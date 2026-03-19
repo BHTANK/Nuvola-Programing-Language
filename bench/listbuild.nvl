@@ -1,0 +1,18 @@
+-- Benchmark 9: List build + reduce — 1M elements
+-- Tests: dynamic array growth, iteration
+
+n := 1000000
+arr := []
+i := 0
+while i < n
+  arr.push(i)
+  i = i + 1
+
+-- Sum all elements
+sum := 0
+i = 0
+while i < n
+  sum = sum + arr[i]
+  i = i + 1
+
+print("list 1M build+sum = " + str(sum))

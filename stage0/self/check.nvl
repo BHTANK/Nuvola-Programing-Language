@@ -1,0 +1,502 @@
+-- check.nvl — Static checker for the Nuvola self-hosted compiler
+-- Two-pass analysis:
+--   Pass 1: collect_fns   — build a table of known function signatures
+--   Pass 2: check_stmts   — walk the AST and append diagnostics
+-- check_program() runs both passes and returns true if any errors were found.
+--
+-- fn_table entries: map { min_arity, max_arity, variadic }
+-- ctx entries:      map { vars: list of known variable names }
+-- diags entries:    map { kind, msg, line, col }
+
+-- ── Built-in function signatures ─────────────────────────────────────────────
+
+fn builtin_fn_table()
+  t = {}
+  -- core type/conversion builtins
+  t.set("print",      {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("eprint",     {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("str",        {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("int",        {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("float",      {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("bool",       {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("len",        {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("type",       {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("assert",     {min_arity: 1, max_arity: 2, variadic: false})
+  t.set("exit",       {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("args",       {min_arity: 0, max_arity: 0, variadic: false})
+
+  -- file I/O
+  t.set("read_file",  {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("write_file", {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("file_read",  {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("file_write", {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("file_exists",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("file_append",{min_arity: 2, max_arity: 2, variadic: false})
+
+  -- math builtins
+  t.set("abs",        {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("sqrt",       {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("floor",      {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("ceil",       {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("round",      {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("sin",        {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("cos",        {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("tan",        {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("exp",        {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("log",        {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("log2",       {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("log10",      {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("pow",        {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("hypot",      {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("atan2",      {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("min",        {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("max",        {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("sum",        {min_arity: 1, max_arity: 1, variadic: false})
+
+  -- collection builtins
+  t.set("range",      {min_arity: 1, max_arity: 3, variadic: false})
+  t.set("map",        {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("filter",     {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("sorted",     {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("reversed",   {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("zip",        {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("flatten",    {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("unique",     {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("enumerate",  {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("first",      {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("last",       {min_arity: 1, max_arity: 1, variadic: false})
+
+  -- string builtins
+  t.set("format_str", {min_arity: 1, max_arity: 1, variadic: true})
+  t.set("str_repeat", {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("str_index_of",{min_arity: 2, max_arity: 2, variadic: false})
+  t.set("str_slice",  {min_arity: 2, max_arity: 3, variadic: false})
+  t.set("utf8_len",   {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("utf8_at",    {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("utf8_chars", {min_arity: 1, max_arity: 1, variadic: false})
+
+  -- path builtins
+  t.set("path_dirname",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("path_join",  {min_arity: 2, max_arity: 2, variadic: false})
+
+  -- system/time builtins
+  t.set("time_ms",    {min_arity: 0, max_arity: 0, variadic: false})
+  t.set("sleep_ms",   {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("env_get",    {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("cli_args",   {min_arity: 0, max_arity: 0, variadic: false})
+  t.set("popen_read", {min_arity: 1, max_arity: 1, variadic: false})
+
+  -- nv_* runtime primitives
+  t.set("nv_shell",   {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_read_file",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_write_file",{min_arity: 2, max_arity: 2, variadic: false})
+  t.set("nv_clock_ns",{min_arity: 0, max_arity: 0, variadic: false})
+  t.set("nv_time_now_ms",{min_arity: 0, max_arity: 0, variadic: false})
+  t.set("nv_sleep_sec",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_os_getcwd",{min_arity: 0, max_arity: 0, variadic: false})
+  t.set("nv_os_exists",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_os_is_file",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_os_is_dir",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_os_listdir",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_os_mkdir",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_os_remove",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_os_rename",{min_arity: 2, max_arity: 2, variadic: false})
+  t.set("nv_os_getenv",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_os_setenv",{min_arity: 2, max_arity: 2, variadic: false})
+  t.set("nv_os_system",{min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_os_file_size",{min_arity: 1, max_arity: 1, variadic: false})
+
+  -- regex builtins
+  t.set("regex_match",    {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("regex_find",     {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("regex_find_all", {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("regex_replace",  {min_arity: 3, max_arity: 3, variadic: false})
+  t.set("regex_split",    {min_arity: 2, max_arity: 2, variadic: false})
+
+  -- crypto builtins
+  t.set("sha256",         {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("sha256_bytes",   {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("hmac_sha256",    {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("base64_encode",  {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("base64_decode",  {min_arity: 1, max_arity: 1, variadic: false})
+
+  -- JSON builtins
+  t.set("json_parse",     {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("json_stringify",  {min_arity: 1, max_arity: 1, variadic: false})
+
+  -- HTTP builtins
+  t.set("nv_http_get",    {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("nv_http_post",   {min_arity: 2, max_arity: 3, variadic: false})
+  t.set("nv_http_serve",  {min_arity: 2, max_arity: 2, variadic: false})
+  t.set("nv_http_response",{min_arity: 2, max_arity: 3, variadic: false})
+
+  -- concurrency builtins
+  t.set("channel",    {min_arity: 0, max_arity: 1, variadic: false})
+  t.set("nv_spawn",   {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("await_",     {min_arity: 1, max_arity: 1, variadic: false})
+
+  -- error handling
+  t.set("throw",      {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("Some",       {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("None",       {min_arity: 0, max_arity: 0, variadic: false})
+
+  -- GPU builtins
+  t.set("gpu_init",       {min_arity: 0, max_arity: 0, variadic: false})
+  t.set("gpu_free_mib",   {min_arity: 0, max_arity: 0, variadic: false})
+  t.set("gpu_upload",     {min_arity: 3, max_arity: 3, variadic: false})
+  t.set("gpu_download",   {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("gpu_free",       {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("gpu_matmul",     {min_arity: 3, max_arity: 5, variadic: false})
+  t.set("gpu_rows",       {min_arity: 1, max_arity: 1, variadic: false})
+  t.set("gpu_cols",       {min_arity: 1, max_arity: 1, variadic: false})
+  t
+
+
+-- ── Pass 1: collect function declarations ────────────────────────────────────
+
+fn collect_fns(stmts, fn_table)
+  i = 0
+  while i < stmts.len
+    stmt := stmts[i]
+    k    := stmt.get("kind")
+    if k == "fn_def"
+      name   := stmt.get("name")
+      params := stmt.get("params")
+      arity  := params.len
+      sig = {}
+      sig.set("min_arity", arity)
+      sig.set("max_arity", arity)
+      sig.set("variadic",  false)
+      fn_table.set(name, sig)
+    i = i + 1
+
+-- ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn ctx_has_var(ctx, name)
+  vars := ctx.get("vars")
+  for v in vars
+    if v == name
+      return true
+  false
+
+fn ctx_add_var(ctx, name)
+  vars := ctx.get("vars")
+  vars.push(name)
+
+fn make_ctx()
+  c = {}
+  c.set("vars", [])
+  c
+
+fn child_ctx(parent)
+  -- inherit parent vars into a new list
+  parent_vars := parent.get("vars")
+  child_vars  = []
+  for v in parent_vars
+    child_vars.push(v)
+  c = {}
+  c.set("vars", child_vars)
+  c
+
+fn diag_error(diags, msg, line, col)
+  d = {}
+  d.set("kind", "error")
+  d.set("msg",  msg)
+  d.set("line", line)
+  d.set("col",  col)
+  diags.push(d)
+
+fn diag_warn(diags, msg, line, col)
+  d = {}
+  d.set("kind", "warn")
+  d.set("msg",  msg)
+  d.set("line", line)
+  d.set("col",  col)
+  diags.push(d)
+
+fn node_line(node)
+  ln := node.get("line")
+  if ln == nil
+    return 0
+  ln
+
+fn node_col(node)
+  cl := node.get("col")
+  if cl == nil
+    return 0
+  cl
+
+-- ── Pass 2: check expressions ────────────────────────────────────────────────
+
+fn check_expr(expr, fn_table, ctx, diags)
+  if expr == nil
+    return nil
+  k := expr.get("kind")
+
+  if k == "int" or k == "float" or k == "str" or k == "bool" or k == "nil"
+    return nil
+
+  if k == "ident"
+    name := expr.get("name")
+    if not ctx_has_var(ctx, name)
+      -- may be a function reference — check fn_table
+      if fn_table.get(name) == nil
+        diag_warn(diags, "unknown identifier '" + name + "'", 0, 0)
+    return nil
+
+  if k == "binop"
+    check_expr(expr.get("left"),  fn_table, ctx, diags)
+    check_expr(expr.get("right"), fn_table, ctx, diags)
+    return nil
+
+  if k == "unop"
+    check_expr(expr.get("operand"), fn_table, ctx, diags)
+    return nil
+
+  if k == "call"
+    fn_name := expr.get("fn")
+    a_args  := expr.get("args")
+    arity   = 0
+    if a_args != nil
+      arity = a_args.len
+    sig := fn_table.get(fn_name)
+    if sig == nil
+      diag_warn(diags, "call to unknown function '" + fn_name + "'", 0, 0)
+    else
+      min_a := sig.get("min_arity")
+      max_a := sig.get("max_arity")
+      vriad := sig.get("variadic")
+      if arity < min_a
+        diag_error(diags, "'" + fn_name + "' requires at least " + str(min_a) + " argument(s), got " + str(arity), 0, 0)
+      else if not vriad and arity > max_a
+        diag_error(diags, "'" + fn_name + "' accepts at most " + str(max_a) + " argument(s), got " + str(arity), 0, 0)
+    -- check argument expressions
+    if a_args != nil
+      for arg in a_args
+        check_expr(arg, fn_table, ctx, diags)
+    return nil
+
+  if k == "method_call"
+    check_expr(expr.get("obj"), fn_table, ctx, diags)
+    a_args := expr.get("args")
+    if a_args != nil
+      for arg in a_args
+        check_expr(arg, fn_table, ctx, diags)
+    return nil
+
+  if k == "index"
+    check_expr(expr.get("obj"), fn_table, ctx, diags)
+    check_expr(expr.get("idx"), fn_table, ctx, diags)
+    return nil
+
+  if k == "field"
+    check_expr(expr.get("obj"), fn_table, ctx, diags)
+    return nil
+
+  if k == "pipe"
+    check_expr(expr.get("val"), fn_table, ctx, diags)
+    check_expr(expr.get("fn"),  fn_table, ctx, diags)
+    return nil
+
+  if k == "range"
+    check_expr(expr.get("start"), fn_table, ctx, diags)
+    check_expr(expr.get("end"),   fn_table, ctx, diags)
+    return nil
+
+  if k == "list"
+    items := expr.get("items")
+    if items != nil
+      for item in items
+        check_expr(item, fn_table, ctx, diags)
+    return nil
+
+  if k == "map"
+    pairs := expr.get("pairs")
+    if pairs != nil
+      for pair in pairs
+        check_expr(pair[0], fn_table, ctx, diags)
+        check_expr(pair[1], fn_table, ctx, diags)
+    return nil
+
+  if k == "struct_lit"
+    fields := expr.get("fields")
+    if fields != nil
+      for pair in fields
+        check_expr(pair[1], fn_table, ctx, diags)
+    return nil
+
+  if k == "lambda"
+    lctx   := child_ctx(ctx)
+    params := expr.get("params")
+    if params != nil
+      for p in params
+        ctx_add_var(lctx, p)
+    check_expr(expr.get("body"), fn_table, lctx, diags)
+    return nil
+
+  if k == "if_expr"
+    check_expr(expr.get("cond"), fn_table, ctx, diags)
+    check_expr(expr.get("then"), fn_table, ctx, diags)
+    e := expr.get("else")
+    if e != nil
+      check_expr(e, fn_table, ctx, diags)
+    return nil
+
+  -- unknown / unrecognised node — silently ignore
+  nil
+
+-- ── Pass 2: check statements ─────────────────────────────────────────────────
+
+fn check_block(stmts, fn_table, ctx, diags)
+  if stmts == nil
+    return nil
+  -- stmts may be a block node or a raw list
+  actual = stmts
+  if stmts.get != nil
+    k := stmts.get("kind")
+    if k == "block"
+      actual = stmts.get("stmts")
+  if actual == nil
+    return nil
+  check_stmts(actual, fn_table, ctx, diags)
+
+fn check_stmts(stmts, fn_table, ctx, diags)
+  if stmts == nil
+    return nil
+  for stmt in stmts
+    check_one_stmt(stmt, fn_table, ctx, diags)
+
+fn check_one_stmt(stmt, fn_table, ctx, diags)
+  if stmt == nil
+    return nil
+  k := stmt.get("kind")
+
+  if k == "let"
+    name := stmt.get("name")
+    check_expr(stmt.get("val"), fn_table, ctx, diags)
+    ctx_add_var(ctx, name)
+    return nil
+
+  if k == "assign"
+    check_expr(stmt.get("target"), fn_table, ctx, diags)
+    check_expr(stmt.get("val"),    fn_table, ctx, diags)
+    return nil
+
+  if k == "compound_assign"
+    check_expr(stmt.get("target"), fn_table, ctx, diags)
+    check_expr(stmt.get("val"),    fn_table, ctx, diags)
+    return nil
+
+  if k == "fn_def"
+    name   := stmt.get("name")
+    params := stmt.get("params")
+    fctx   := child_ctx(ctx)
+    ctx_add_var(ctx, name)
+    if params != nil
+      for p in params
+        ctx_add_var(fctx, p)
+    body := stmt.get("body")
+    check_block(body, fn_table, fctx, diags)
+    return nil
+
+  if k == "return"
+    check_expr(stmt.get("val"), fn_table, ctx, diags)
+    return nil
+
+  if k == "break"
+    return nil
+
+  if k == "continue"
+    return nil
+
+  if k == "expr_stmt"
+    check_expr(stmt.get("expr"), fn_table, ctx, diags)
+    return nil
+
+  if k == "if"
+    check_expr(stmt.get("cond"), fn_table, ctx, diags)
+    then_ctx := child_ctx(ctx)
+    check_block(stmt.get("then"), fn_table, then_ctx, diags)
+    elifs := stmt.get("elifs")
+    if elifs != nil
+      for elif_node in elifs
+        check_expr(elif_node.get("cond"), fn_table, ctx, diags)
+        elif_ctx := child_ctx(ctx)
+        check_block(elif_node.get("body"), fn_table, elif_ctx, diags)
+    else_body := stmt.get("else")
+    if else_body != nil
+      else_ctx := child_ctx(ctx)
+      check_block(else_body, fn_table, else_ctx, diags)
+    return nil
+
+  if k == "for"
+    var_name := stmt.get("var")
+    check_expr(stmt.get("iter"), fn_table, ctx, diags)
+    fctx := child_ctx(ctx)
+    ctx_add_var(fctx, var_name)
+    check_block(stmt.get("body"), fn_table, fctx, diags)
+    return nil
+
+  if k == "while"
+    check_expr(stmt.get("cond"), fn_table, ctx, diags)
+    wctx := child_ctx(ctx)
+    check_block(stmt.get("body"), fn_table, wctx, diags)
+    return nil
+
+  if k == "match"
+    check_expr(stmt.get("subject"), fn_table, ctx, diags)
+    arms := stmt.get("arms")
+    if arms != nil
+      for arm in arms
+        arm_ctx := child_ctx(ctx)
+        guard := arm.get("guard")
+        if guard != nil
+          check_expr(guard, fn_table, arm_ctx, diags)
+        check_expr(arm.get("body"), fn_table, arm_ctx, diags)
+    return nil
+
+  if k == "import"
+    return nil
+
+  if k == "type_decl"
+    return nil
+
+  if k == "comptime"
+    check_expr(stmt.get("val"), fn_table, ctx, diags)
+    ctx_add_var(ctx, stmt.get("name"))
+    return nil
+
+  if k == "block"
+    bctx := child_ctx(ctx)
+    check_stmts(stmt.get("stmts"), fn_table, bctx, diags)
+    return nil
+
+  -- unrecognised statement kind — silently skip
+  nil
+
+-- ── Top-level entry point ─────────────────────────────────────────────────────
+
+fn check_program(program, file_path)
+  fn_table := builtin_fn_table()
+  collect_fns(program, fn_table)
+  ctx   := make_ctx()
+  diags = []
+  check_stmts(program, fn_table, ctx, diags)
+
+  has_error = false
+  for d in diags
+    prefix = file_path + ": "
+    ln := d.get("line")
+    cl := d.get("col")
+    if ln != nil and ln != 0
+      prefix = file_path + ":" + str(ln) + ":" + str(cl) + ": "
+    dkind := d.get("kind")
+    if dkind == "error"
+      has_error = true
+      print(prefix + "error: " + d.get("msg"))
+    else
+      print(prefix + "warning: " + d.get("msg"))
+
+  if diags.len == 0
+    print(file_path + ": no issues found")
+  has_error

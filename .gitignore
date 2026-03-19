@@ -1,0 +1,4 @@
+stage0/target/
+__pycache__/
+*.o
+a.out

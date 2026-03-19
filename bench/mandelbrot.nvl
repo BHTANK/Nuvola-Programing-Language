@@ -1,0 +1,30 @@
+-- Benchmark 2: Mandelbrot set iteration count
+-- Tests: floating-point arithmetic throughput, inner loops
+
+fn mandelbrot(cx, cy, max_iter)
+  x = 0.0
+  y = 0.0
+  i = 0
+  while i < max_iter
+    x2 := x * x
+    y2 := y * y
+    if x2 + y2 > 4.0 => return i
+    y = 2.0 * x * y + cy
+    x = x2 - y2 + cx
+    i = i + 1
+  max_iter
+
+-- Count iterations across a 200x200 grid
+size   := 200
+total  := 0
+row    := 0
+while row < size
+  col := 0
+  while col < size
+    cx := (float(col) / float(size)) * 3.5 - 2.5
+    cy := (float(row) / float(size)) * 2.0 - 1.0
+    total = total + mandelbrot(cx, cy, 1000)
+    col = col + 1
+  row = row + 1
+
+print("mandelbrot 200x200 total_iters = " + str(total))

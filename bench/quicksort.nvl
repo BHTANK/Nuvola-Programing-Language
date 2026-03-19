@@ -1,0 +1,33 @@
+-- Benchmark 4: Quicksort 100k elements
+-- Tests: list indexing, recursion, comparisons
+
+fn quicksort(arr, lo, hi)
+  if lo >= hi => return nil
+  pivot := arr[hi]
+  i     := lo
+  j     := lo
+  while j < hi
+    if arr[j] <= pivot
+      tmp    := arr[i]
+      arr[i] = arr[j]
+      arr[j] = tmp
+      i = i + 1
+    j = j + 1
+  tmp    := arr[i]
+  arr[i] = arr[hi]
+  arr[hi] = tmp
+  quicksort(arr, lo, i - 1)
+  quicksort(arr, i + 1, hi)
+
+-- Build 100k pseudo-random integers (LCG)
+n   := 100000
+arr := []
+x   := 12345
+i   := 0
+while i < n
+  x = (x * 1664525 + 1013904223) % 4294967296
+  arr.push(x % 1000000)
+  i = i + 1
+
+quicksort(arr, 0, n - 1)
+print("sorted[0]=" + str(arr[0]) + " sorted[-1]=" + str(arr[n-1]))

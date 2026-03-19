@@ -1,0 +1,2280 @@
+-- Nuvola Language Evaluator — v0.1
+-- Interprets a meaningful subset of Nuvola syntax.
+--
+-- Supported:
+--   - Immutable (:=) and mutable (=) bindings
+--   - Primitive types: i64, f64, str, bool, nil/None
+--   - Arithmetic, comparison, logical operators
+--   - String interpolation  {"expr"}
+--   - Functions (fn), lambdas (fn(...) =>), placeholder lambdas (_ * 2)
+--   - If/else expressions and statements
+--   - Match expressions (literal, wildcard, range, OR, guard, enum variant)
+--   - For loops (range and iterable)
+--   - While loops
+--   - Pipeline operator |>
+--   - Vec (list), Map (dict), Set literals
+--   - Builtins: print, len, range, map, filter, reduce/fold, sum, min, max,
+--              zip, enumerate, sorted, reversed, flatten, count, any, all,
+--              take, drop, join, split, contains, type_of, abs, sqrt, floor,
+--              ceil, round, pow, str(), int(), float(), bool()
+--   - Structs (type) and enum variants
+--   - Option (Some/None) and Result (Ok/Err)
+--   - Error propagation via catch
+--   - Tuple destructuring
+--   - Closures with captured environment
+--   - Recursion (including mutual)
+--   - Modules (import from stdlib stubs)
+--   - @pure/@io annotations (parsed, not enforced)
+
+@io module nuvola_eval
+
+use std.os
+use std.regex
+use std.math
+use std.time
+use std.fs
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- AST nodes
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type Node
+
+type Num
+    v: Any
+
+type StrNode
+    v: Str
+
+type BoolNode
+    v: Bool
+
+type Nil
+
+type Ident
+    name: Str
+
+type BinOp
+    op: Str
+    l:  Node
+    r:  Node
+
+type UnOp
+    op:   Str
+    expr: Node
+
+type Pipe
+    l: Node
+    r: Node
+
+type Call
+    fn:     Node
+    args:   List(Node)
+    kwargs: Map(Str, Node) = Map()
+
+type Index
+    obj: Node
+    idx: Node
+
+type Field
+    obj:   Node
+    field: Str
+
+type Assign
+    name:      Str
+    expr:      Node
+    immutable: Bool = true
+    typed:     Option(Str) = None
+
+type IndexAssign
+    obj:  Node
+    idx:  Node
+    expr: Node
+
+type FieldAssign
+    obj:   Node
+    field: Str
+    expr:  Node
+
+type Destructure
+    pattern: Node
+    expr:    Node
+
+type Fn
+    params: List(Tuple(Str, Option(Str), Option(Node)))
+    body:   Node
+    name:   Option(Str) = None
+
+type FnDecl
+    name:     Str
+    params:   List(Tuple(Str, Option(Str), Option(Node)))
+    body:     Node
+    ret_type: Option(Str) = None
+
+type If
+    cond:  Node
+    then:  Node
+    elifs: List(Tuple(Node, Node)) = List()
+    else_: Option(Node) = None
+
+type MatchNode
+    expr: Node
+    arms: List(MatchArm)
+
+type MatchArm
+    pattern: Any
+    guard:   Option(Node)
+    body:    Node
+
+type ForLoop
+    var:   Any
+    iter_: Node
+    body:  Node
+
+type WhileLoop
+    cond: Node
+    body: Node
+
+type Block
+    stmts: List(Node)
+
+type Return
+    expr: Option(Node) = None
+
+type Break
+    expr: Option(Node) = None
+
+type Continue
+
+type ListLit
+    items: List(Node)
+
+type MapLit
+    pairs: List(Tuple(Node, Node))
+
+type SetLit
+    items: List(Node)
+
+type TupleLit
+    items: List(Node)
+
+type RangeLit
+    start:     Node
+    end:       Node
+    inclusive: Bool = false
+
+type StructLit
+    name:   Str
+    fields: Map(Str, Node)
+
+type Spread
+    base:      Node
+    overrides: Map(Str, Node)
+
+type TypeDecl
+    name:     Str
+    fields:   Option(Map(Str, Tuple(Str, Option(Node)))) = None
+    variants: Option(List(Tuple(Str, List(Tuple(Option(Str), Str))))) = None
+
+type Import
+    path:  Str
+    names: Option(List(Str)) = None
+    alias: Option(Str) = None
+
+type Annotation
+    name:  Str
+    inner: Node
+
+-- Runtime values
+
+type NuvolaFn
+    params: List(Tuple(Str, Option(Str), Option(Node)))
+    body:   Node
+    env:    Env
+    name:   Option(Str) = None
+
+fn nuvola_fn_repr(f: NuvolaFn) -> Str
+    "<fn {f.name ?? \"(anon)\"}>"
+
+type NuvolaStruct
+    type_name: Str
+    fields:    Map(Str, Any)
+
+fn nuvola_struct_repr(s: NuvolaStruct) -> Str
+    fs := s.fields.entries().map(fn(e) => "{e[0]}: {repr(e[1])}").join(", ")
+    "{s.type_name} {{ {fs} }}"
+
+type NuvolaEnum
+    type_name: Str
+    variant:   Str
+    value:     Option(Any) = None
+
+fn nuvola_enum_repr(e: NuvolaEnum) -> Str
+    if e.value == None
+        "{e.type_name}.{e.variant}"
+    else
+        "{e.type_name}.{e.variant}({repr(e.value)})"
+
+type NuvolaOption
+    value:   Option(Any) = None
+    is_some: Bool = true
+
+fn nuvola_option_repr(o: NuvolaOption) -> Str
+    if o.is_some then "Some({repr(o.value)})" else "None"
+
+type NuvolaResult
+    value: Any
+    is_ok: Bool = true
+
+fn nuvola_result_repr(r: NuvolaResult) -> Str
+    if r.is_ok then "Ok({repr(r.value)})" else "Err({repr(r.value)})"
+
+-- Control flow signals
+
+type ReturnSignal
+    v: Any
+
+type BreakSignal
+    v: Option(Any) = None
+
+type ContinueSignal
+
+SENTINEL := "__SENTINEL__"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Lexer
+-- ─────────────────────────────────────────────────────────────────────────────
+
+KEYWORDS := Set(
+    "fn", "if", "else", "for", "while", "loop", "in", "return", "break", "continue",
+    "match", "type", "trait", "impl", "import", "export", "from", "as", "where",
+    "and", "or", "not", "is", "true", "false", "nil", "self",
+    "Some", "None", "Ok", "Err"
+)
+
+-- Token: (type, value, line, col)
+fn tokenize(src: Str) -> List(Tuple(Str, Str, Int, Int))
+    tokens = List()
+    i = 0
+    lines := src.split("\n")
+    line_starts = List(0)
+    for line in lines.slice(0, lines.len() - 1)
+        line_starts.push(line_starts.last() + line.len() + 1)
+
+    fn get_line(pos: Int) -> Int
+        lo = 0
+        hi = line_starts.len() - 1
+        while lo < hi
+            mid := (lo + hi + 1) // 2
+            if line_starts[mid] <= pos
+                lo = mid
+            else
+                hi = mid - 1
+        lo + 1
+
+    fn get_col(pos: Int) -> Int
+        line_idx := get_line(pos) - 1
+        pos - line_starts[line_idx]
+
+    while i < src.len()
+        -- skip doc comments and regular comments
+        if src.slice(i, i + 2) == "--"
+            end := src.find("\n", i)
+            i = if end != -1 then end + 1 else src.len()
+            continue
+        -- skip whitespace
+        if src[i] in List(" ", "\t", "\r")
+            i += 1
+            continue
+        if src[i] == "\n"
+            tokens.push(("NEWLINE", "\n", get_line(i), 0))
+            i += 1
+            continue
+
+        ln := get_line(i)
+        col := get_col(i)
+
+        -- Annotations
+        if src[i] == "@"
+            j = i + 1
+            while j < src.len() and (src[j].is_alnum() or src[j] == "_")
+                j += 1
+            tokens.push(("ANNOT", src.slice(i, j), ln, col))
+            i = j
+            continue
+
+        -- Multi-line string
+        if src.slice(i, i + 3) == "\"\"\""
+            j = i + 3
+            while j < src.len() and src.slice(j, j + 3) != "\"\"\""
+                j += 1
+            tokens.push(("STRING", src.slice(i + 3, j), ln, col))
+            i = j + 3
+            continue
+
+        -- String with interpolation
+        if src[i] == "\""
+            j = i + 1
+            s = List()
+            while j < src.len() and src[j] != "\""
+                if src[j] == "\\"
+                    esc_map := Map("n" -> "\n", "t" -> "\t", "r" -> "\r",
+                                   "\\" -> "\\", "\"" -> "\"")
+                    esc := esc_map.get(src[j + 1], src[j + 1])
+                    s.push(esc)
+                    j += 2
+                else
+                    s.push(src[j])
+                    j += 1
+            tokens.push(("STRING", s.join(""), ln, col))
+            i = j + 1
+            continue
+
+        -- Numbers
+        if src[i].is_digit() or (src[i] == "." and i + 1 < src.len() and src[i + 1].is_digit())
+            j = i
+            while j < src.len() and (src[j].is_digit() or src[j] == "_")
+                j += 1
+            is_float = false
+            if j < src.len() and src[j] == "." and (j + 1 >= src.len() or src[j + 1] != ".")
+                is_float = true
+                j += 1
+                while j < src.len() and (src[j].is_digit() or src[j] == "_")
+                    j += 1
+            if j < src.len() and src[j] in List("e", "E")
+                is_float = true
+                j += 1
+                if j < src.len() and src[j] in List("+", "-")
+                    j += 1
+                while j < src.len() and src[j].is_digit()
+                    j += 1
+            -- type suffix
+            while j < src.len() and src[j] in List("u","f","i","0","1","2","3","4","5","6","7","8","9")
+                j += 1
+            raw := src.slice(i, j).replace("_", "")
+            -- strip type suffix
+            num_str := regex.sub("[ui](?:8|16|32|64|128|size)$|f(?:16|32|64|128)$", "", raw)
+            tok_type := if is_float or "." in num_str or "e" in num_str.to_lower() then "FLOAT" else "INT"
+            tokens.push((tok_type, num_str, ln, col))
+            i = j
+            continue
+
+        -- Identifiers and keywords
+        if src[i].is_alpha() or src[i] == "_"
+            j = i
+            while j < src.len() and (src[j].is_alnum() or src[j] == "_")
+                j += 1
+            word := src.slice(i, j)
+            if word in List("true", "false")
+                tokens.push(("BOOL", word, ln, col))
+            elif word in List("nil", "None")
+                tokens.push(("NIL", word, ln, col))
+            elif word in KEYWORDS
+                tokens.push(("KW", word, ln, col))
+            else
+                tokens.push(("IDENT", word, ln, col))
+            i = j
+            continue
+
+        -- Operators (order matters — longer first)
+        ops := List("..=", "|>=", "|>", "=>", ":=", "!=", "<=", ">=", "==", "&&", "||",
+                     "<<", ">>", "->", "**", "//", "??", "?.", "..",
+                     "+", "-", "*", "/", "%", "<", ">", "=", ":", ".", ",", ";",
+                     "(", ")", "[", "]", "{", "}", "!", "?", "&", "|", "^", "~", "@")
+        matched = false
+        for op in ops
+            if src.slice(i, i + op.len()) == op
+                tokens.push(("OP", op, ln, col))
+                i += op.len()
+                matched = true
+                break
+        if not matched
+            i += 1  -- skip unknown char
+
+    tokens.push(("EOF", "", if src.len() > 0 then get_line(src.len() - 1) else 1, 0))
+    tokens
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Parser
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type ParseError
+    msg:  Str
+    line: Int = 0
+
+type Parser
+    tokens: List(Tuple(Str, Str, Int, Int))
+    pos:    Int = 0
+
+fn parser_new(tokens: List(Tuple(Str, Str, Int, Int))) -> Parser
+    Parser(tokens = tokens, pos = 0)
+
+fn peek(p: Parser, offset: Int = 0) -> Tuple(Str, Str, Int, Int)
+    idx := p.pos + offset
+    if idx < p.tokens.len()
+        p.tokens[idx]
+    else
+        ("EOF", "", 0, 0)
+
+fn skip_newlines(p: Parser)
+    while peek(p)[0] == "NEWLINE"
+        p.pos += 1
+
+fn eat(p: Parser, type_: Option(Str) = None, value: Option(Str) = None) -> Tuple(Str, Str, Int, Int)
+    skip_newlines(p)
+    t := p.tokens[p.pos]
+    if type_ != None and t[0] != type_
+        panic("Line {t[2]}: Expected {type_} but got {t[0]} '{t[1]}'")
+    if value != None and t[1] != value
+        panic("Line {t[2]}: Expected '{value}' but got '{t[1]}'")
+    p.pos += 1
+    t
+
+fn eat_if(p: Parser, type_: Option(Str) = None, value: Option(Str) = None) -> Bool
+    skip_newlines(p)
+    t := p.tokens[p.pos]
+    if type_ != None and t[0] != type_
+        return false
+    if value != None and t[1] != value
+        return false
+    p.pos += 1
+    true
+
+fn tok_col(p: Parser, offset: Int = 0) -> Int
+    idx = p.pos + offset
+    while idx < p.tokens.len() and p.tokens[idx][0] == "NEWLINE"
+        idx += 1
+    t := if idx < p.tokens.len() then p.tokens[idx] else ("EOF", "", 0, 0)
+    if t.len() > 3 then t[3] else 0
+
+fn parse_program(p: Parser) -> Block
+    stmts = List()
+    while peek(p)[0] != "EOF"
+        skip_newlines(p)
+        if peek(p)[0] == "EOF"
+            break
+        s := parse_stmt(p)
+        if s != None
+            stmts.push(s)
+    Block(stmts = stmts)
+
+fn parse_indented_block(p: Parser, min_col: Int = -1) -> Block
+    stmts = List()
+    skip_newlines(p)
+    if peek(p)[0] == "EOF"
+        return Block(stmts = List())
+    block_col := if min_col < 0 then tok_col(p) else min_col
+    loop
+        skip_newlines(p)
+        t := peek(p)
+        if t[0] == "EOF"
+            break
+        cur_col := if t.len() > 3 then t[3] else 0
+        if cur_col < block_col
+            break
+        if t[0] == "KW" and t[1] == "else"
+            break
+        s := parse_stmt(p)
+        if s != None
+            stmts.push(s)
+        while peek(p)[0] == "OP" and peek(p)[1] == ";"
+            p.pos += 1
+        skip_newlines(p)
+        t2 := peek(p)
+        if t2[0] == "EOF"
+            break
+        cur_col2 := if t2.len() > 3 then t2[3] else 0
+        if cur_col2 < block_col
+            break
+        if t2[0] == "KW" and t2[1] == "else"
+            break
+    Block(stmts = stmts)
+
+fn parse_arrow_body(p: Parser) -> Block
+    if peek(p)[0] == "KW" and peek(p)[1] == "return"
+        p.pos += 1
+        val := parse_expr(p)
+        return Block(stmts = List(Return(expr = Some(val))))
+    s := parse_stmt(p)
+    Block(stmts = if s != None then List(s) else List())
+
+fn parse_stmt(p: Parser) -> Option(Node)
+    skip_newlines(p)
+    t := peek(p)
+
+    -- Annotation
+    if t[0] == "ANNOT"
+        p.pos += 1
+        skip_newlines(p)
+        inner := parse_stmt(p)
+        return Annotation(name = t[1], inner = inner)
+
+    -- Import
+    if t[0] == "KW" and t[1] == "import"
+        return parse_import(p)
+
+    -- Type declaration
+    if t[0] == "KW" and t[1] == "type"
+        return parse_type_decl(p)
+
+    -- Function declaration (named)
+    if t[0] == "KW" and t[1] == "fn"
+        nxt := peek(p, 1)
+        if nxt[0] == "IDENT"
+            return parse_fn_decl(p)
+
+    -- If statement
+    if t[0] == "KW" and t[1] == "if"
+        return parse_if_stmt(p)
+
+    -- For loop
+    if t[0] == "KW" and t[1] == "for"
+        return parse_for(p)
+
+    -- While loop
+    if t[0] == "KW" and t[1] == "while"
+        return parse_while(p)
+
+    -- Return
+    if t[0] == "KW" and t[1] == "return"
+        p.pos += 1
+        skip_newlines(p)
+        if peek(p)[0] in List("EOF", "NEWLINE") or (peek(p)[0] == "KW" and peek(p)[1] in List("else", "elif"))
+            return Return(expr = Some(Nil()))
+        expr := parse_expr(p)
+        return Return(expr = Some(expr))
+
+    -- Break
+    if t[0] == "KW" and t[1] == "break"
+        p.pos += 1
+        if peek(p)[0] not in List("NEWLINE", "EOF")
+            expr := parse_expr(p)
+            return Break(expr = Some(expr))
+        return Break()
+
+    -- Continue
+    if t[0] == "KW" and t[1] == "continue"
+        p.pos += 1
+        return Continue()
+
+    -- Match
+    if t[0] == "KW" and t[1] == "match"
+        return parse_match(p)
+
+    -- Assignment/expression
+    expr := parse_expr(p)
+
+    -- Check for binding (:= or = assignment at stmt level)
+    if expr is Ident and peek(p)[0] == "OP" and peek(p)[1] in List(":=", "=", "+=", "-=", "*=", "/=")
+        op := peek(p)[1]
+        p.pos += 1
+        rhs := parse_expr(p)
+        if op == ":="
+            return Assign(name = expr.name, expr = rhs, immutable = true)
+        elif op == "="
+            return Assign(name = expr.name, expr = rhs, immutable = false)
+        else
+            bin_op := op.slice(0, 1)
+            return Assign(name = expr.name, expr = BinOp(op = bin_op, l = expr, r = rhs), immutable = false)
+
+    -- Index assignment
+    if expr is Index and peek(p)[0] == "OP" and peek(p)[1] == "="
+        p.pos += 1
+        rhs := parse_expr(p)
+        return IndexAssign(obj = expr.obj, idx = expr.idx, expr = rhs)
+
+    -- Field assignment
+    if expr is Field and peek(p)[0] == "OP" and peek(p)[1] == "="
+        p.pos += 1
+        rhs := parse_expr(p)
+        return FieldAssign(obj = expr.obj, field = expr.field, expr = rhs)
+
+    -- Typed binding: name: Type = expr
+    if expr is Ident and peek(p)[0] == "OP" and peek(p)[1] == ":"
+        p.pos += 1
+        type_name := parse_type_expr(p)
+        if peek(p)[0] == "OP" and peek(p)[1] in List(":=", "=")
+            op := peek(p)[1]
+            p.pos += 1
+            rhs := parse_expr(p)
+            return Assign(name = expr.name, expr = rhs, immutable = (op == ":="), typed = Some(type_name))
+        return expr
+
+    -- Tuple destructure: (a, b) := expr
+    if expr is TupleLit and peek(p)[0] == "OP" and peek(p)[1] in List(":=", "=")
+        op := peek(p)[1]
+        p.pos += 1
+        rhs := parse_expr(p)
+        return Destructure(pattern = expr, expr = rhs)
+
+    -- Skip trailing semicolons
+    while peek(p)[0] == "OP" and peek(p)[1] == ";"
+        p.pos += 1
+    expr
+
+fn parse_import(p: Parser) -> Import
+    eat(p, "KW", "import")
+    path_parts = List()
+    t := eat(p, "IDENT")
+    path_parts.push(t[1])
+    names = None
+    alias = None
+    while peek(p)[0] == "OP" and peek(p)[1] == "."
+        p.pos += 1
+        if peek(p)[0] == "OP" and peek(p)[1] == "{"
+            p.pos += 1
+            names = List()
+            while peek(p)[1] != "}"
+                names.push(eat(p, "IDENT")[1])
+                if not eat_if(p, "OP", ",")
+                    break
+            eat(p, "OP", "}")
+            break
+        t = eat(p, "IDENT")
+        path_parts.push(t[1])
+    if peek(p)[0] == "KW" and peek(p)[1] == "as"
+        p.pos += 1
+        alias = eat(p, "IDENT")[1]
+    Import(path = path_parts.join("."), names = names, alias = alias)
+
+fn parse_type_decl(p: Parser) -> TypeDecl
+    eat(p, "KW", "type")
+    name := eat(p, "IDENT")[1]
+    skip_newlines(p)
+    fields = Map()
+    variants = List()
+    type_col := tok_col(p)
+    loop
+        skip_newlines(p)
+        t := peek(p)
+        if t[0] == "EOF"
+            break
+        cur_col := if t.len() > 3 then t[3] else 0
+        if cur_col < type_col
+            break
+        if t[0] == "IDENT" and peek(p, 1)[0] == "OP" and peek(p, 1)[1] == ":"
+            fname := eat(p, "IDENT")[1]
+            eat(p, "OP", ":")
+            ftype := parse_type_expr(p)
+            default = None
+            if peek(p)[0] == "OP" and peek(p)[1] == "="
+                p.pos += 1
+                default = parse_expr(p)
+            fields[fname] = (ftype, default)
+        elif t[0] == "IDENT"
+            vname := eat(p, "IDENT")[1]
+            vfields = List()
+            if peek(p)[0] == "OP" and peek(p)[1] == "("
+                p.pos += 1
+                while peek(p)[1] != ")"
+                    if peek(p)[0] == "IDENT" and peek(p, 1)[1] == ":"
+                        fn_ := eat(p, "IDENT")[1]
+                        eat(p, "OP", ":")
+                        ft := parse_type_expr(p)
+                        vfields.push((fn_, ft))
+                    else
+                        ft := parse_type_expr(p)
+                        vfields.push((None, ft))
+                    if not eat_if(p, "OP", ",")
+                        break
+                eat(p, "OP", ")")
+            variants.push((vname, vfields))
+        else
+            break
+    TypeDecl(
+        name     = name,
+        fields   = if fields.len() > 0 then Some(fields) else None,
+        variants = if variants.len() > 0 then Some(variants) else None
+    )
+
+fn parse_type_expr(p: Parser) -> Str
+    t := eat(p, "IDENT")
+    name := t[1]
+    if peek(p)[0] == "OP" and peek(p)[1] == "("
+        p.pos += 1
+        inner := parse_type_expr(p)
+        if peek(p)[0] == "OP" and peek(p)[1] == ","
+            p.pos += 1
+            inner2 := parse_type_expr(p)
+        eat(p, "OP", ")")
+    name
+
+fn parse_fn_decl(p: Parser) -> FnDecl
+    eat(p, "KW", "fn")
+    name := eat(p, "IDENT")[1]
+    eat(p, "OP", "(")
+    params := parse_params(p)
+    eat(p, "OP", ")")
+    ret_type = None
+    if peek(p)[0] == "OP" and peek(p)[1] == "->"
+        p.pos += 1
+        ret_type = parse_type_expr(p)
+    if peek(p)[0] == "KW" and peek(p)[1] == "where"
+        p.pos += 1
+        while peek(p)[0] not in List("NEWLINE", "EOF") and peek(p)[1] != "=>"
+            p.pos += 1
+    skip_newlines(p)
+    body = None
+    if peek(p)[0] == "OP" and peek(p)[1] == "=>"
+        p.pos += 1
+        body = Block(stmts = List(Return(expr = Some(parse_expr(p)))))
+    else
+        body = parse_indented_block(p)
+    FnDecl(name = name, params = params, body = body, ret_type = ret_type)
+
+fn parse_params(p: Parser) -> List(Tuple(Str, Option(Str), Option(Node)))
+    params = List()
+    while peek(p)[1] != ")"
+        if peek(p)[0] == "OP" and peek(p)[1] == "..."
+            p.pos += 1
+        t := eat(p, "IDENT")
+        pname := t[1]
+        ptype = None
+        pdefault = None
+        if peek(p)[0] == "OP" and peek(p)[1] == ":"
+            p.pos += 1
+            ptype = parse_type_expr(p)
+            if peek(p)[0] == "KW" and peek(p)[1] == "where"
+                p.pos += 1
+                while peek(p)[1] not in List(",", ")")
+                    p.pos += 1
+        if peek(p)[0] == "OP" and peek(p)[1] == "="
+            p.pos += 1
+            pdefault = parse_expr(p)
+        params.push((pname, ptype, pdefault))
+        if not eat_if(p, "OP", ",")
+            break
+    params
+
+fn parse_if_stmt(p: Parser) -> If
+    eat(p, "KW", "if")
+    cond := parse_expr(p)
+    skip_newlines(p)
+    then_block = None
+    if peek(p)[0] == "OP" and peek(p)[1] == "=>"
+        p.pos += 1
+        then_block = parse_arrow_body(p)
+    else
+        then_block = parse_indented_block(p)
+    elifs = List()
+    else_block = None
+    skip_newlines(p)
+    while peek(p)[0] == "KW" and peek(p)[1] == "else"
+        p.pos += 1
+        skip_newlines(p)
+        if peek(p)[0] == "KW" and peek(p)[1] == "if"
+            p.pos += 1
+            ec := parse_expr(p)
+            skip_newlines(p)
+            if peek(p)[0] == "OP" and peek(p)[1] == "=>"
+                p.pos += 1
+                elifs.push((ec, parse_arrow_body(p)))
+            else
+                eb := parse_indented_block(p)
+                elifs.push((ec, eb))
+            skip_newlines(p)
+        elif peek(p)[0] == "OP" and peek(p)[1] == "=>"
+            p.pos += 1
+            else_block = parse_arrow_body(p)
+            break
+        else
+            else_block = parse_indented_block(p)
+            break
+    If(cond = cond, then = then_block, elifs = elifs, else_ = else_block)
+
+fn parse_for(p: Parser) -> ForLoop
+    eat(p, "KW", "for")
+    var = None
+    if peek(p)[0] == "OP" and peek(p)[1] == "("
+        p.pos += 1
+        vars_ = List(eat(p, "IDENT")[1])
+        while eat_if(p, "OP", ",")
+            vars_.push(eat(p, "IDENT")[1])
+        eat(p, "OP", ")")
+        var = vars_
+    else
+        var_t := peek(p)
+        if var_t[0] == "IDENT" and peek(p, 1)[0] == "OP" and peek(p, 1)[1] == ","
+            v1 := eat(p, "IDENT")[1]
+            eat(p, "OP", ",")
+            v2 := eat(p, "IDENT")[1]
+            var = List(v1, v2)
+        else
+            var = eat(p, "IDENT")[1]
+    eat(p, "KW", "in")
+    iter_ := parse_expr(p)
+    skip_newlines(p)
+    body = None
+    if peek(p)[0] == "OP" and peek(p)[1] == "=>"
+        p.pos += 1
+        body = Block(stmts = List(parse_stmt(p)))
+    else
+        body = parse_indented_block(p)
+    ForLoop(var = var, iter_ = iter_, body = body)
+
+fn parse_while(p: Parser) -> WhileLoop
+    eat(p, "KW", "while")
+    cond := parse_expr(p)
+    skip_newlines(p)
+    body = None
+    if peek(p)[0] == "OP" and peek(p)[1] == "=>"
+        p.pos += 1
+        body = Block(stmts = List(parse_stmt(p)))
+    else
+        body = parse_indented_block(p)
+    WhileLoop(cond = cond, body = body)
+
+fn parse_match(p: Parser) -> MatchNode
+    eat(p, "KW", "match")
+    expr := parse_expr(p)
+    skip_newlines(p)
+    arms = List()
+    arm_col := tok_col(p)
+    loop
+        skip_newlines(p)
+        t := peek(p)
+        if t[0] == "EOF"
+            break
+        cur_col := if t.len() > 3 then t[3] else 0
+        if cur_col < arm_col
+            break
+        if t[0] == "KW" and t[1] in List("fn", "type", "for", "while", "return", "match", "else")
+            break
+        if t[0] == "OP" and t[1] == ")"
+            break
+        pattern := parse_match_pattern(p)
+        guard = None
+        if peek(p)[0] == "KW" and peek(p)[1] == "if"
+            p.pos += 1
+            guard = parse_expr(p)
+        eat(p, "OP", "=>")
+        skip_newlines(p)
+        body := parse_match_body(p)
+        arms.push(MatchArm(pattern = pattern, guard = guard, body = body))
+        if peek(p)[0] not in List("IDENT", "INT", "FLOAT", "STRING", "BOOL", "NIL", "KW", "OP")
+            break
+        t2 := peek(p)
+        if t2[0] == "EOF"
+            break
+        if t2[0] == "KW" and t2[1] in List("fn", "type", "for", "while", "return", "import")
+            break
+    MatchNode(expr = expr, arms = arms)
+
+fn parse_match_pattern(p: Parser) -> Any
+    parts = List(parse_single_pattern(p))
+    while peek(p)[0] == "OP" and peek(p)[1] == "|"
+        p.pos += 1
+        parts.push(parse_single_pattern(p))
+    if parts.len() > 1 then parts else parts[0]
+
+fn parse_single_pattern(p: Parser) -> Any
+    t := peek(p)
+    if t[0] == "OP" and t[1] == "_"
+        p.pos += 1
+        return ("wildcard",)
+    if t[0] == "NIL"
+        p.pos += 1
+        return ("literal", None)
+    if t[0] == "BOOL"
+        p.pos += 1
+        return ("literal", t[1] == "true")
+    if t[0] == "INT"
+        p.pos += 1
+        v := t[1].to_int()
+        if peek(p)[0] == "OP" and peek(p)[1] in List("..", "..=")
+            inclusive := peek(p)[1] == "..="
+            p.pos += 1
+            if peek(p)[0] == "INT"
+                end := eat(p, "INT")[1].to_int()
+                return ("range", v, end, inclusive)
+            return ("range_from", v)
+        return ("literal", v)
+    if t[0] == "FLOAT"
+        p.pos += 1
+        return ("literal", t[1].to_float())
+    if t[0] == "STRING"
+        p.pos += 1
+        return ("literal", t[1])
+    if t[0] == "OP" and t[1] == ".."
+        p.pos += 1
+        if peek(p)[0] == "INT"
+            end := eat(p, "INT")[1].to_int()
+            return ("range_to", end, false)
+        if peek(p)[0] == "OP" and peek(p)[1] == "="
+            p.pos += 1
+            end := eat(p, "INT")[1].to_int()
+            return ("range_to", end, true)
+    if t[0] == "IDENT"
+        name := eat(p, "IDENT")[1]
+        -- Enum variant: TypeName.Variant
+        if peek(p)[0] == "OP" and peek(p)[1] == "."
+            p.pos += 1
+            variant := eat(p, "IDENT")[1]
+            if peek(p)[0] == "OP" and peek(p)[1] == "("
+                p.pos += 1
+                inner := parse_single_pattern(p)
+                eat(p, "OP", ")")
+                return ("enum_variant", name, variant, inner)
+            return ("enum_variant", name, variant, None)
+        if peek(p)[0] == "OP" and peek(p)[1] == "("
+            p.pos += 1
+            inners = List(parse_single_pattern(p))
+            while eat_if(p, "OP", ",")
+                inners.push(parse_single_pattern(p))
+            eat(p, "OP", ")")
+            inner := if inners.len() == 1 then inners[0] else inners
+            return ("constructor", name, inner)
+        if name == "Some"
+            if peek(p)[0] == "OP" and peek(p)[1] == "("
+                p.pos += 1
+                inner := parse_single_pattern(p)
+                eat(p, "OP", ")")
+                return ("some", inner)
+            return ("some", ("wildcard",))
+        if name == "None"
+            return ("none",)
+        if name == "Ok"
+            if peek(p)[0] == "OP" and peek(p)[1] == "("
+                p.pos += 1
+                inner := parse_single_pattern(p)
+                eat(p, "OP", ")")
+                return ("ok", inner)
+            return ("ok", ("wildcard",))
+        if name == "Err"
+            if peek(p)[0] == "OP" and peek(p)[1] == "("
+                p.pos += 1
+                inner := parse_single_pattern(p)
+                eat(p, "OP", ")")
+                return ("err", inner)
+            return ("err", ("wildcard",))
+        if name[0].is_upper()
+            return ("type_check", name)
+        return ("bind", name)
+    ("wildcard",)
+
+fn parse_match_body(p: Parser) -> Node
+    if peek(p)[0] == "NEWLINE"
+        skip_newlines(p)
+        s := parse_stmt(p)
+        return Block(stmts = if s != None then List(s) else List())
+    parse_expr(p)
+
+-- Expression precedence chain
+
+fn parse_expr(p: Parser) -> Node
+    parse_catch(p)
+
+fn parse_catch(p: Parser) -> Node
+    parse_or(p)
+
+fn parse_or(p: Parser) -> Node
+    left = parse_and(p)
+    loop
+        t := peek(p)
+        if t[0] == "KW" and t[1] == "or"
+            p.pos += 1
+            right := parse_and(p)
+            left = BinOp(op = "or", l = left, r = right)
+        elif t[0] == "OP" and t[1] == "||"
+            p.pos += 1
+            right := parse_and(p)
+            left = BinOp(op = "or", l = left, r = right)
+        elif t[0] == "OP" and t[1] == "??"
+            p.pos += 1
+            right := parse_and(p)
+            left = BinOp(op = "??", l = left, r = right)
+        else
+            break
+    left
+
+fn parse_and(p: Parser) -> Node
+    left = parse_not(p)
+    loop
+        t := peek(p)
+        if t[0] == "KW" and t[1] == "and"
+            p.pos += 1
+            right := parse_not(p)
+            left = BinOp(op = "and", l = left, r = right)
+        elif t[0] == "OP" and t[1] == "&&"
+            p.pos += 1
+            right := parse_not(p)
+            left = BinOp(op = "and", l = left, r = right)
+        else
+            break
+    left
+
+fn parse_not(p: Parser) -> Node
+    if peek(p)[0] == "KW" and peek(p)[1] == "not"
+        p.pos += 1
+        return UnOp(op = "not", expr = parse_not(p))
+    parse_compare(p)
+
+fn parse_compare(p: Parser) -> Node
+    left = parse_range(p)
+    loop
+        t := peek(p)
+        if t[0] == "OP" and t[1] in List("==", "!=", "<", ">", "<=", ">=")
+            op := t[1]
+            p.pos += 1
+            right := parse_range(p)
+            left = BinOp(op = op, l = left, r = right)
+        elif t[0] == "KW" and t[1] == "is"
+            p.pos += 1
+            type_name := eat(p, "IDENT")[1]
+            left = BinOp(op = "is", l = left, r = Ident(name = type_name))
+        else
+            break
+    left
+
+fn parse_range(p: Parser) -> Node
+    left := parse_add(p)
+    if peek(p)[0] == "OP" and peek(p)[1] in List("..", "..=")
+        inclusive := peek(p)[1] == "..="
+        p.pos += 1
+        right := parse_add(p)
+        return RangeLit(start = left, end = right, inclusive = inclusive)
+    left
+
+fn parse_add(p: Parser) -> Node
+    left = parse_mul(p)
+    loop
+        t := peek(p)
+        if t[0] == "OP" and t[1] in List("+", "-")
+            op := t[1]
+            p.pos += 1
+            right := parse_mul(p)
+            left = BinOp(op = op, l = left, r = right)
+        else
+            break
+    left
+
+fn parse_mul(p: Parser) -> Node
+    left = parse_pipe(p)
+    loop
+        t := peek(p)
+        if t[0] == "OP" and t[1] in List("*", "/", "//", "%")
+            op := t[1]
+            p.pos += 1
+            right := parse_pipe(p)
+            left = BinOp(op = op, l = left, r = right)
+        else
+            break
+    left
+
+fn parse_pipe(p: Parser) -> Node
+    left = parse_pow(p)
+    loop
+        skip_newlines(p)
+        if peek(p)[0] == "OP" and peek(p)[1] == "|>"
+            p.pos += 1
+            skip_newlines(p)
+            right := parse_postfix(p)
+            left = Pipe(l = left, r = right)
+        else
+            break
+    left
+
+fn parse_pow(p: Parser) -> Node
+    left := parse_unary(p)
+    if peek(p)[0] == "OP" and peek(p)[1] == "**"
+        p.pos += 1
+        right := parse_pow(p)  -- right-associative
+        return BinOp(op = "**", l = left, r = right)
+    left
+
+fn parse_unary(p: Parser) -> Node
+    t := peek(p)
+    if t[0] == "OP" and t[1] == "-"
+        p.pos += 1
+        return UnOp(op = "-", expr = parse_unary(p))
+    if t[0] == "OP" and t[1] == "!"
+        p.pos += 1
+        return UnOp(op = "!", expr = parse_unary(p))
+    parse_postfix(p)
+
+fn parse_postfix(p: Parser) -> Node
+    node = parse_primary(p)
+    loop
+        t := peek(p)
+        -- Field access
+        if t[0] == "OP" and t[1] == "." and peek(p, 1)[0] == "IDENT"
+            p.pos += 1
+            field := eat(p, "IDENT")[1]
+            if peek(p)[0] == "OP" and peek(p)[1] == "("
+                p.pos += 1
+                args = List()
+                while peek(p)[1] != ")"
+                    args.push(parse_expr(p))
+                    if not eat_if(p, "OP", ",")
+                        break
+                eat(p, "OP", ")")
+                node = Call(fn = Field(obj = node, field = field), args = args)
+            else
+                node = Field(obj = node, field = field)
+        -- Index
+        elif t[0] == "OP" and t[1] == "["
+            p.pos += 1
+            idx := parse_expr(p)
+            eat(p, "OP", "]")
+            node = Index(obj = node, idx = idx)
+        -- Call
+        elif t[0] == "OP" and t[1] == "("
+            p.pos += 1
+            args = List()
+            while peek(p)[1] != ")"
+                args.push(parse_expr(p))
+                if not eat_if(p, "OP", ",")
+                    break
+            eat(p, "OP", ")")
+            node = Call(fn = node, args = args)
+        -- Optional chaining ?.
+        elif t[0] == "OP" and t[1] == "?."
+            p.pos += 1
+            field := eat(p, "IDENT")[1]
+            node = BinOp(op = "?.", l = node, r = Ident(name = field))
+        else
+            break
+    node
+
+fn parse_primary(p: Parser) -> Node
+    skip_newlines(p)
+    t := peek(p)
+
+    if t[0] == "INT"
+        p.pos += 1
+        return Num(v = t[1].to_int())
+    if t[0] == "FLOAT"
+        p.pos += 1
+        return Num(v = t[1].to_float())
+    if t[0] == "BOOL"
+        p.pos += 1
+        return BoolNode(v = t[1] == "true")
+    if t[0] == "NIL"
+        p.pos += 1
+        return Nil()
+    if t[0] == "STRING"
+        p.pos += 1
+        return StrNode(v = t[1])
+
+    -- Placeholder lambda: _ * 2 etc
+    if t[0] == "OP" and t[1] == "_"
+        p.pos += 1
+        if peek(p)[0] == "OP" and peek(p)[1] in List("+", "-", "*", "/", "%", "**", "//")
+            op := peek(p)[1]
+            p.pos += 1
+            rhs := parse_primary(p)
+            return Fn(params = List(("_", None, None)),
+                      body = Block(stmts = List(Return(expr = Some(BinOp(op = op, l = Ident(name = "_"), r = rhs))))))
+        if peek(p)[0] == "OP" and peek(p)[1] == "."
+            p.pos += 1
+            field := eat(p, "IDENT")[1]
+            return Fn(params = List(("_", None, None)),
+                      body = Block(stmts = List(Return(expr = Some(Field(obj = Ident(name = "_"), field = field))))))
+        return Fn(params = List(("_", None, None)),
+                  body = Block(stmts = List(Return(expr = Some(Ident(name = "_"))))))
+
+    -- If expression
+    if t[0] == "KW" and t[1] == "if"
+        p.pos += 1
+        cond := parse_expr(p)
+        skip_newlines(p)
+        then_block = None
+        if peek(p)[0] == "OP" and peek(p)[1] == "=>"
+            p.pos += 1
+            if peek(p)[0] == "KW" and peek(p)[1] == "return"
+                p.pos += 1
+                then_val := parse_expr(p)
+                then_block = Block(stmts = List(Return(expr = Some(then_val))))
+            else
+                then_val := parse_expr(p)
+                then_block = Block(stmts = List(then_val))
+        else
+            then_block = parse_indented_block(p)
+        elifs = List()
+        else_block = None
+        skip_newlines(p)
+        while peek(p)[0] == "KW" and peek(p)[1] == "else"
+            p.pos += 1
+            skip_newlines(p)
+            if peek(p)[0] == "KW" and peek(p)[1] == "if"
+                p.pos += 1
+                ec := parse_expr(p)
+                skip_newlines(p)
+                if peek(p)[0] == "OP" and peek(p)[1] == "=>"
+                    p.pos += 1
+                    if peek(p)[0] == "KW" and peek(p)[1] == "return"
+                        p.pos += 1
+                        ev := parse_expr(p)
+                        elifs.push((ec, Block(stmts = List(Return(expr = Some(ev))))))
+                    else
+                        ev := parse_expr(p)
+                        elifs.push((ec, Block(stmts = List(ev))))
+                else
+                    eb := parse_indented_block(p)
+                    elifs.push((ec, eb))
+                skip_newlines(p)
+            elif peek(p)[0] == "OP" and peek(p)[1] == "=>"
+                p.pos += 1
+                if peek(p)[0] == "KW" and peek(p)[1] == "return"
+                    p.pos += 1
+                    else_val := parse_expr(p)
+                    else_block = Block(stmts = List(Return(expr = Some(else_val))))
+                else
+                    else_val := parse_expr(p)
+                    else_block = Block(stmts = List(else_val))
+                break
+            else
+                else_block = parse_indented_block(p)
+                break
+        return If(cond = cond, then = then_block, elifs = elifs, else_ = else_block)
+
+    -- fn (anonymous)
+    if t[0] == "KW" and t[1] == "fn"
+        p.pos += 1
+        eat(p, "OP", "(")
+        params := parse_params(p)
+        eat(p, "OP", ")")
+        if peek(p)[0] == "OP" and peek(p)[1] == "->"
+            p.pos += 1
+            parse_type_expr(p)  -- skip return type
+        body = None
+        if peek(p)[0] == "OP" and peek(p)[1] == "=>"
+            p.pos += 1
+            body = Block(stmts = List(Return(expr = Some(parse_expr(p)))))
+        else
+            body = parse_indented_block(p)
+        return Fn(params = params, body = body)
+
+    -- Tuple or grouping
+    if t[0] == "OP" and t[1] == "("
+        p.pos += 1
+        if peek(p)[0] == "OP" and peek(p)[1] == ")"
+            p.pos += 1
+            return TupleLit(items = List())  -- unit
+        first := parse_expr(p)
+        if peek(p)[0] == "OP" and peek(p)[1] == ","
+            items = List(first)
+            while eat_if(p, "OP", ",")
+                if peek(p)[1] == ")"
+                    break
+                items.push(parse_expr(p))
+            eat(p, "OP", ")")
+            return TupleLit(items = items)
+        eat(p, "OP", ")")
+        return first
+
+    -- List literal
+    if t[0] == "OP" and t[1] == "["
+        p.pos += 1
+        items = List()
+        skip_newlines(p)
+        while peek(p)[1] != "]"
+            items.push(parse_expr(p))
+            if not eat_if(p, "OP", ",")
+                break
+            skip_newlines(p)
+            if peek(p)[1] == "]"
+                break
+        eat(p, "OP", "]")
+        return ListLit(items = items)
+
+    -- Map/Set literal
+    if t[0] == "OP" and t[1] == "{"
+        p.pos += 1
+        if peek(p)[1] == "}"
+            p.pos += 1
+            return MapLit(pairs = List())
+        first_key := parse_expr(p)
+        if peek(p)[0] == "OP" and peek(p)[1] == ":"
+            -- Map
+            p.pos += 1
+            first_val := parse_expr(p)
+            pairs = List((first_key, first_val))
+            while eat_if(p, "OP", ",")
+                skip_newlines(p)
+                if peek(p)[1] == "}"
+                    break
+                k := parse_expr(p)
+                eat(p, "OP", ":")
+                v := parse_expr(p)
+                pairs.push((k, v))
+            eat(p, "OP", "}")
+            return MapLit(pairs = pairs)
+        else
+            -- Set
+            items = List(first_key)
+            while eat_if(p, "OP", ",")
+                items.push(parse_expr(p))
+            eat(p, "OP", "}")
+            return SetLit(items = items)
+
+    -- Identifier
+    if t[0] == "IDENT"
+        p.pos += 1
+        name := t[1]
+        -- Struct literal: Name { field: val, ... }
+        if peek(p)[0] == "OP" and peek(p)[1] == "{"
+            p.pos += 1
+            fields = Map()
+            spread_base = None
+            while peek(p)[1] != "}"
+                if peek(p)[0] == "OP" and peek(p)[1] == ".."
+                    p.pos += 1
+                    spread_base = parse_expr(p)
+                    eat_if(p, "OP", ",")
+                    continue
+                fname := eat(p, "IDENT")[1]
+                if peek(p)[0] == "OP" and peek(p)[1] == ":"
+                    p.pos += 1
+                    fields[fname] = parse_expr(p)
+                else
+                    fields[fname] = Ident(name = fname)
+                if not eat_if(p, "OP", ",")
+                    break
+            eat(p, "OP", "}")
+            sl := StructLit(name = name, fields = fields)
+            if spread_base != None
+                return Spread(base = spread_base, overrides = fields)
+            return sl
+        return Ident(name = name)
+
+    -- KW as value: Some, None, Ok, Err, true, false
+    if t[0] == "KW" and t[1] in List("Some", "None", "Ok", "Err", "true", "false")
+        p.pos += 1
+        if t[1] == "true"
+            return BoolNode(v = true)
+        if t[1] == "false"
+            return BoolNode(v = false)
+        if t[1] == "None"
+            return Nil()
+        -- Some(x), Ok(x), Err(x)
+        if peek(p)[0] == "OP" and peek(p)[1] == "("
+            p.pos += 1
+            inner := parse_expr(p)
+            eat(p, "OP", ")")
+            return Call(fn = Ident(name = t[1]), args = List(inner))
+        return Ident(name = t[1])
+
+    if t[0] == "ANNOT"
+        p.pos += 1
+        return parse_primary(p)
+
+    -- Match as expression
+    if t[0] == "KW" and t[1] == "match"
+        return parse_match(p)
+
+    panic("Unexpected token {t[0]} '{t[1]}' at line {t[2]}")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Evaluator
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type Env
+    vars:      Map(Str, Any) = Map()
+    immutable: Set(Str) = Set()
+    parent:    Option(Env) = None
+
+fn env_get(env: Env, name: Str) -> Any
+    if name in env.vars
+        return env.vars[name]
+    if env.parent != None
+        return env_get(env.parent, name)
+    panic("Undefined variable: '{name}'")
+
+fn env_set(env: Env, name: Str, value: Any, immutable: Bool = true)
+    env.vars[name] = value
+    if immutable
+        env.immutable.add(name)
+
+fn env_assign(env: Env, name: Str, value: Any, force_mutable: Bool = false)
+    if name in env.vars
+        if name in env.immutable and not force_mutable
+            panic("Cannot reassign immutable binding '{name}'")
+        env.vars[name] = value
+        if force_mutable
+            env.immutable.discard(name)
+        return
+    if env.parent != None
+        env_assign(env.parent, name, value, force_mutable)
+        return
+    panic("Undefined variable: '{name}'")
+
+fn env_define(env: Env, name: Str, value: Any, immutable: Bool = true)
+    env.vars[name] = value
+    if immutable
+        env.immutable.add(name)
+    else
+        env.immutable.discard(name)
+
+type Evaluator
+    global_env: Env
+    type_defs:  Map(Str, TypeDecl) = Map()
+
+fn evaluator_new() -> Evaluator
+    env := Env()
+    ev := Evaluator(global_env = env)
+    setup_builtins(ev)
+    ev
+
+fn format_val(ev: Evaluator, v: Any) -> Str
+    if v == None or (v is NuvolaOption and not v.is_some)
+        return "None"
+    if v is Bool
+        return if v then "true" else "false"
+    if v is Float
+        return if v == v.to_int().to_float() then v.to_int().to_str() else v.to_str()
+    if v is NuvolaFn
+        return nuvola_fn_repr(v)
+    if v is NuvolaStruct
+        return nuvola_struct_repr(v)
+    if v is NuvolaEnum
+        return nuvola_enum_repr(v)
+    if v is NuvolaOption
+        return nuvola_option_repr(v)
+    if v is NuvolaResult
+        return nuvola_result_repr(v)
+    if v is List
+        inner := v.map(fn(x) => format_val(ev, x)).join(", ")
+        return "[{inner}]"
+    if v is Map
+        inner := v.entries().map(fn(e) => "\"{e[0]}\": {format_val(ev, e[1])}").join(", ")
+        return "{" ++ inner ++ "}"
+    if v is Set
+        inner := v.to_list().sort().map(fn(x) => format_val(ev, x)).join(", ")
+        return "{" ++ inner ++ "}"
+    if v is Tuple
+        inner := v.to_list().map(fn(x) => format_val(ev, x)).join(", ")
+        return "({inner})"
+    v.to_str()
+
+fn truthy(ev: Evaluator, v: Any) -> Bool
+    if v == None
+        return false
+    if v is Bool
+        return v
+    if v is Int
+        return v != 0
+    if v is Float
+        return v != 0.0
+    if v is Str
+        return v.len() > 0
+    if v is List
+        return v.len() > 0
+    if v is NuvolaOption
+        return v.is_some
+    if v is NuvolaResult
+        return v.is_ok
+    true
+
+@io fn setup_builtins(ev: Evaluator)
+    e := ev.global_env
+    env_define(e, "print",   fn(...args) => print(args.map(fn(a) => format_val(ev, a)).join(" ")))
+    env_define(e, "println", fn(...args) => print(args.map(fn(a) => format_val(ev, a)).join(" ")))
+    env_define(e, "str",     fn(x) => format_val(ev, x))
+    env_define(e, "int",     fn(x) => if x is Bool then (if x then 1 else 0) else x.to_int())
+    env_define(e, "float",   fn(x) => x.to_float())
+    env_define(e, "bool",    fn(x) => truthy(ev, x))
+    env_define(e, "len",     fn(x) => x.len())
+    env_define(e, "range",   fn(...a) => List.range(a))
+    env_define(e, "abs",     fn(x) => math.abs(x))
+    env_define(e, "sqrt",    fn(x) => math.sqrt(x))
+    env_define(e, "floor",   fn(x) => math.floor(x))
+    env_define(e, "ceil",    fn(x) => math.ceil(x))
+    env_define(e, "round",   fn(x, n = 0) => math.round(x, n.to_int()))
+    env_define(e, "pow",     fn(x, y) => x ** y)
+    env_define(e, "max",     fn(...a) => if a.len() == 1 and a[0] is List then a[0].max() else a.max())
+    env_define(e, "min",     fn(...a) => if a.len() == 1 and a[0] is List then a[0].min() else a.min())
+    env_define(e, "sum",     fn(x) => x.sum())
+    env_define(e, "sorted",  fn(x) => x.sort())
+    env_define(e, "sort",    fn(x) => x.sort())
+    env_define(e, "reversed", fn(x) => x.reverse())
+    env_define(e, "zip",     fn(...a) => a[0].zip(a[1]).map(fn(pair) => pair.to_list()))
+    env_define(e, "enumerate", fn(x) => x.enumerate().map(fn(pair) => List(pair[0], pair[1])))
+
+    env_define(e, "map", fn(a, b = None)
+        if b == None
+            return fn(xs) => xs.map(fn(x) => call_fn(ev, a, List(x)))
+        if a is NuvolaFn or callable(a)
+            return b.map(fn(x) => call_fn(ev, a, List(x)))
+        a.map(fn(x) => call_fn(ev, b, List(x)))
+    )
+
+    env_define(e, "filter", fn(a, b = None)
+        if b == None
+            return fn(xs) => xs.filter(fn(x) => call_fn(ev, a, List(x)))
+        if a is NuvolaFn or callable(a)
+            return b.filter(fn(x) => call_fn(ev, a, List(x)))
+        a.filter(fn(x) => call_fn(ev, b, List(x)))
+    )
+
+    env_define(e, "fold",    fn(xs, init, f) => fold_fn(ev, xs, init, f))
+    env_define(e, "reduce",  fn(xs, f) => if xs.len() > 0 then fold_fn(ev, xs.slice(1), xs[0], f) else None)
+    env_define(e, "flatten", fn(xs) => xs.flatten())
+    env_define(e, "count",   fn(xs) => xs.len())
+    env_define(e, "any",     fn(f_or_xs, xs = None) =>
+        if xs != None then xs.any(fn(x) => call_fn(ev, f_or_xs, List(x))) else f_or_xs.any(fn(x) => x))
+    env_define(e, "all",     fn(f_or_xs, xs = None) =>
+        if xs != None then xs.all(fn(x) => call_fn(ev, f_or_xs, List(x))) else f_or_xs.all(fn(x) => x))
+    env_define(e, "take",    fn(xs, n) => xs.slice(0, n.to_int()))
+    env_define(e, "drop",    fn(xs, n) => xs.slice(n.to_int()))
+    env_define(e, "join",    fn(xs, sep = "") => xs.map(fn(x) => format_val(ev, x)).join(sep))
+    env_define(e, "split",   fn(s, sep = " ") => s.split(sep))
+    env_define(e, "contains", fn(xs, x) => x in xs)
+    env_define(e, "type_of", fn(x) => type_of(x))
+    env_define(e, "assert",  fn(cond, msg = "Assertion failed") => if not cond then panic(msg))
+    env_define(e, "panic",   fn(msg = "panic") => panic(msg))
+    env_define(e, "Some",    fn(x) => NuvolaOption(value = x, is_some = true))
+    env_define(e, "None_",   NuvolaOption(value = None, is_some = false))
+    env_define(e, "Ok",      fn(x) => NuvolaResult(value = x, is_ok = true))
+    env_define(e, "Err",     fn(x) => NuvolaResult(value = x, is_ok = false))
+    env_define(e, "PI",      math.PI)
+    env_define(e, "E",       math.E)
+    env_define(e, "TAU",     math.TAU)
+    env_define(e, "inf",     math.INF)
+    env_define(e, "nan",     math.NAN)
+    env_define(e, "time_ns", fn() => time.now_ns())
+    env_define(e, "time_s",  fn() => time.now_s())
+    -- String methods as free functions
+    env_define(e, "to_upper", fn(s) => s.to_upper())
+    env_define(e, "to_lower", fn(s) => s.to_lower())
+    env_define(e, "trim",    fn(s) => s.trim())
+    env_define(e, "starts_with", fn(s, p) => s.starts_with(p))
+    env_define(e, "ends_with",   fn(s, p) => s.ends_with(p))
+    env_define(e, "replace", fn(s, a, b) => s.replace(a, b))
+    env_define(e, "chars",   fn(s) => s.chars())
+    env_define(e, "bytes",   fn(s) => s.bytes())
+    env_define(e, "parse_i64", fn(s) => s.to_int())
+    env_define(e, "parse_f64", fn(s) => s.to_float())
+    -- Math
+    env_define(e, "sin",    math.sin)
+    env_define(e, "cos",    math.cos)
+    env_define(e, "tan",    math.tan)
+    env_define(e, "log",    math.log)
+    env_define(e, "log2",   math.log2)
+    env_define(e, "log10",  math.log10)
+    env_define(e, "exp",    math.exp)
+    env_define(e, "tanh",   math.tanh)
+    env_define(e, "fib",    None)  -- will be user-defined
+
+fn fold_fn(ev: Evaluator, xs: List, init: Any, f: Any) -> Any
+    acc = init
+    for x in xs
+        acc = call_fn(ev, f, List(acc, x))
+    acc
+
+fn call_fn(ev: Evaluator, fn_val: Any, args: List(Any)) -> Any
+    if callable(fn_val)
+        return fn_val(args)
+    if fn_val is NuvolaFn
+        child := Env(parent = Some(fn_val.env))
+        for i in 0..fn_val.params.len()
+            (pname, _, pdefault) := fn_val.params[i]
+            if i < args.len()
+                env_define(child, pname, args[i], immutable = false)
+            elif pdefault != None
+                env_define(child, pname, eval_node(ev, pdefault, child), immutable = false)
+        match eval_node(ev, fn_val.body, child)
+            ReturnSignal(v) -> v
+            result          -> result
+    panic("Not callable: {repr(fn_val)}")
+
+fn range_to_list(ev: Evaluator, r: RangeLit, env: Env) -> List(Int)
+    start := if r.start != None then eval_node(ev, r.start, env) else 0
+    end   := if r.end != None then eval_node(ev, r.end, env) else 0
+    if r.inclusive
+        List.range(start.to_int(), end.to_int() + 1)
+    else
+        List.range(start.to_int(), end.to_int())
+
+fn interpolate(ev: Evaluator, s: Str, env: Env) -> Str
+    result = List()
+    i = 0
+    while i < s.len()
+        if s[i] == "{" and i + 1 < s.len() and s[i + 1] != "{"
+            j := s.find("}", i + 1)
+            if j == -1
+                result.push(s[i])
+                i += 1
+                continue
+            expr_str := s.slice(i + 1, j)
+            fmt_spec = None
+            if ":" in expr_str
+                parts := expr_str.rsplit(":", 1)
+                expr_str = parts[0]
+                fmt_spec = parts[1]
+            match catch(fn()
+                toks := tokenize(expr_str)
+                p_inner := parser_new(toks)
+                node := parse_expr(p_inner)
+                eval_node(ev, node, env)
+            )
+                Ok(val) ->
+                    if fmt_spec != None
+                        if fmt_spec.ends_with("f") or "f" in fmt_spec
+                            decimals := match regex.search("\\.([0-9]+)", fmt_spec)
+                                Some(m) -> m[1].to_int()
+                                None    -> 2
+                            result.push(val.to_float().format(".{decimals}f"))
+                        else
+                            result.push(format_val(ev, val))
+                    else
+                        result.push(format_val(ev, val))
+                Err(_) ->
+                    result.push(s.slice(i, j + 1))
+            i = j + 1
+        elif s.slice(i, i + 2) == "{{"
+            result.push("{")
+            i += 2
+        elif s.slice(i, i + 2) == "}}"
+            result.push("}")
+            i += 2
+        else
+            result.push(s[i])
+            i += 1
+    result.join("")
+
+fn eval_node(ev: Evaluator, node: Node, env: Env) -> Any
+    if node == None
+        return None
+
+    if node is Num
+        return node.v
+    if node is BoolNode
+        return node.v
+    if node is Nil
+        return NuvolaOption(value = None, is_some = false)
+    if node is StrNode
+        return interpolate(ev, node.v, env)
+
+    if node is Ident
+        name := node.name
+        if name == "None"
+            return NuvolaOption(value = None, is_some = false)
+        if name == "true"
+            return true
+        if name == "false"
+            return false
+        return env_get(env, name)
+
+    if node is RangeLit
+        return range_to_list(ev, node, env)
+
+    if node is ListLit
+        return node.items.map(fn(item) => eval_node(ev, item, env))
+
+    if node is MapLit
+        result = Map()
+        for (k, v) in node.pairs
+            result[format_val(ev, eval_node(ev, k, env))] = eval_node(ev, v, env)
+        return result
+
+    if node is SetLit
+        return node.items.map(fn(item) => eval_node(ev, item, env)).to_set()
+
+    if node is TupleLit
+        return node.items.map(fn(item) => eval_node(ev, item, env)).to_tuple()
+
+    if node is StructLit
+        fields = Map()
+        for (k, v) in node.fields.entries()
+            fields[k] = eval_node(ev, v, env)
+        return NuvolaStruct(type_name = node.name, fields = fields)
+
+    if node is Spread
+        base := eval_node(ev, node.base, env)
+        fields := if base is NuvolaStruct then Map(base.fields) else Map()
+        for (k, v) in node.overrides.entries()
+            fields[k] = eval_node(ev, v, env)
+        type_name := if base is NuvolaStruct then base.type_name else "Struct"
+        return NuvolaStruct(type_name = type_name, fields = fields)
+
+    if node is BinOp
+        return eval_binop(ev, node, env)
+
+    if node is UnOp
+        v := eval_node(ev, node.expr, env)
+        if node.op == "-"
+            return -v
+        if node.op == "not" or node.op == "!"
+            return not v
+        return v
+
+    if node is Pipe
+        left := eval_node(ev, node.l, env)
+        right := eval_node(ev, node.r, env)
+        if callable(right) or right is NuvolaFn
+            return call_fn(ev, right, List(left))
+        if node.r is Call
+            fn_val := eval_node(ev, node.r.fn, env)
+            args := List(left) ++ node.r.args.map(fn(a) => eval_node(ev, a, env))
+            return call_fn(ev, fn_val, args)
+        panic("Pipe target is not callable: {repr(right)}")
+
+    if node is Field
+        obj := eval_node(ev, node.obj, env)
+        field := node.field
+        if obj is NuvolaStruct
+            if field in obj.fields
+                return obj.fields[field]
+            panic("{obj.type_name} has no field '{field}'")
+        if obj is NuvolaOption
+            if field == "is_some"
+                return obj.is_some
+            if field == "value"
+                return obj.value
+        if obj is NuvolaResult
+            if field == "is_ok"
+                return obj.is_ok
+            if field == "value"
+                return obj.value
+        if field == "is_some" and not (obj is NuvolaOption) and not (obj is NuvolaResult)
+            return true
+        if field == "value" and not (obj is NuvolaOption) and not (obj is NuvolaResult)
+            return obj
+        if obj is List
+            if field == "len"
+                return obj.len()
+            if field == "is_empty"
+                return obj.len() == 0
+            if field == "first"
+                return if obj.len() > 0 then obj[0] else NuvolaOption(value = None, is_some = false)
+            if field == "last"
+                return if obj.len() > 0 then obj[obj.len() - 1] else NuvolaOption(value = None, is_some = false)
+        if obj is Str
+            if field == "len"
+                return obj.len()
+            if field == "is_empty"
+                return obj.len() == 0
+        if obj is Map
+            if field == "len"
+                return obj.len()
+            if field in obj
+                return obj[field]
+        return get_method(ev, obj, field)
+
+    if node is Index
+        obj := eval_node(ev, node.obj, env)
+        idx := eval_node(ev, node.idx, env)
+        if obj is List
+            return obj[idx.to_int()]
+        if obj is Str
+            return obj[idx.to_int()]
+        if obj is Map
+            key := if idx is Str then idx else format_val(ev, idx)
+            return obj.get(key, NuvolaOption(value = None, is_some = false))
+        if obj is Tuple
+            return obj[idx.to_int()]
+        panic("Cannot index {type_of(obj)}")
+
+    if node is Call
+        fn_node := node.fn
+        if fn_node is Field
+            obj := eval_node(ev, fn_node.obj, env)
+            method := fn_node.field
+            args := node.args.map(fn(a) => eval_node(ev, a, env))
+            return call_method(ev, obj, method, args, env)
+        fn_val := eval_node(ev, fn_node, env)
+        args := node.args.map(fn(a) => eval_node(ev, a, env))
+        return call_fn(ev, fn_val, args)
+
+    if node is Assign
+        val := eval_node(ev, node.expr, env)
+        if node.immutable
+            env_define(env, node.name, val, immutable = true)
+        else
+            -- env_assign panics if the variable doesn't exist yet,
+            -- so we catch the panic and fall back to defining a new mutable binding.
+            match catch(fn() => env_assign(env, node.name, val, force_mutable = true))
+                Err(_) ->
+                    env_define(env, node.name, val, immutable = false)
+                _ -> ()
+        return val
+
+    if node is IndexAssign
+        obj := eval_node(ev, node.obj, env)
+        idx := eval_node(ev, node.idx, env)
+        val := eval_node(ev, node.expr, env)
+        if obj is List
+            obj[idx.to_int()] = val
+        elif obj is Map
+            key := if idx is Str then idx else format_val(ev, idx)
+            obj[key] = val
+        return val
+
+    if node is FieldAssign
+        obj := eval_node(ev, node.obj, env)
+        val := eval_node(ev, node.expr, env)
+        if obj is NuvolaStruct
+            obj.fields[node.field] = val
+        elif obj is Map
+            obj[node.field] = val
+        return val
+
+    if node is Destructure
+        rhs := eval_node(ev, node.expr, env)
+        destructure(ev, node.pattern, rhs, env)
+        return rhs
+
+    if node is Fn
+        return NuvolaFn(params = node.params, body = node.body, env = env, name = node.name)
+
+    if node is FnDecl
+        fn_val := NuvolaFn(params = node.params, body = node.body, env = env, name = node.name)
+        env_define(env, node.name, fn_val, immutable = true)
+        return fn_val
+
+    if node is If
+        cond := eval_node(ev, node.cond, env)
+        if truthy(ev, cond)
+            return eval_node(ev, node.then, env)
+        for (ec, eb) in node.elifs
+            if truthy(ev, eval_node(ev, ec, env))
+                return eval_node(ev, eb, env)
+        if node.else_ != None
+            return eval_node(ev, node.else_, env)
+        return NuvolaOption(value = None, is_some = false)
+
+    if node is MatchNode
+        val := eval_node(ev, node.expr, env)
+        for arm in node.arms
+            child_env := Env(parent = Some(env))
+            if match_pattern(ev, arm.pattern, val, child_env)
+                if arm.guard != None and not truthy(ev, eval_node(ev, arm.guard, child_env))
+                    continue
+                return eval_node(ev, arm.body, child_env)
+        return NuvolaOption(value = None, is_some = false)
+
+    if node is Block
+        result = NuvolaOption(value = None, is_some = false)
+        for stmt in node.stmts
+            result = eval_node(ev, stmt, env)
+            -- Propagate control flow signals immediately (these are values,
+            -- not exceptions, so we must short-circuit manually)
+            if result is ReturnSignal or result is BreakSignal or result is ContinueSignal
+                return result
+        return result
+
+    if node is ForLoop
+        iter_val := eval_node(ev, node.iter_, env)
+        if iter_val is Map
+            iter_val = iter_val.entries().to_list()
+        result = None
+        for item in iter_val
+            child := Env(parent = Some(env))
+            if node.var is List
+                if item is List or item is Tuple
+                    for i in 0..node.var.len()
+                        env_define(child, node.var[i], item[i], immutable = true)
+                else
+                    env_define(child, node.var[0], item, immutable = true)
+            else
+                env_define(child, node.var, item, immutable = true)
+            match eval_node(ev, node.body, child)
+                ContinueSignal    -> continue
+                BreakSignal(v)    -> return v
+                r if r is ReturnSignal -> return r
+                r                 -> result = r
+        return result
+
+    if node is WhileLoop
+        result = None
+        while truthy(ev, eval_node(ev, node.cond, env))
+            match eval_node(ev, node.body, env)
+                ContinueSignal    -> continue
+                BreakSignal(v)    -> return v
+                r if r is ReturnSignal -> return r
+                r                 -> result = r
+        return result
+
+    if node is Return
+        val := if node.expr != None then eval_node(ev, node.expr, env) else None
+        return ReturnSignal(v = val)
+
+    if node is Break
+        val := if node.expr != None then eval_node(ev, node.expr, env) else None
+        return BreakSignal(v = val)
+
+    if node is Continue
+        return ContinueSignal()
+
+    if node is TypeDecl
+        ev.type_defs[node.name] = node
+        if node.fields != None
+            tname := node.name
+            tfields := node.fields
+            constructor := fn(...kwargs)
+                fields = Map()
+                for (fname, (ftype, fdefault)) in tfields.entries()
+                    if fname in kwargs
+                        fields[fname] = kwargs[fname]
+                    elif fdefault != None
+                        fields[fname] = eval_node(ev, fdefault, ev.global_env)
+                    else
+                        fields[fname] = None
+                NuvolaStruct(type_name = tname, fields = fields)
+            env_define(env, node.name, constructor, immutable = true)
+        return None
+
+    if node is Import
+        return None
+
+    if node is Annotation
+        return eval_node(ev, node.inner, env)
+
+    None
+
+fn eval_binop(ev: Evaluator, node: BinOp, env: Env) -> Any
+    op := node.op
+    -- Short-circuit
+    if op == "and"
+        l := eval_node(ev, node.l, env)
+        return if not truthy(ev, l) then l else eval_node(ev, node.r, env)
+    if op == "or"
+        l := eval_node(ev, node.l, env)
+        return if truthy(ev, l) then l else eval_node(ev, node.r, env)
+    if op == "??"
+        l := eval_node(ev, node.l, env)
+        if l is NuvolaOption
+            return if l.is_some then l.value else eval_node(ev, node.r, env)
+        return if l != None then l else eval_node(ev, node.r, env)
+
+    l := eval_node(ev, node.l, env)
+    r := eval_node(ev, node.r, env)
+
+    match op
+        "+" ->
+            if l is Str or r is Str
+                return format_val(ev, l) ++ format_val(ev, r)
+            if l is List and r is List
+                return l ++ r
+            l + r
+        "-"  -> l - r
+        "*" ->
+            if l is Str and r is Int
+                return l.repeat(r)
+            if l is List and r is Int
+                result = List()
+                for _ in 0..r
+                    result = result ++ l
+                return result
+            l * r
+        "/"  -> l / r
+        "//" -> l // r
+        "%"  -> l % r
+        "**" -> l ** r
+        "==" ->
+            if l is NuvolaOption and r is NuvolaOption
+                return l.is_some == r.is_some and l.value == r.value
+            l == r
+        "!=" -> l != r
+        "<"  -> l < r
+        ">"  -> l > r
+        "<=" -> l <= r
+        ">=" -> l >= r
+        "is" ->
+            type_name := if r is Str then r elif r is Ident then r.name else r.to_str()
+            if l is NuvolaStruct
+                return l.type_name == type_name
+            if l is NuvolaEnum
+                return l.type_name == type_name
+            type_of(l) == type_name
+        "|"  -> if l is Int or l is Set then l | r else l
+        "&"  -> if l is Int or l is Set then l & r else l
+        "^"  -> if l is Int then l ^ r else l
+        "<<" -> l << r
+        ">>" -> l >> r
+        "?." ->
+            if l is NuvolaOption and not l.is_some
+                return NuvolaOption(value = None, is_some = false)
+            obj := if l is NuvolaOption then l.value else l
+            field := if r is Ident then r.name else r.to_str()
+            get_field(ev, obj, field)
+        _ -> None
+
+fn get_field(ev: Evaluator, obj: Any, field: Str) -> Any
+    if obj is NuvolaStruct
+        return obj.fields.get(field)
+    if obj is Map
+        return obj.get(field)
+    None
+
+fn get_method(ev: Evaluator, obj: Any, method: Str) -> Any
+    if obj is List
+        match method
+            "push"      -> return fn(x) => obj.push(x)
+            "pop"       -> return fn() => obj.pop()
+            "len"       -> return fn() => obj.len()
+            "is_empty"  -> return fn() => obj.len() == 0
+            "map"       -> return fn(f) => obj.map(fn(x) => call_fn(ev, f, List(x)))
+            "filter"    -> return fn(f) => obj.filter(fn(x) => call_fn(ev, f, List(x)))
+            "fold"      -> return fn(init, f) => fold_fn(ev, obj, init, f)
+            "sum"       -> return fn() => obj.sum()
+            "min"       -> return fn() => obj.min()
+            "max"       -> return fn() => obj.max()
+            "sort"      -> return fn() => obj.sort()
+            "sort_by"   -> return fn(f) => obj.sort_by(fn(x) => call_fn(ev, f, List(x)))
+            "any"       -> return fn(f) => obj.any(fn(x) => call_fn(ev, f, List(x)))
+            "all"       -> return fn(f) => obj.all(fn(x) => call_fn(ev, f, List(x)))
+            "take"      -> return fn(n) => obj.slice(0, n.to_int())
+            "drop"      -> return fn(n) => obj.slice(n.to_int())
+            "first"     -> return fn() => if obj.len() > 0 then obj[0] else NuvolaOption(value = None, is_some = false)
+            "last"      -> return fn() => if obj.len() > 0 then obj[obj.len() - 1] else NuvolaOption(value = None, is_some = false)
+            "join"      -> return fn(sep = "") => obj.map(fn(x) => format_val(ev, x)).join(sep)
+            "enumerate" -> return fn() => obj.enumerate().map(fn(p) => List(p[0], p[1]))
+            "zip"       -> return fn(other) => obj.zip(other).map(fn(p) => p.to_list())
+            "flatten"   -> return fn() => obj.flatten()
+            "count"     -> return fn() => obj.len()
+            "extend"    -> return fn(other) => obj.extend(other)
+            "contains"  -> return fn(x) => x in obj
+            "dedupe"    -> return fn() => obj.dedupe()
+            "reverse"   -> return fn() => obj.reverse()
+            "windows"   -> return fn(n) => obj.windows(n.to_int())
+            "chunks"    -> return fn(n) => obj.chunks(n.to_int())
+            "collect"   -> return fn() => obj
+            "mean"      -> return fn() => if obj.len() > 0 then obj.sum() / obj.len() else 0
+            _           -> return fn(...a) => None
+
+    if obj is Str
+        match method
+            "len"         -> return fn() => obj.len()
+            "to_upper"    -> return fn() => obj.to_upper()
+            "to_lower"    -> return fn() => obj.to_lower()
+            "trim"        -> return fn() => obj.trim()
+            "split"       -> return fn(sep = " ") => obj.split(sep)
+            "contains"    -> return fn(s) => s in obj
+            "starts_with" -> return fn(s) => obj.starts_with(s)
+            "ends_with"   -> return fn(s) => obj.ends_with(s)
+            "replace"     -> return fn(a, b) => obj.replace(a, b)
+            "chars"       -> return fn() => obj.chars()
+            "bytes"       -> return fn() => obj.bytes()
+            "parse_i64"   -> return fn() => obj.to_int()
+            "parse_f64"   -> return fn() => obj.to_float()
+            "is_empty"    -> return fn() => obj.len() == 0
+            "repeat"      -> return fn(n) => obj.repeat(n.to_int())
+            "lines"       -> return fn() => obj.split("\n")
+            _             -> return fn(...a) => None
+
+    if obj is Map
+        match method
+            "get"      -> return fn(k, default = None) => obj.get(format_val(ev, k), default)
+            "set"      -> return fn(k, v) => obj[format_val(ev, k)] = v
+            "keys"     -> return fn() => obj.keys()
+            "values"   -> return fn() => obj.values()
+            "entries"  -> return fn() => obj.entries().map(fn(e) => List(e[0], e[1]))
+            "len"      -> return fn() => obj.len()
+            "contains" -> return fn(k) => format_val(ev, k) in obj
+            "is_empty" -> return fn() => obj.len() == 0
+            "sorted_by_key" -> return fn() => obj.entries().sort()
+            _          -> return fn(...a) => None
+
+    if obj is NuvolaOption
+        match method
+            "unwrap"    -> return fn() => if obj.is_some then obj.value else panic("unwrap on None")
+            "unwrap_or" -> return fn(default) => if obj.is_some then obj.value else default
+            "map"       -> return fn(f) => if obj.is_some then NuvolaOption(value = call_fn(ev, f, List(obj.value)), is_some = true) else obj
+            "is_some"   -> return fn() => obj.is_some
+            "is_none"   -> return fn() => not obj.is_some
+            _           -> return fn(...a) => None
+
+    if obj is Float
+        match method
+            "sqrt"   -> return fn() => math.sqrt(obj)
+            "abs"    -> return fn() => math.abs(obj)
+            "floor"  -> return fn() => math.floor(obj)
+            "ceil"   -> return fn() => math.ceil(obj)
+            "round"  -> return fn(n = 0) => math.round(obj, n.to_int())
+            "to_i64" -> return fn() => obj.to_int()
+            "to_f64" -> return fn() => obj
+            "to_str" -> return fn() => format_val(ev, obj)
+            _        -> return fn(...a) => None
+
+    if obj is Int
+        match method
+            "to_f64" -> return fn() => obj.to_float()
+            "to_i64" -> return fn() => obj
+            "to_str" -> return fn() => obj.to_str()
+            "abs"    -> return fn() => math.abs(obj)
+            "pow"    -> return fn(n) => obj ** n.to_int()
+            _        -> return fn(...a) => None
+
+    fn(...a) => None
+
+fn call_method(ev: Evaluator, obj: Any, method: Str, args: List(Any), env: Env) -> Any
+    m := get_method(ev, obj, method)
+    if callable(m)
+        return m(args)
+    panic("No method '{method}' on {type_of(obj)}")
+
+fn match_pattern(ev: Evaluator, pattern: Any, value: Any, env: Env) -> Bool
+    if pattern is List
+        -- OR pattern
+        return pattern.any(fn(p) => match_pattern(ev, p, value, env))
+    if not (pattern is Tuple) or pattern.len() == 0
+        return false
+    kind := pattern[0]
+    if kind == "wildcard"
+        return true
+    if kind == "literal"
+        lit := pattern[1]
+        if value is NuvolaOption and not value.is_some and lit == None
+            return true
+        if value is Bool and lit is Bool
+            return value == lit
+        if (value is Int or value is Float) and (lit is Int or lit is Float)
+            return value == lit
+        if value is Str and lit is Str
+            return value == lit
+        return value == lit
+    if kind == "bind"
+        env_define(env, pattern[1], value, immutable = true)
+        return true
+    if kind == "range"
+        (_, lo, hi, inclusive) := pattern
+        if value is Int or value is Float
+            return if inclusive then lo <= value and value <= hi else lo <= value and value < hi
+        return false
+    if kind == "range_from"
+        (_, lo) := pattern
+        return (value is Int or value is Float) and value >= lo
+    if kind == "range_to"
+        (_, hi, inclusive) := pattern
+        if value is Int or value is Float
+            return if inclusive then value <= hi else value < hi
+        return false
+    if kind == "some"
+        if value is NuvolaOption and value.is_some
+            return match_pattern(ev, pattern[1], value.value, env)
+        return false
+    if kind == "none"
+        return value is NuvolaOption and not value.is_some
+    if kind == "ok"
+        if value is NuvolaResult and value.is_ok
+            return match_pattern(ev, pattern[1], value.value, env)
+        return false
+    if kind == "err"
+        if value is NuvolaResult and not value.is_ok
+            return match_pattern(ev, pattern[1], value.value, env)
+        return false
+    if kind == "type_check"
+        type_name := pattern[1]
+        if value is NuvolaStruct
+            return value.type_name == type_name
+        if value is NuvolaEnum
+            return value.variant == type_name
+        return type_of(value) == type_name
+    if kind == "constructor"
+        cname := pattern[1]
+        inner := pattern[2]
+        if cname == "Some" and value is NuvolaOption and value.is_some
+            return match_pattern(ev, inner, value.value, env)
+        if value is NuvolaStruct and value.type_name == cname
+            return true
+        if value is NuvolaEnum and value.variant == cname
+            return match_pattern(ev, inner, value.value, env)
+        return false
+    if kind == "enum_variant"
+        (_, tname, vname, inner) := pattern
+        if value is NuvolaEnum and value.variant == vname
+            if inner != None
+                return match_pattern(ev, inner, value.value, env)
+            return true
+        if value is NuvolaStruct and value.type_name == vname
+            return true
+        return false
+    false
+
+fn destructure(ev: Evaluator, pattern: Any, value: Any, env: Env)
+    if pattern is TupleLit
+        if value is List or value is Tuple
+            for i in 0..pattern.items.len()
+                p := pattern.items[i]
+                v := value[i]
+                if p is Ident
+                    env_define(env, p.name, v, immutable = true)
+                else
+                    destructure(ev, p, v, env)
+        elif value is NuvolaStruct
+            for p in pattern.items
+                if p is Ident and p.name in value.fields
+                    env_define(env, p.name, value.fields[p.name], immutable = true)
+
+@io fn run(ev: Evaluator, source: Str) -> Any
+    tokens := tokenize(source)
+    p := parser_new(tokens)
+    tree := parse_program(p)
+    eval_node(ev, tree, ev.global_env)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Test runner
+-- ─────────────────────────────────────────────────────────────────────────────
+
+@io fn run_test_file(path: Str, level: Str)
+    print()
+    print("=" * 70)
+    print("  NUVOLA TEST SUITE — {level.to_upper()}")
+    print("  File: {path}")
+    print("=" * 70)
+
+    source := fs.read(path)
+    ev := evaluator_new()
+    passed = 0
+    failed = 0
+    errors = List()
+
+    -- Split into individual tests by -- TEST: markers
+    test_blocks := regex.split("\n-- TEST: (.+)\n", source)
+
+    if test_blocks.len() == 1
+        -- Run as single program; run() panics on error, so catch it
+        match catch(fn() => run(ev, source))
+            Ok(_) ->
+                t0 := time.perf_counter()
+                run(ev, source)
+                elapsed := (time.perf_counter() - t0) * 1000.0
+                print("  Program ran successfully in {elapsed:.1f}ms")
+            Err(e) ->
+                print("  ERROR: {e}")
+        return
+
+    -- Run each test block
+    preamble := test_blocks[0]
+    test_pairs = List()
+    i = 1
+    while i < test_blocks.len() - 1
+        test_pairs.push((test_blocks[i], test_blocks[i + 1]))
+        i += 2
+
+    for (test_name, test_body) in test_pairs
+        full_code := preamble ++ "\n" ++ test_body
+        test_ev := evaluator_new()
+        t0 := time.perf_counter()
+        match catch(fn() => run(test_ev, full_code))
+            Ok(_) ->
+                elapsed := (time.perf_counter() - t0) * 1000.0
+                print("  PASS  {test_name:<50} ({elapsed:.1f}ms)")
+                passed += 1
+            Err(e) ->
+                err_str := e.to_str()
+                if "Assertion" in err_str
+                    print("  FAIL  {test_name:<50} — {err_str}")
+                else
+                    print("  ERR   {test_name:<50} — {err_str}")
+                failed += 1
+                errors.push((test_name, err_str))
+
+    total := passed + failed
+    print()
+    print("  Results: {passed}/{total} passed", end = "")
+    if failed > 0
+        print("  ({failed} failed)")
+    else
+        print("  — all tests passed!")
+
+    (passed, failed)
+
+@io fn main()
+    args := os.args()
+    if args.len() < 2
+        print("Usage: nuvola_eval.nvl <test_file.nvl> [--verbose]")
+        os.exit(1)
+    run_test_file(args[1], args[1])

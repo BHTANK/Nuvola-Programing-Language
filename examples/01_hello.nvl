@@ -1,0 +1,108 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 01_hello.nvl — Hello World and basic syntax
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- The simplest possible program
+print("Hello, World!")
+
+
+-- ─── Greet with a name ────────────────────────────────────────────────────────
+
+fn greet(name: str) -> str
+  "Hello, {name}! Welcome to Nuvola."
+
+print(greet("Alice"))
+
+
+-- ─── Multiple styles ──────────────────────────────────────────────────────────
+
+-- Arrow style (single expression)
+fn square(x) => x * x
+
+-- Block style (multiple statements)
+fn describe(n: i64) -> str
+  category := match n
+    ..0     => "negative"
+    0       => "zero"
+    1..10   => "small"
+    10..100 => "medium"
+    _       => "large"
+  "{n} is a {category} number"
+
+for n in [-5, 0, 1, 7, 42, 999]
+  print(describe(n))
+
+
+-- ─── String interpolation ─────────────────────────────────────────────────────
+
+name    := "Nuvola"
+version := 1
+pi      := 3.14159265358979
+
+print("Language: {name}")
+print("Version:  v{version}.0")
+print("Pi:       {pi:.4f}")
+print("Pi²:      {pi**2:.6f}")
+print("Padded:   {'hello':>20}")     -- right-align in 20 chars
+print("Upper:    {name.to_upper()}")
+
+
+-- ─── Collections ──────────────────────────────────────────────────────────────
+
+-- Array (fixed size, stack)
+primes := [2, 3, 5, 7, 11, 13, 17, 19]
+print("First prime: {primes[0]}")
+print("Last prime:  {primes[-1]}")
+print("Primes:      {primes}")
+
+-- Vec (dynamic, heap)
+nums = Vec.new()
+for i in 1..=10
+  nums.push(i * i)
+print("Squares: {nums}")
+
+-- Map
+capitals := {
+  "France": "Paris",
+  "Japan": "Tokyo",
+  "Brazil": "Brasília",
+  "Australia": "Canberra",
+}
+for (country, capital) in capitals.sorted_by_key()
+  print("{country:15} → {capital}")
+
+
+-- ─── Functions are first-class ────────────────────────────────────────────────
+
+ops := [
+  ("add",      fn(a, b) => a + b),
+  ("subtract", fn(a, b) => a - b),
+  ("multiply", fn(a, b) => a * b),
+  ("max",      fn(a, b) => if a > b => a else b),
+]
+
+for (name, op) in ops
+  print("{name}(10, 3) = {op(10, 3)}")
+
+
+-- ─── Pattern matching ─────────────────────────────────────────────────────────
+
+type Shape
+  Circle(radius: f64)
+  Rectangle(w: f64, h: f64)
+  Triangle(base: f64, height: f64)
+
+fn area(s: Shape) -> f64
+  match s
+    Circle(r)        => 3.14159 * r * r
+    Rectangle(w, h)  => w * h
+    Triangle(b, h)   => 0.5 * b * h
+
+shapes := [
+  Shape.Circle(5.0),
+  Shape.Rectangle(4.0, 6.0),
+  Shape.Triangle(3.0, 8.0),
+]
+
+for shape in shapes
+  print("Area: {area(shape):.2f}")

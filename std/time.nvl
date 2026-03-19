@@ -1,0 +1,58 @@
+-- std/time.nvl — Nuvola time and date utilities
+-- Import with: import "std/time.nvl"
+-- Namespaced:  import "std/time.nvl" as time
+
+-- ── Current time ───────────────────────────────────────────────────────────
+fn time_now_ms()
+  -- Milliseconds since Unix epoch (wall clock)
+  nv_time_now_ms()
+
+fn time_now_us()
+  -- Microseconds since Unix epoch
+  nv_time_now_us()
+
+fn time_now_sec()
+  -- Seconds since Unix epoch (float)
+  nv_time_now_sec()
+
+fn time_monotonic_ms()
+  -- Monotonic milliseconds (for measuring elapsed time, no jumps)
+  time_ms()
+
+-- ── Formatting ────────────────────────────────────────────────────────────
+fn time_format(ms)
+  -- "YYYY-MM-DD HH:MM:SS" from milliseconds since epoch
+  nv_time_format(ms)
+
+fn time_format_iso(ms)
+  -- "YYYY-MM-DDTHH:MM:SSZ" (UTC) from milliseconds since epoch
+  nv_time_format_iso(ms)
+
+fn time_now_str()
+  -- Current local time as "YYYY-MM-DD HH:MM:SS"
+  nv_time_format(nv_time_now_ms())
+
+fn time_now_iso()
+  -- Current UTC time as ISO 8601
+  nv_time_format_iso(nv_time_now_ms())
+
+-- ── Sleeping ──────────────────────────────────────────────────────────────
+fn time_sleep_sec(s)
+  -- Sleep for s seconds (float, e.g. 0.5 for 500ms)
+  nv_sleep_sec(s)
+
+fn time_sleep_ms(ms)
+  -- Sleep for ms milliseconds
+  nv_sleep_sec(ms.to_float() / 1000.0)
+
+-- ── Elapsed time measurement ───────────────────────────────────────────────
+fn time_elapsed_ms(start_ms)
+  -- Return elapsed ms since start_ms (from time_monotonic_ms())
+  time_ms() - start_ms
+
+fn time_bench(f)
+  -- Call f(), return elapsed milliseconds
+  t0 := time_ms()
+  f()
+  time_ms() - t0
+

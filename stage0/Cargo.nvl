@@ -1,0 +1,33 @@
+-- Cargo.nvl — Stage-0 Bootstrap Compiler build configuration
+-- Equivalent of Cargo.toml for the Nuvola build system
+
+module cargo
+
+use std.build  -- Package, Binary, Dependency, Profile
+
+package := Package {
+  name        = "nuvc"
+  version     = "0.1.0"
+  edition     = "2021"
+  description = "Nuvola Stage-0 Bootstrap Compiler"
+  license     = "MIT"
+}
+
+binaries := [
+  Binary { name = "nuvc",      path = "src/main.rs" }
+  Binary { name = "nuvola-lsp", path = "src/lsp.rs" }
+]
+
+dependencies := {
+  "lsp-server": Dependency { version = "0.7" }
+  "lsp-types":  Dependency { version = "0.95" }
+  "serde_json": Dependency { version = "1" }
+  "serde":      Dependency { version = "1", features = ["derive"] }
+}
+
+release_profile := Profile {
+  opt_level     = 3
+  lto           = true
+  codegen_units = 1
+  strip         = true
+}

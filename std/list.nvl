@@ -1,0 +1,161 @@
+-- std/list.nvl — Nuvola standard list library
+-- Import with: import "std/list.nvl"
+
+-- ── Functional ────────────────────────────────────────────────────────────
+fn list_map(lst, f)
+  result = []
+  for x in lst
+    result.push(f(x))
+  result
+
+fn list_filter(lst, pred)
+  result = []
+  for x in lst
+    if pred(x)
+      result.push(x)
+  result
+
+fn list_reduce(lst, f, init)
+  acc = init
+  for x in lst
+    acc = f(acc, x)
+  acc
+
+fn list_any(lst, pred)
+  for x in lst
+    if pred(x) => return true
+  false
+
+fn list_all(lst, pred)
+  for x in lst
+    if not pred(x) => return false
+  true
+
+fn list_count(lst, pred)
+  n = 0
+  for x in lst
+    if pred(x)
+      n = n + 1
+  n
+
+fn list_find(lst, pred)
+  -- Return first element matching pred, or nil
+  for x in lst
+    if pred(x) => return x
+  nil
+
+fn list_index_of_fn(lst, pred)
+  -- Return index of first matching element, or -1
+  i = 0
+  for x in lst
+    if pred(x) => return i
+    i = i + 1
+  -1
+
+-- ── Grouping ──────────────────────────────────────────────────────────────
+fn list_chunk(lst, size)
+  -- Split list into chunks of at most `size`
+  result = []
+  i = 0
+  while i < lst.len
+    chunk = []
+    j = 0
+    while j < size and i + j < lst.len
+      chunk.push(lst[i + j])
+      j = j + 1
+    result.push(chunk)
+    i = i + size
+  result
+
+fn list_partition(lst, pred)
+  -- Returns [yes, no] — elements matching pred and those that don't
+  yes = []
+  no  = []
+  for x in lst
+    if pred(x)
+      yes.push(x)
+    else
+      no.push(x)
+  [yes, no]
+
+-- ── Building ──────────────────────────────────────────────────────────────
+fn list_repeat(val, n)
+  result = []
+  i = 0
+  while i < n
+    result.push(val)
+    i = i + 1
+  result
+
+fn list_range(start, stop, step)
+  -- range(start, stop, step) — inclusive of start, exclusive of stop
+  result = []
+  if step == 0 => return result
+  i = start
+  while (step > 0 and i < stop) or (step < 0 and i > stop)
+    result.push(i)
+    i = i + step
+  result
+
+-- ── Set-like ops ──────────────────────────────────────────────────────────
+fn list_union(a, b)
+  result = []
+  for x in a
+    result.push(x)
+  for x in b
+    if not result.contains(x)
+      result.push(x)
+  result
+
+fn list_intersection(a, b)
+  result = []
+  for x in a
+    if b.contains(x) and not result.contains(x)
+      result.push(x)
+  result
+
+fn list_difference(a, b)
+  -- Elements in a that are not in b
+  result = []
+  for x in a
+    if not b.contains(x)
+      result.push(x)
+  result
+
+-- ── Transpose ─────────────────────────────────────────────────────────────
+fn list_transpose(matrix)
+  -- Transpose a list-of-lists (must all be same length)
+  if matrix.len == 0 => return []
+  cols := matrix[0].len
+  result = []
+  c = 0
+  while c < cols
+    col = []
+    for row in matrix
+      col.push(row[c])
+    result.push(col)
+    c = c + 1
+  result
+
+-- ── Max/min with key ──────────────────────────────────────────────────────
+fn list_max_by(lst, key_fn)
+  if lst.len == 0 => return nil
+  best     = lst[0]
+  best_key = key_fn(best)
+  for x in lst
+    k := key_fn(x)
+    if k > best_key
+      best     = x
+      best_key = k
+  best
+
+fn list_min_by(lst, key_fn)
+  if lst.len == 0 => return nil
+  best     = lst[0]
+  best_key = key_fn(best)
+  for x in lst
+    k := key_fn(x)
+    if k < best_key
+      best     = x
+      best_key = k
+  best

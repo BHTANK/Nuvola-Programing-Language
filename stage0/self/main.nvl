@@ -1,0 +1,418 @@
+-- main.nvl — Entry point for the Nuvola self-hosted compiler
+-- Imports lexer, parser, static checker, formatter, and codegen.
+-- Dispatches on command-line flags.
+--
+-- Usage:
+--   nvlc --lex   <file>           tokenize and print tokens
+--   nvlc --count <file>           print token count breakdown
+--   nvlc --parse <file>           parse and print AST
+--   nvlc --check <file>           run static checker
+--   nvlc --fmt   <file>           pretty-print source
+--   nvlc --fmt   <file> --write   pretty-print and write back to file
+--   nvlc --help | -h              print this help
+--   nvlc <file> [-o out] [--emit-c]   compile to binary (default command)
+
+import "./lexer.nvl"
+import "./parser.nvl"
+import "./check.nvl"
+import "./fmt.nvl"
+import "./codegen.nvl"
+import "./hardware.nvl"
+import "./llvm.nvl"
+
+-- ── Help text ─────────────────────────────────────────────────────────────────
+
+fn print_help()
+  print("nvlc — Nuvola self-hosted compiler")
+  print("")
+  print("Usage:")
+  print("  nvlc --lex   <file>             tokenize and print tokens")
+  print("  nvlc --count <file>             print token count breakdown")
+  print("  nvlc --parse <file>             parse and print AST")
+  print("  nvlc --check <file>             run static checker")
+  print("  nvlc --fmt   <file>             pretty-print source")
+  print("  nvlc --fmt   <file> --write     pretty-print and write back")
+  print("  nvlc <file> [-o out] [--emit-c] compile to binary")
+  print("  nvlc --help | -h                show this help")
+
+-- ── Flag helpers ──────────────────────────────────────────────────────────────
+
+fn argv_has(argv, flag)
+  for a in argv
+    if a == flag
+      return true
+  false
+
+fn argv_after(argv, flag)
+  i = 0
+  while i < argv.len
+    if argv[i] == flag
+      if i + 1 < argv.len
+        return argv[i + 1]
+    i = i + 1
+  nil
+
+-- ── Token count breakdown ────────────────────────────────────────────────────
+
+fn count_tokens(tokens)
+  counts = {}
+  for tok in tokens
+    k   := tok.get("kind")
+    cur := counts.get(k)
+    if cur == nil
+      counts.set(k, 1)
+    else
+      counts.set(k, cur + 1)
+  counts
+
+fn print_counts(counts, total)
+  print("total: " + str(total))
+  kinds := ["int", "float", "str", "bool", "nil", "ident", "kw",
+            "annot", "op", "nl", "indent", "dedent", "eof"]
+  for kind in kinds
+    n := counts.get(kind)
+    if n != nil and n > 0
+      print("  " + kind + ": " + str(n))
+
+-- ── AST printer (tree form) ───────────────────────────────────────────────────
+
+fn indent_str(depth)
+  s = ""
+  i = 0
+  while i < depth
+    s = s + "  "
+    i = i + 1
+  s
+
+fn print_expr_node(expr, depth)
+  if expr == nil
+    print(indent_str(depth) + "<nil>")
+    return nil
+  ind := indent_str(depth)
+  k   := expr.get("kind")
+
+  if k == "int" or k == "float" or k == "bool"
+    print(ind + k + "(" + expr.get("val") + ")")
+  else if k == "str"
+    print(ind + "str(\"" + expr.get("val") + "\")")
+  else if k == "nil"
+    print(ind + "nil")
+  else if k == "ident"
+    print(ind + "ident(" + expr.get("name") + ")")
+  else if k == "binop"
+    print(ind + "binop(" + expr.get("op") + ")")
+    print_expr_node(expr.get("left"),  depth + 1)
+    print_expr_node(expr.get("right"), depth + 1)
+  else if k == "unop"
+    print(ind + "unop(" + expr.get("op") + ")")
+    print_expr_node(expr.get("operand"), depth + 1)
+  else if k == "call"
+    a_args := expr.get("args")
+    nargs  = 0
+    if a_args != nil
+      nargs = a_args.len
+    print(ind + "call(" + str(expr.get("fn")) + ", " + str(nargs) + " args)")
+    if a_args != nil
+      for arg in a_args
+        print_expr_node(arg, depth + 1)
+  else if k == "method_call"
+    a_args := expr.get("args")
+    nargs  = 0
+    if a_args != nil
+      nargs = a_args.len
+    print(ind + "method_call(." + expr.get("method") + ", " + str(nargs) + " args)")
+    print_expr_node(expr.get("obj"), depth + 1)
+  else if k == "index"
+    print(ind + "index[]")
+    print_expr_node(expr.get("obj"), depth + 1)
+    print_expr_node(expr.get("idx"), depth + 1)
+  else if k == "field"
+    print(ind + "field(." + expr.get("field") + ")")
+    print_expr_node(expr.get("obj"), depth + 1)
+  else if k == "list"
+    items := expr.get("items")
+    nit   = 0
+    if items != nil
+      nit = items.len
+    print(ind + "list[" + str(nit) + "]")
+    if items != nil
+      for item in items
+        print_expr_node(item, depth + 1)
+  else if k == "map"
+    pairs := expr.get("pairs")
+    np    = 0
+    if pairs != nil
+      np = pairs.len
+    print(ind + "map{" + str(np) + "}")
+  else if k == "pipe"
+    print(ind + "pipe |>")
+    print_expr_node(expr.get("val"), depth + 1)
+    print_expr_node(expr.get("fn"),  depth + 1)
+  else if k == "range"
+    op = ".."
+    inc := expr.get("inclusive")
+    if inc
+      op = "..="
+    print(ind + "range(" + op + ")")
+    print_expr_node(expr.get("start"), depth + 1)
+    print_expr_node(expr.get("end"),   depth + 1)
+  else if k == "lambda"
+    params := expr.get("params")
+    np     = 0
+    if params != nil
+      np = params.len
+    print(ind + "lambda(" + str(np) + " params)")
+    print_expr_node(expr.get("body"), depth + 1)
+  else if k == "if_expr"
+    print(ind + "if_expr")
+    print_expr_node(expr.get("cond"), depth + 1)
+    print_expr_node(expr.get("then"), depth + 1)
+  else
+    print(ind + "expr(" + k + ")")
+
+fn print_stmt_node(stmt, depth)
+  if stmt == nil
+    return nil
+  ind := indent_str(depth)
+  k   := stmt.get("kind")
+
+  if k == "fn_def"
+    params := stmt.get("params")
+    np     = 0
+    if params != nil
+      np = params.len
+    is_async := stmt.get("async")
+    prefix = "fn "
+    if is_async
+      prefix = "async fn "
+    print(ind + prefix + stmt.get("name") + "(" + str(np) + " params)")
+    print_stmt_node(stmt.get("body"), depth + 1)
+
+  else if k == "block"
+    stmts := stmt.get("stmts")
+    if stmts != nil
+      i = 0
+      while i < stmts.len
+        print_stmt_node(stmts[i], depth)
+        i = i + 1
+
+  else if k == "let"
+    print(ind + ":= " + stmt.get("name"))
+    print_expr_node(stmt.get("val"), depth + 1)
+
+  else if k == "assign"
+    print(ind + "= (assign)")
+    print_expr_node(stmt.get("target"), depth + 1)
+    print_expr_node(stmt.get("val"),    depth + 1)
+
+  else if k == "compound_assign"
+    print(ind + stmt.get("op") + " (compound)")
+    print_expr_node(stmt.get("target"), depth + 1)
+    print_expr_node(stmt.get("val"),    depth + 1)
+
+  else if k == "return"
+    print(ind + "return")
+    print_expr_node(stmt.get("val"), depth + 1)
+
+  else if k == "break"
+    print(ind + "break")
+
+  else if k == "continue"
+    print(ind + "continue")
+
+  else if k == "if"
+    print(ind + "if")
+    print_expr_node(stmt.get("cond"), depth + 1)
+    print(ind + "  then:")
+    print_stmt_node(stmt.get("then"), depth + 2)
+    elifs := stmt.get("elifs")
+    if elifs != nil
+      for elif_node in elifs
+        print(ind + "  elif:")
+        print_expr_node(elif_node.get("cond"), depth + 2)
+        print_stmt_node(elif_node.get("body"), depth + 2)
+    else_body := stmt.get("else")
+    if else_body != nil
+      print(ind + "  else:")
+      print_stmt_node(else_body, depth + 2)
+
+  else if k == "for"
+    print(ind + "for " + stmt.get("var") + " in ...")
+    print_expr_node(stmt.get("iter"), depth + 1)
+    print_stmt_node(stmt.get("body"), depth + 1)
+
+  else if k == "while"
+    print(ind + "while ...")
+    print_expr_node(stmt.get("cond"), depth + 1)
+    print_stmt_node(stmt.get("body"), depth + 1)
+
+  else if k == "match"
+    arms := stmt.get("arms")
+    na   = 0
+    if arms != nil
+      na = arms.len
+    print(ind + "match (" + str(na) + " arms)")
+    print_expr_node(stmt.get("subject"), depth + 1)
+
+  else if k == "expr_stmt"
+    print(ind + "expr_stmt:")
+    print_expr_node(stmt.get("expr"), depth + 1)
+
+  else if k == "import"
+    print(ind + "import \"" + stmt.get("path") + "\"")
+
+  else if k == "type_decl"
+    print(ind + "type " + stmt.get("name"))
+
+  else if k == "comptime"
+    print(ind + "comptime " + stmt.get("name"))
+
+  else
+    print(ind + "stmt(" + k + ")")
+
+-- ── Command: --lex ────────────────────────────────────────────────────────────
+
+fn cmd_lex(path)
+  src := read_file(path)
+  if src == nil
+    print("error: cannot read " + path)
+    return nil
+  tokens := lex(src)
+  print("Lexed " + path + " — " + str(tokens.len) + " tokens")
+  for tok in tokens
+    kind := tok.get("kind")
+    val  := tok.get("val")
+    ln   := tok.get("line")
+    cl   := tok.get("col")
+    if kind == "nl" or kind == "indent" or kind == "dedent" or kind == "eof"
+      print(str(ln) + ":" + str(cl) + "  " + kind)
+    else
+      print(str(ln) + ":" + str(cl) + "  " + kind + "  " + val)
+
+-- ── Command: --count ──────────────────────────────────────────────────────────
+
+fn cmd_count(path)
+  src := read_file(path)
+  if src == nil
+    print("error: cannot read " + path)
+    return nil
+  tokens := lex(src)
+  counts := count_tokens(tokens)
+  print("Token counts for " + path + ":")
+  print_counts(counts, tokens.len)
+
+-- ── Command: --parse ──────────────────────────────────────────────────────────
+
+fn cmd_parse(path)
+  src := read_file(path)
+  if src == nil
+    print("error: cannot read " + path)
+    return nil
+  tokens := lex(src)
+  state  := make_state(tokens)
+  stmts  := parse_program(state)
+  print("=== AST: " + path + " (" + str(stmts.len) + " top-level stmts) ===")
+  i = 0
+  while i < stmts.len
+    print_stmt_node(stmts[i], 0)
+    i = i + 1
+  print("=== END ===")
+
+-- ── Command: --check ──────────────────────────────────────────────────────────
+
+fn cmd_check(path)
+  src := read_file(path)
+  if src == nil
+    print("error: cannot read " + path)
+    return nil
+  tokens := lex(src)
+  state  := make_state(tokens)
+  stmts  := parse_program(state)
+  has_err := check_program(stmts, path)
+  if has_err
+    print("check: FAILED")
+  else
+    print("check: OK")
+
+-- ── Command: --fmt ────────────────────────────────────────────────────────────
+
+fn cmd_fmt(path, do_write)
+  src := read_file(path)
+  if src == nil
+    print("error: cannot read " + path)
+    return nil
+  tokens  := lex(src)
+  state   := make_state(tokens)
+  stmts   := parse_program(state)
+  output  := fmt_program(stmts)
+  if do_write
+    write_file(path, output)
+    print("fmt: wrote " + path)
+  else
+    print(output)
+
+-- ── Command: compile (default) ────────────────────────────────────────────────
+
+fn cmd_compile(path, out_path, emit_c)
+  src := read_file(path)
+  if src == nil
+    print("error: cannot read " + path)
+    return nil
+  -- Delegate to the codegen pipeline.
+  -- codegen.nvl is imported separately when this is built as the full driver.
+  -- For now, print a clear message so the user knows to use codegen directly.
+  print("compile: use codegen directly: ./codegen " + path)
+  if out_path != nil
+    print("  (output: " + out_path + ")")
+  if emit_c
+    print("  (emit-c mode)")
+
+-- ── Main dispatcher ───────────────────────────────────────────────────────────
+
+argv := args()
+
+if argv.len < 2
+  print_help()
+else
+  cmd  := argv[1]
+
+  if cmd == "--help" or cmd == "-h"
+    print_help()
+
+  else if cmd == "--lex"
+    if argv.len < 3
+      print("error: --lex requires a file argument")
+    else
+      cmd_lex(argv[2])
+
+  else if cmd == "--count"
+    if argv.len < 3
+      print("error: --count requires a file argument")
+    else
+      cmd_count(argv[2])
+
+  else if cmd == "--parse"
+    if argv.len < 3
+      print("error: --parse requires a file argument")
+    else
+      cmd_parse(argv[2])
+
+  else if cmd == "--check"
+    if argv.len < 3
+      print("error: --check requires a file argument")
+    else
+      cmd_check(argv[2])
+
+  else if cmd == "--fmt"
+    if argv.len < 3
+      print("error: --fmt requires a file argument")
+    else
+      do_write := argv_has(argv, "--write")
+      cmd_fmt(argv[2], do_write)
+
+  else
+    -- treat first arg as a source file
+    path     := cmd
+    out_path := argv_after(argv, "-o")
+    emit_c   := argv_has(argv, "--emit-c")
+    cmd_compile(path, out_path, emit_c)

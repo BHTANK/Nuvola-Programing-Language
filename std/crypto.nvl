@@ -1,0 +1,73 @@
+-- std/crypto.nvl — Cryptographic utilities
+-- Import with: import "std/crypto.nvl"
+--
+-- SHA-256 (self-contained, no OpenSSL required)
+-- HMAC-SHA256
+-- Base64 encode/decode
+
+-- ── SHA-256 ───────────────────────────────────────────────────────────────────
+
+-- hash_sha256(s: str) → 64-char hex string
+fn hash_sha256(s)
+  sha256(s)
+
+-- hash_sha256_bytes(bytes: list of ints 0-255) → 64-char hex string
+fn hash_sha256_bytes(bytes)
+  sha256_bytes(bytes)
+
+-- ── HMAC-SHA256 ───────────────────────────────────────────────────────────────
+
+-- hmac(key: str, msg: str) → 64-char hex string
+fn hmac(key, msg)
+  hmac_sha256(key, msg)
+
+-- ── Base64 ────────────────────────────────────────────────────────────────────
+
+-- b64_encode(s: str) → base64 string
+fn b64_encode(s)
+  base64_encode(s)
+
+-- b64_decode(s: str) → decoded string
+fn b64_decode(s)
+  base64_decode(s)
+
+-- ── Utilities ─────────────────────────────────────────────────────────────────
+
+-- hex_to_bytes(hex: str) → list of ints (0-255)
+fn hex_to_bytes(hex)
+  result = []
+  i := 0
+  while i + 1 < hex.len
+    hi  := hex[i]
+    lo  := hex[i + 1]
+    val := 0
+    if hi >= "0" and hi <= "9" => val = int(hi) - int("0")
+    if hi >= "a" and hi <= "f" => val = int(hi) - int("a") + 10
+    if hi >= "A" and hi <= "F" => val = int(hi) - int("A") + 10
+    val = val * 16
+    if lo >= "0" and lo <= "9" => val = val + int(lo) - int("0")
+    if lo >= "a" and lo <= "f" => val = val + int(lo) - int("a") + 10
+    if lo >= "A" and lo <= "F" => val = val + int(lo) - int("A") + 10
+    result.push(val)
+    i = i + 2
+  result
+
+-- bytes_to_hex(bytes: list) → hex string
+fn bytes_to_hex(bytes)
+  hex_chars := "0123456789abcdef"
+  result = ""
+  for b in bytes
+    bv := int(b) % 256
+    result = result + hex_chars[bv // 16] + hex_chars[bv % 16]
+  result
+
+-- constant_time_eq(a, b: str) → bool (timing-safe string comparison)
+fn constant_time_eq(a, b)
+  if a.len != b.len => return false
+  diff = 0
+  i := 0
+  while i < a.len
+    diff = diff + (int(a[i]) - int(b[i]))
+    if diff < 0 => diff = -diff
+    i = i + 1
+  diff == 0

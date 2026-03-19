@@ -1,0 +1,127 @@
+-- std/csv.nvl — CSV parsing and serialization
+-- Import with: import "std/csv.nvl"
+
+-- ── Parse a single CSV line into a list of strings ────────────────────────────
+fn csv_parse_line(line, delim)
+  fields = []
+  field  = ""
+  in_q   := false
+  i      := 0
+  while i < line.len
+    c := line[i]
+    if in_q
+      if c == "\""
+        -- peek: doubled quote = escaped quote
+        if i + 1 < line.len and line[i + 1] == "\""
+          field = field + "\""
+          i = i + 2
+        else
+          in_q = false
+          i = i + 1
+      else
+        field = field + c
+        i = i + 1
+    else
+      if c == "\""
+        in_q = true
+        i = i + 1
+      else if c == delim
+        fields.push(field)
+        field = ""
+        i = i + 1
+      else
+        field = field + c
+        i = i + 1
+  fields.push(field)
+  fields
+
+-- ── Parse CSV string → list of list of strings ────────────────────────────────
+fn csv_parse(text, delim)
+  if delim == nil => delim = ","
+  lines  := text.split("\n")
+  result := []
+  for line in lines
+    -- skip empty lines
+    if line.trim() != ""
+      result.push(csv_parse_line(line, delim))
+  result
+
+-- ── Parse CSV with header → list of maps ─────────────────────────────────────
+fn csv_parse_maps(text, delim)
+  if delim == nil => delim = ","
+  rows := csv_parse(text, delim)
+  if rows.len == 0 => return []
+  headers := rows[0]
+  result  := []
+  i := 1
+  while i < rows.len
+    row := rows[i]
+    m   := {}
+    j   := 0
+    while j < headers.len
+      key := headers[j]
+      val := if j < row.len => row[j] else ""
+      m.set(key, val)
+      j = j + 1
+    result.push(m)
+    i = i + 1
+  result
+
+-- ── Serialize a list of strings to a CSV line ─────────────────────────────────
+fn csv_encode_line(fields, delim)
+  if delim == nil => delim = ","
+  parts := []
+  for f in fields
+    -- quote field if it contains delimiter, quote, or newline
+    fs := str(f)
+    needs_q := fs.contains(delim) or fs.contains("\"") or fs.contains("\n")
+    if needs_q
+      escaped := ""
+      k := 0
+      while k < fs.len
+        ch := fs[k]
+        if ch == "\""
+          escaped = escaped + "\"\""
+        else
+          escaped = escaped + ch
+        k = k + 1
+      parts.push("\"" + escaped + "\"")
+    else
+      parts.push(fs)
+  parts.join(delim)
+
+-- ── Serialize list of lists → CSV string ──────────────────────────────────────
+fn csv_encode(rows, delim)
+  if delim == nil => delim = ","
+  lines := []
+  for row in rows
+    lines.push(csv_encode_line(row, delim))
+  lines.join("\n")
+
+-- ── Serialize list of maps → CSV string (with header row) ─────────────────────
+fn csv_encode_maps(records, keys, delim)
+  if delim == nil => delim = ","
+  lines := []
+  lines.push(csv_encode_line(keys, delim))
+  for rec in records
+    row := []
+    for k in keys
+      v := rec.get(k)
+      if v == nil => v = ""
+      row.push(str(v))
+    lines.push(csv_encode_line(row, delim))
+  lines.join("\n")
+
+-- ── Column selection ──────────────────────────────────────────────────────────
+fn csv_column(rows, idx, skip_header)
+  -- Extract column idx from parsed rows (list of lists).
+  -- skip_header: if true, skip first row.
+  result := []
+  start  := if skip_header => 1 else 0
+  i := start
+  while i < rows.len
+    row := rows[i]
+    if idx < row.len
+      result.push(row[idx])
+    i = i + 1
+  result

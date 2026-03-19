@@ -1,0 +1,224 @@
+-- stdlib/os.nvl — OS and filesystem operations for Nuvola
+-- All functions use nv_shell() for system calls and nv_read_file() / nv_write_file()
+-- for I/O. These are primitives provided by the Nuvola runtime.
+
+-- ── Path utilities ────────────────────────────────────────────────────────────
+
+fn os_exists(path)
+  -- Returns true if path exists (file or directory).
+  result := nv_shell("test -e " + shell_quote(path) + " && echo 1 || echo 0")
+  result.get("stdout").trim() == "1"
+
+fn os_is_file(path)
+  result := nv_shell("test -f " + shell_quote(path) + " && echo 1 || echo 0")
+  result.get("stdout").trim() == "1"
+
+fn os_is_dir(path)
+  result := nv_shell("test -d " + shell_quote(path) + " && echo 1 || echo 0")
+  result.get("stdout").trim() == "1"
+
+fn os_basename(path)
+  -- Last component of path (filename).
+  i    := path.len() - 1
+  -- Strip trailing slashes
+  while i > 0 and path[i] == "/"
+    i = i - 1
+  j := i
+  while j > 0 and path[j - 1] != "/"
+    j = j - 1
+  path.slice(j, i + 1)
+
+fn os_dirname(path)
+  -- Parent directory of path.
+  i := path.len() - 1
+  while i > 0 and path[i] == "/"
+    i = i - 1
+  while i > 0 and path[i] != "/"
+    i = i - 1
+  if i == 0
+    if path[0] == "/"
+      return "/"
+    return "."
+  -- Strip trailing slashes from dir
+  j := i
+  while j > 1 and path[j - 1] == "/"
+    j = j - 1
+  path.slice(0, j)
+
+fn os_join(a, b)
+  -- Join two path segments.
+  if a.len() == 0
+    return b
+  if b.len() == 0
+    return a
+  if a[a.len() - 1] == "/"
+    return a + b
+  a + "/" + b
+
+fn os_ext(path)
+  -- Return file extension including dot, e.g. ".nvl". Empty string if none.
+  base := os_basename(path)
+  i    := base.len() - 1
+  while i > 0
+    if base[i] == "."
+      return base.slice(i, base.len())
+    i = i - 1
+  ""
+
+fn os_strip_ext(path)
+  -- Return path without its extension.
+  base := os_basename(path)
+  dir  := os_dirname(path)
+  i    := base.len() - 1
+  while i > 0
+    if base[i] == "."
+      stem := base.slice(0, i)
+      if dir == "."
+        return stem
+      return os_join(dir, stem)
+    i = i - 1
+  path
+
+-- ── Filesystem operations ─────────────────────────────────────────────────────
+
+fn os_mkdir(path)
+  -- Create directory (including parents). Returns true on success.
+  result := nv_shell("mkdir -p " + shell_quote(path))
+  result.get("exit") == 0
+
+fn os_rm(path)
+  -- Remove file or directory recursively. Returns true on success.
+  result := nv_shell("rm -rf " + shell_quote(path))
+  result.get("exit") == 0
+
+fn os_copy(src, dst)
+  result := nv_shell("cp -r " + shell_quote(src) + " " + shell_quote(dst))
+  result.get("exit") == 0
+
+fn os_move(src, dst)
+  result := nv_shell("mv " + shell_quote(src) + " " + shell_quote(dst))
+  result.get("exit") == 0
+
+fn os_listdir(path)
+  -- Returns list of entry names (not full paths) in directory.
+  result := nv_shell("ls -1 " + shell_quote(path) + " 2>/dev/null")
+  if result.get("exit") != 0
+    return []
+  lines := result.get("stdout").trim().split("\n")
+  out   := []
+  i     := 0
+  while i < lines.len()
+    if lines[i].len() > 0
+      out.push(lines[i])
+    i = i + 1
+  out
+
+fn os_listdir_full(path)
+  -- Returns list of full paths for each entry in directory.
+  names := os_listdir(path)
+  out   := []
+  i     := 0
+  while i < names.len()
+    out.push(os_join(path, names[i]))
+    i = i + 1
+  out
+
+fn os_read(path)
+  -- Read entire file as string.
+  nv_read_file(path)
+
+fn os_write(path, content)
+  -- Write string to file (overwrite).
+  nv_write_file(path, content)
+
+fn os_append(path, content)
+  -- Append string to file.
+  result := nv_shell("printf '%s' " + shell_quote(content) + " >> " + shell_quote(path))
+  result.get("exit") == 0
+
+fn os_tempfile(suffix)
+  -- Create a temporary file and return its path.
+  result := nv_shell("mktemp /tmp/nv_XXXXXX" + suffix)
+  result.get("stdout").trim()
+
+fn os_tempdir()
+  result := nv_shell("mktemp -d /tmp/nv_XXXXXX")
+  result.get("stdout").trim()
+
+-- ── Environment ───────────────────────────────────────────────────────────────
+
+fn os_getenv(name)
+  -- Get environment variable. Returns empty string if not set.
+  result := nv_shell("printf '%s' \"${" + name + "}\"")
+  result.get("stdout")
+
+fn os_setenv(name, val)
+  -- Export environment variable for child processes (best-effort via shell).
+  nv_shell("export " + name + "=" + shell_quote(val))
+  nil
+
+fn os_platform()
+  -- Returns "linux", "macos", or "windows".
+  result := nv_shell("uname -s 2>/dev/null || echo Windows")
+  raw := result.get("stdout").trim().to_lower()
+  if raw.starts_with("linux")  => return "linux"
+  if raw.starts_with("darwin") => return "macos"
+  "windows"
+
+fn os_cpu_count()
+  -- Number of logical CPU cores.
+  result := nv_shell("nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1")
+  v := result.get("stdout").trim()
+  if v.len() > 0
+    return int(v)
+  1
+
+fn os_hostname()
+  result := nv_shell("hostname")
+  result.get("stdout").trim()
+
+fn os_cwd()
+  result := nv_shell("pwd")
+  result.get("stdout").trim()
+
+fn os_chdir(path)
+  -- Change working directory. Note: affects subsequent nv_shell calls.
+  nv_shell("cd " + shell_quote(path))
+  nil
+
+-- ── Process ───────────────────────────────────────────────────────────────────
+
+fn os_exit(code)
+  nv_shell("exit " + str(code))
+  nil
+
+fn os_run(cmd)
+  -- Run shell command. Returns {exit, stdout, stderr}.
+  nv_shell(cmd)
+
+fn os_run_ok(cmd)
+  -- Run command, return true if exit code is 0.
+  result := nv_shell(cmd)
+  result.get("exit") == 0
+
+fn os_which(program)
+  -- Return path to executable, or empty string if not found.
+  result := nv_shell("which " + shell_quote(program) + " 2>/dev/null")
+  if result.get("exit") == 0
+    return result.get("stdout").trim()
+  ""
+
+-- ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn shell_quote(s)
+  -- Wrap string in single quotes, escaping any internal single quotes.
+  escaped := ""
+  i := 0
+  while i < s.len()
+    c := s[i]
+    if c == "'"
+      escaped = escaped + "'\\''"
+    else
+      escaped = escaped + c
+    i = i + 1
+  "'" + escaped + "'"

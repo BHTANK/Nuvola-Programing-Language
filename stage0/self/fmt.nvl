@@ -1,0 +1,446 @@
+-- fmt.nvl — Pretty-printer for Nuvola AST nodes
+-- Produces canonical Nuvola source from a parsed AST.
+-- Uses 2-space indentation throughout.
+-- All functions return strings; nothing is printed directly.
+
+-- ── Indentation helper ────────────────────────────────────────────────────────
+
+fn ind(depth)
+  s = ""
+  i = 0
+  while i < depth
+    s = s + "  "
+    i = i + 1
+  s
+
+-- ── Pattern formatter ─────────────────────────────────────────────────────────
+
+fn fmt_pattern(pat)
+  if pat == nil
+    return "_"
+  k := pat.get("kind")
+  if k == "int" or k == "float" or k == "bool"
+    return pat.get("val")
+  if k == "str"
+    return "\"" + pat.get("val") + "\""
+  if k == "nil"
+    return "nil"
+  if k == "ident"
+    return pat.get("name")
+  if k == "binop"
+    op    := pat.get("op")
+    left  := fmt_pattern(pat.get("left"))
+    right := fmt_pattern(pat.get("right"))
+    return left + " " + op + " " + right
+  if k == "list"
+    items := pat.get("items")
+    parts = []
+    for item in items
+      parts.push(fmt_pattern(item))
+    result = "["
+    i = 0
+    while i < parts.len
+      if i > 0
+        result = result + ", "
+      result = result + parts[i]
+      i = i + 1
+    return result + "]"
+  -- fallback: emit as expression
+  fmt_expr(pat, 0)
+
+-- ── Expression formatter ──────────────────────────────────────────────────────
+
+fn fmt_expr(expr, depth)
+  if expr == nil
+    return "nil"
+  k := expr.get("kind")
+
+  if k == "int"
+    return expr.get("val")
+
+  if k == "float"
+    return expr.get("val")
+
+  if k == "str"
+    return "\"" + expr.get("val") + "\""
+
+  if k == "bool"
+    return expr.get("val")
+
+  if k == "nil"
+    return "nil"
+
+  if k == "ident"
+    return expr.get("name")
+
+  if k == "binop"
+    op    := expr.get("op")
+    left  := fmt_expr(expr.get("left"),  depth)
+    right := fmt_expr(expr.get("right"), depth)
+    return left + " " + op + " " + right
+
+  if k == "unop"
+    op      := expr.get("op")
+    operand := fmt_expr(expr.get("operand"), depth)
+    if op == "neg"
+      return "-" + operand
+    if op == "not"
+      return "not " + operand
+    return op + operand
+
+  if k == "call"
+    fn_name := expr.get("fn")
+    a_args  := expr.get("args")
+    return fn_name + "(" + fmt_args(a_args) + ")"
+
+  if k == "method_call"
+    obj    := fmt_expr(expr.get("obj"), depth)
+    method := expr.get("method")
+    a_args := expr.get("args")
+    return obj + "." + method + "(" + fmt_args(a_args) + ")"
+
+  if k == "index"
+    obj := fmt_expr(expr.get("obj"), depth)
+    idx := fmt_expr(expr.get("idx"), depth)
+    return obj + "[" + idx + "]"
+
+  if k == "field"
+    obj   := fmt_expr(expr.get("obj"), depth)
+    field := expr.get("field")
+    return obj + "." + field
+
+  if k == "pipe"
+    lhs := fmt_expr(expr.get("val"), depth)
+    rhs := fmt_expr(expr.get("fn"),  depth)
+    return lhs + " |> " + rhs
+
+  if k == "pipe_call"
+    lhs    := fmt_expr(expr.get("val"), depth)
+    fn_e   := fmt_expr(expr.get("fn"),  depth)
+    a_args := expr.get("args")
+    return lhs + " |> " + fn_e + "(" + fmt_args(a_args) + ")"
+
+  if k == "range"
+    start     := fmt_expr(expr.get("start"), depth)
+    end_e     := fmt_expr(expr.get("end"),   depth)
+    inclusive := expr.get("inclusive")
+    op = ".."
+    if inclusive
+      op = "..="
+    return start + op + end_e
+
+  if k == "list"
+    items := expr.get("items")
+    return "[" + fmt_expr_list(items) + "]"
+
+  if k == "map"
+    pairs := expr.get("pairs")
+    return "{" + fmt_pairs(pairs) + "}"
+
+  if k == "struct_lit"
+    name   := expr.get("name")
+    fields := expr.get("fields")
+    return name + " {" + fmt_pairs(fields) + "}"
+
+  if k == "lambda"
+    params := expr.get("params")
+    body   := fmt_expr(expr.get("body"), depth)
+    return "fn(" + fmt_param_list(params) + ") => " + body
+
+  if k == "if_expr"
+    cond := fmt_expr(expr.get("cond"), depth)
+    then := fmt_expr(expr.get("then"), depth)
+    e    := expr.get("else")
+    if e != nil
+      return "if " + cond + " => " + then + " else => " + fmt_expr(e, depth)
+    return "if " + cond + " => " + then
+
+  -- fallback
+  "/* unknown expr: " + k + " */"
+
+-- ── Argument list helpers ─────────────────────────────────────────────────────
+
+fn fmt_args(a_args)
+  if a_args == nil
+    return ""
+  if a_args.len == 0
+    return ""
+  result = ""
+  i = 0
+  while i < a_args.len
+    if i > 0
+      result = result + ", "
+    result = result + fmt_expr(a_args[i], 0)
+    i = i + 1
+  result
+
+fn fmt_expr_list(items)
+  if items == nil
+    return ""
+  if items.len == 0
+    return ""
+  result = ""
+  i = 0
+  while i < items.len
+    if i > 0
+      result = result + ", "
+    result = result + fmt_expr(items[i], 0)
+    i = i + 1
+  result
+
+fn fmt_pairs(pairs)
+  if pairs == nil
+    return ""
+  if pairs.len == 0
+    return ""
+  result = ""
+  i = 0
+  while i < pairs.len
+    if i > 0
+      result = result + ", "
+    pair   := pairs[i]
+    key    := fmt_expr(pair[0], 0)
+    val    := fmt_expr(pair[1], 0)
+    result = result + key + ": " + val
+    i = i + 1
+  result
+
+fn fmt_param_list(params)
+  if params == nil
+    return ""
+  if params.len == 0
+    return ""
+  result = ""
+  i = 0
+  while i < params.len
+    if i > 0
+      result = result + ", "
+    p := params[i]
+    -- param may be a plain string name or a map with "name" and optional "type"
+    if p.get != nil
+      pname := p.get("name")
+      ptype := p.get("type")
+      if pname == nil
+        result = result + str(p)
+      else if ptype == nil or ptype == ""
+        result = result + pname
+      else
+        result = result + pname + ": " + ptype
+    else
+      result = result + str(p)
+    i = i + 1
+  result
+
+-- ── Block formatter ───────────────────────────────────────────────────────────
+
+fn fmt_block(body, depth)
+  if body == nil
+    return ""
+  -- body may be a block node or a bare expression
+  k := body.get("kind")
+  if k == "block"
+    stmts := body.get("stmts")
+    if stmts == nil or stmts.len == 0
+      return ""
+    result = ""
+    for stmt in stmts
+      result = result + fmt_stmt(stmt, depth)
+    return result
+  -- bare expr used as body (arrow form already handled by caller)
+  ind(depth) + fmt_expr(body, depth) + "\n"
+
+-- ── Statement formatter ───────────────────────────────────────────────────────
+
+fn fmt_stmt(stmt, depth)
+  if stmt == nil
+    return ""
+  k   := stmt.get("kind")
+  pre := ind(depth)
+
+  if k == "let"
+    name     := stmt.get("name")
+    val      := fmt_expr(stmt.get("val"), depth)
+    type_ann := stmt.get("type_ann")
+    mutable  := stmt.get("mutable")
+    if mutable
+      if type_ann != nil and type_ann != ""
+        return pre + name + ": " + type_ann + " = " + val + "\n"
+      return pre + name + " = " + val + "\n"
+    if type_ann != nil and type_ann != ""
+      return pre + name + ": " + type_ann + " := " + val + "\n"
+    return pre + name + " := " + val + "\n"
+
+  if k == "assign"
+    target := fmt_expr(stmt.get("target"), depth)
+    val    := fmt_expr(stmt.get("val"),    depth)
+    return pre + target + " = " + val + "\n"
+
+  if k == "compound_assign"
+    target := fmt_expr(stmt.get("target"), depth)
+    op     := stmt.get("op")
+    val    := fmt_expr(stmt.get("val"), depth)
+    return pre + target + " " + op + " " + val + "\n"
+
+  if k == "fn_def"
+    return fmt_fn_decl(stmt, depth, stmt.get("async"))
+
+  if k == "return"
+    val := stmt.get("val")
+    if val == nil
+      return pre + "return\n"
+    vk := val.get("kind")
+    if vk == "nil"
+      return pre + "return\n"
+    return pre + "return " + fmt_expr(val, depth) + "\n"
+
+  if k == "break"
+    val := stmt.get("val")
+    if val == nil
+      return pre + "break\n"
+    return pre + "break " + fmt_expr(val, depth) + "\n"
+
+  if k == "continue"
+    return pre + "continue\n"
+
+  if k == "expr_stmt"
+    return pre + fmt_expr(stmt.get("expr"), depth) + "\n"
+
+  if k == "if"
+    return fmt_if_stmt(stmt, depth)
+
+  if k == "for"
+    var_name := stmt.get("var")
+    iter     := fmt_expr(stmt.get("iter"), depth)
+    body_str := fmt_block(stmt.get("body"), depth + 1)
+    return pre + "for " + var_name + " in " + iter + "\n" + body_str
+
+  if k == "while"
+    cond_str := fmt_expr(stmt.get("cond"), depth)
+    body_str := fmt_block(stmt.get("body"), depth + 1)
+    return pre + "while " + cond_str + "\n" + body_str
+
+  if k == "match"
+    return fmt_match_stmt(stmt, depth)
+
+  if k == "import"
+    path  := stmt.get("path")
+    names := stmt.get("names")
+    alias := stmt.get("alias")
+    if alias != nil and alias != ""
+      return pre + "import \"" + path + "\" as " + alias + "\n"
+    if names != nil and names.len > 0
+      return pre + "import \"" + path + "\" (" + fmt_name_list(names) + ")\n"
+    return pre + "import \"" + path + "\"\n"
+
+  if k == "type_decl"
+    name   := stmt.get("name")
+    flavor := stmt.get("flavor")
+    fields := stmt.get("fields")
+    if fields == nil or fields.len == 0
+      return pre + "type " + name + " = " + flavor + "\n"
+    result  = pre + "type " + name + "\n"
+    for field in fields
+      fname := field.get("name")
+      ftype := field.get("type")
+      if ftype != nil and ftype != ""
+        result = result + ind(depth + 1) + fname + ": " + ftype + "\n"
+      else
+        result = result + ind(depth + 1) + fname + "\n"
+    return result
+
+  if k == "comptime"
+    name := stmt.get("name")
+    val  := fmt_expr(stmt.get("val"), depth)
+    return pre + "comptime " + name + " := " + val + "\n"
+
+  if k == "block"
+    return fmt_block(stmt, depth)
+
+  -- fallback
+  pre + "-- [unhandled stmt: " + k + "]\n"
+
+-- ── Function declaration formatter ───────────────────────────────────────────
+
+fn fmt_fn_decl(def, depth, is_async)
+  pre    := ind(depth)
+  name   := def.get("name")
+  params := def.get("params")
+  body   := def.get("body")
+
+  header = pre
+  if is_async
+    header = header + "async "
+  header = header + "fn " + name + "(" + fmt_param_list(params) + ")"
+
+  -- detect arrow body (body is not a block node)
+  if body != nil
+    bk := body.get("kind")
+    if bk != "block"
+      return header + " => " + fmt_expr(body, depth) + "\n"
+
+  body_str := fmt_block(body, depth + 1)
+  header + "\n" + body_str
+
+-- ── if statement (with elif/else chain) ──────────────────────────────────────
+
+fn fmt_if_stmt(stmt, depth)
+  pre  := ind(depth)
+  cond := fmt_expr(stmt.get("cond"), depth)
+  then := fmt_block(stmt.get("then"), depth + 1)
+
+  result = pre + "if " + cond + "\n" + then
+
+  elifs := stmt.get("elifs")
+  if elifs != nil
+    for elif_node in elifs
+      elif_cond := fmt_expr(elif_node.get("cond"), depth)
+      elif_body := fmt_block(elif_node.get("body"), depth + 1)
+      result = result + pre + "elif " + elif_cond + "\n" + elif_body
+
+  else_body := stmt.get("else")
+  if else_body != nil
+    result = result + pre + "else\n" + fmt_block(else_body, depth + 1)
+
+  result
+
+-- ── match statement ───────────────────────────────────────────────────────────
+
+fn fmt_match_stmt(stmt, depth)
+  pre     := ind(depth)
+  subject := fmt_expr(stmt.get("subject"), depth)
+  arms    := stmt.get("arms")
+
+  result = pre + "match " + subject + "\n"
+  if arms != nil
+    for arm in arms
+      pat   := fmt_pattern(arm.get("pat"))
+      guard := arm.get("guard")
+      body  := fmt_expr(arm.get("body"), depth + 1)
+      arm_str = ind(depth + 1) + pat
+      if guard != nil
+        arm_str = arm_str + " if " + fmt_expr(guard, depth + 1)
+      arm_str = arm_str + " => " + body + "\n"
+      result = result + arm_str
+  result
+
+-- ── name list helper (for imports) ───────────────────────────────────────────
+
+fn fmt_name_list(names)
+  if names == nil or names.len == 0
+    return ""
+  result = ""
+  i = 0
+  while i < names.len
+    if i > 0
+      result = result + ", "
+    result = result + names[i]
+    i = i + 1
+  result
+
+-- ── Program formatter ─────────────────────────────────────────────────────────
+
+fn fmt_program(program)
+  result = ""
+  for stmt in program
+    result = result + fmt_stmt(stmt, 0)
+  result

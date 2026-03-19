@@ -1,0 +1,236 @@
+-- hardware.nvl — Hardware dispatch system for the Nuvola self-hosted compiler
+-- Routes computation to VRAM/GPU or CPU based on workload characteristics.
+-- This is the core of the "direct to hardware" capability.
+--
+-- Device detection queries NVIDIA SMI for GPU/VRAM presence.
+-- Dispatch heuristic: GPU if data > 1 MB and work is parallel.
+-- VRAM management calls nv_shell with CUDA runtime helpers.
+-- Kernel compilation wraps nuvc --target gpu-cuda / metal / spirv.
+
+-- ── Hardware target constants ─────────────────────────────────────────────────
+
+HW_CPU  := "cpu"
+HW_GPU  := "gpu"
+HW_VRAM := "vram"
+HW_AUTO := "auto"
+
+-- ── Device detection ──────────────────────────────────────────────────────────
+
+fn detect_gpu()
+  -- Run nvidia-smi; if it exits 0 a compatible GPU is present.
+  result := nv_shell("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null")
+  code   := result.get("exit")
+  code == 0
+
+fn detect_vram_mb()
+  -- Query total VRAM in MiB from the first GPU.
+  result := nv_shell("nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null")
+  code   := result.get("exit")
+  if code != 0
+    return 0
+  out := result.get("stdout")
+  if out == nil or out == ""
+    return 0
+  -- out is a decimal integer string, possibly with trailing whitespace
+  int(out)
+
+fn detect_cpu_cores()
+  -- Try nproc first; fall back to counting processor lines in /proc/cpuinfo.
+  result := nv_shell("nproc 2>/dev/null")
+  code   := result.get("exit")
+  if code == 0
+    out := result.get("stdout")
+    if out != nil and out != ""
+      return int(out)
+  -- fallback: grep -c processor /proc/cpuinfo
+  result2 := nv_shell("grep -c processor /proc/cpuinfo 2>/dev/null")
+  code2   := result2.get("exit")
+  if code2 == 0
+    out2 := result2.get("stdout")
+    if out2 != nil and out2 != ""
+      return int(out2)
+  1
+
+fn hw_info()
+  -- Returns a map describing available hardware and the preferred target.
+  has_gpu   := detect_gpu()
+  vram_mb   := detect_vram_mb()
+  cpu_cores := detect_cpu_cores()
+  preferred = HW_CPU
+  if has_gpu
+    preferred = HW_GPU
+  info = {}
+  info.set("has_gpu",   has_gpu)
+  info.set("vram_mb",   vram_mb)
+  info.set("cpu_cores", cpu_cores)
+  info.set("preferred", preferred)
+  info
+
+-- ── Dispatch decision ─────────────────────────────────────────────────────────
+
+fn should_use_gpu(data_size_bytes, is_parallel)
+  -- Use GPU only when a GPU is present, data exceeds 1 MB, and work is parallel.
+  if not is_parallel
+    return false
+  if data_size_bytes <= 1024 * 1024
+    return false
+  detect_gpu()
+
+fn dispatch_target(data_size_bytes, is_parallel)
+  -- Returns HW_GPU or HW_CPU.
+  if should_use_gpu(data_size_bytes, is_parallel)
+    return HW_GPU
+  HW_CPU
+
+-- ── VRAM memory management ────────────────────────────────────────────────────
+
+fn vram_alloc(name, size_bytes)
+  -- Allocate a named VRAM buffer via the Nuvola CUDA runtime helper.
+  -- Returns 0 on success, non-zero on failure.
+  result := nv_shell("nv_cuda_alloc --name " + name + " --bytes " + str(size_bytes))
+  result.get("exit")
+
+fn vram_free(name)
+  -- Release a named VRAM buffer previously allocated with vram_alloc.
+  result := nv_shell("nv_cuda_free --name " + name)
+  result.get("exit")
+
+fn vram_upload(host_file, gpu_name)
+  -- Transfer a host file into a named VRAM buffer (host → VRAM).
+  -- Returns 0 on success.
+  result := nv_shell("nv_cuda_h2d --src " + host_file + " --dst " + gpu_name)
+  result.get("exit")
+
+fn vram_download(gpu_name, host_file)
+  -- Transfer a named VRAM buffer back to a host file (VRAM → host).
+  -- Returns 0 on success.
+  result := nv_shell("nv_cuda_d2h --src " + gpu_name + " --dst " + host_file)
+  result.get("exit")
+
+-- ── GPU kernel compilation ────────────────────────────────────────────────────
+
+fn compile_gpu_kernel(nvl_src, out_ptx)
+  -- Compile a Nuvola GPU source file to PTX (CUDA) via nuvc.
+  -- Returns true on success.
+  result := nv_shell("nuvc --target gpu-cuda " + nvl_src + " -o " + out_ptx)
+  code   := result.get("exit")
+  if code != 0
+    print("compile_gpu_kernel: nuvc failed for " + nvl_src)
+    return false
+  true
+
+fn compile_metal_kernel(nvl_src, out_metallib)
+  -- Compile a Nuvola GPU source file to a Metal library (.metallib).
+  -- Returns true on success.
+  result := nv_shell("nuvc --target gpu-metal " + nvl_src + " -o " + out_metallib)
+  code   := result.get("exit")
+  if code != 0
+    print("compile_metal_kernel: nuvc failed for " + nvl_src)
+    return false
+  true
+
+fn compile_spirv_kernel(nvl_src, out_spirv)
+  -- Compile a Nuvola GPU source file to SPIR-V for Vulkan/OpenCL.
+  -- Returns true on success.
+  result := nv_shell("nuvc --target gpu-spirv " + nvl_src + " -o " + out_spirv)
+  code   := result.get("exit")
+  if code != 0
+    print("compile_spirv_kernel: nuvc failed for " + nvl_src)
+    return false
+  true
+
+-- ── CPU parallel execution ────────────────────────────────────────────────────
+
+fn cpu_parallel_run(bin, input_file, n_cores)
+  -- Run bin on input_file with OMP_NUM_THREADS set for parallelism.
+  -- Returns the exit code of the subprocess.
+  result := nv_shell("OMP_NUM_THREADS=" + str(n_cores) + " " + bin + " " + input_file)
+  result.get("exit")
+
+-- ── Auto dispatch wrapper ─────────────────────────────────────────────────────
+
+fn hw_run(bin, input_file, data_size, is_parallel)
+  -- Detect the best target, run on GPU if beneficial, else CPU.
+  -- Prints dispatch decision to stderr.
+  -- Returns exit code.
+  target := dispatch_target(data_size, is_parallel)
+  if target == HW_GPU
+    print("[hw_run] dispatching to GPU: " + bin)
+    result := nv_shell(bin + " --device gpu " + input_file)
+    return result.get("exit")
+  else
+    info  := hw_info()
+    cores := info.get("cpu_cores")
+    print("[hw_run] dispatching to CPU (" + str(cores) + " cores): " + bin)
+    return cpu_parallel_run(bin, input_file, cores)
+
+-- ── Benchmark mode ────────────────────────────────────────────────────────────
+
+fn hw_bench(bin, input_file, data_size, trials)
+  -- Run bin on both CPU and GPU (if available), time each, return results.
+  -- Returns map {cpu_ns, gpu_ns, winner}.
+  info    := hw_info()
+  cores   := info.get("cpu_cores")
+  has_gpu := info.get("has_gpu")
+
+  -- CPU trials
+  cpu_total = 0
+  i = 0
+  while i < trials
+    t0      := nv_clock_ns()
+    cpu_parallel_run(bin, input_file, cores)
+    t1      := nv_clock_ns()
+    cpu_total = cpu_total + (t1 - t0)
+    i = i + 1
+  cpu_ns := cpu_total / trials
+
+  -- GPU trials (only if GPU present)
+  gpu_ns = 0
+  if has_gpu
+    gpu_total = 0
+    j = 0
+    while j < trials
+      t0g       := nv_clock_ns()
+      nv_shell(bin + " --device gpu " + input_file)
+      t1g       := nv_clock_ns()
+      gpu_total = gpu_total + (t1g - t0g)
+      j = j + 1
+    gpu_ns = gpu_total / trials
+
+  -- Determine winner and speedup ratio
+  winner  = HW_CPU
+  speedup = 1
+  if has_gpu and gpu_ns > 0 and gpu_ns < cpu_ns
+    winner  = HW_GPU
+    speedup = cpu_ns / gpu_ns
+
+  print("hw_bench: cpu_ns=" + str(cpu_ns) + " gpu_ns=" + str(gpu_ns) +
+        " winner=" + winner + " speedup=" + str(speedup) + "x")
+
+  res = {}
+  res.set("cpu_ns",  cpu_ns)
+  res.set("gpu_ns",  gpu_ns)
+  res.set("winner",  winner)
+  res.set("speedup", speedup)
+  res
+
+-- ── Hardware info printer ─────────────────────────────────────────────────────
+
+fn hw_print_info()
+  -- Print a human-readable summary of detected hardware.
+  info    := hw_info()
+  has_gpu := info.get("has_gpu")
+  vram_mb := info.get("vram_mb")
+  cores   := info.get("cpu_cores")
+  pref    := info.get("preferred")
+
+  print("+---------------------------------+")
+  print("|  Nuvola hardware detection      |")
+  print("+---------------------------------+")
+  print("|  CPU cores  : " + str(cores))
+  gpu_line = "no"
+  if has_gpu
+    gpu_line = "yes  (VRAM: " + str(vram_mb) + " MiB)"
+  print("|  GPU present: " + gpu_line)
+  print("|  Preferred  : " + pref)
+  print("+---------------------------------+")

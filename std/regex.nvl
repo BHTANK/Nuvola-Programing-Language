@@ -1,0 +1,75 @@
+-- std/regex.nvl — POSIX regular expressions
+-- Import with: import "std/regex.nvl"
+--
+-- All functions take pattern as first arg (ERE syntax, same as grep -E).
+-- Patterns are compiled fresh each call — cache pattern strings for hot paths.
+
+-- regex_match(pattern, str) → bool
+--   Returns true if pattern matches anywhere in str.
+fn re_match(pattern, s)
+  regex_match(pattern, s)
+
+-- regex_find(pattern, str) → string or nil
+--   Returns the first matching substring, or nil if no match.
+fn re_find(pattern, s)
+  regex_find(pattern, s)
+
+-- regex_find_all(pattern, str) → list of strings
+--   Returns all non-overlapping matches.
+fn re_all(pattern, s)
+  regex_find_all(pattern, s)
+
+-- regex_replace(pattern, str, repl) → string
+--   Replace all matches of pattern with repl.
+fn re_replace(pattern, s, repl)
+  regex_replace(pattern, s, repl)
+
+-- regex_split(pattern, str) → list of strings
+--   Split str on pattern (like Python re.split).
+fn re_split(pattern, s)
+  regex_split(pattern, s)
+
+-- re_count(pattern, str) → int
+--   Count how many matches exist in str.
+fn re_count(pattern, s)
+  regex_find_all(pattern, s).len
+
+-- re_extract(pattern, str) → list of strings (alias for re_all)
+fn re_extract(pattern, s)
+  regex_find_all(pattern, s)
+
+-- re_contains(pattern, str) → bool (alias for re_match)
+fn re_contains(pattern, s)
+  regex_match(pattern, s)
+
+-- re_strip_html(s) → string with all HTML tags removed
+fn re_strip_html(s)
+  regex_replace("<[^>]+>", s, "")
+
+-- re_extract_emails(s) → list of email-like strings
+fn re_extract_emails(s)
+  regex_find_all("[a-zA-Z0-9._%+][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]+\\.[a-zA-Z]{{2,}}", s)
+
+-- re_extract_urls(s) → list of http/https URLs
+fn re_extract_urls(s)
+  regex_find_all("https?://[a-zA-Z0-9./_%?=&#+-]+", s)
+
+-- re_extract_numbers(s) → list of number strings (int or float)
+fn re_extract_numbers(s)
+  regex_find_all("[-+]?[0-9]+\\.?[0-9]*", s)
+
+-- re_is_email(s) → bool
+fn re_is_email(s)
+  regex_match("^[a-zA-Z0-9._%+][-a-zA-Z0-9._%+]*@[a-zA-Z0-9][-a-zA-Z0-9.]+\\.[a-zA-Z]{{2,}}$", s)
+
+-- re_is_url(s) → bool
+fn re_is_url(s)
+  regex_match("^https?://", s)
+
+-- re_is_int(s) → bool
+fn re_is_int(s)
+  regex_match("^[-+]?[0-9]+$", s)
+
+-- re_is_float(s) → bool
+fn re_is_float(s)
+  regex_match("^[-+]?[0-9]*\\.[0-9]+([eE][-+]?[0-9]+)?$", s)

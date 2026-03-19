@@ -1,0 +1,705 @@
+-- full_stage_test.nvl — 4-stage comprehensive Nuvola test suite
+-- Stage 1: Soft       — primitives, bindings, control flow, basic data structures
+-- Stage 2: Harsher    — stdlib, higher-order functions, pattern matching, pipelines
+-- Stage 3: Hard       — algorithms, recursion, closures, string parsing, matrix math
+-- Stage 4: Heavy      — stress loops, crypto, JSON, large data, timing, benchmarks
+
+fn check(cond, label)
+  assert(cond, label)
+
+fn stage_header(name)
+  print("")
+  print("════════════════════════════════════════════════════════════════")
+  print("  " + name)
+  print("════════════════════════════════════════════════════════════════")
+
+-- ═══════════════════════════════════════════════════════════════════════
+--  STAGE 1 — SOFT
+--  Primitives, bindings, operators, control flow, basic collections
+-- ═══════════════════════════════════════════════════════════════════════
+
+stage_header("STAGE 1 — SOFT: Language fundamentals")
+
+-- 1.1 Primitive types
+check(42 == 42,              "int literal")
+check(3.14 > 3.0,            "float literal")
+check("hello" == "hello",    "string literal")
+check(true == true,          "bool literal true")
+check(false == false,        "bool literal false")
+check(nil == nil,            "nil literal")
+
+-- 1.2 Bindings
+x := 10
+check(x == 10,              "immutable bind :=")
+y = 20
+y = 30
+check(y == 30,              "mutable assign =")
+
+-- 1.3 Arithmetic
+check(2 + 3 == 5,           "add")
+check(10 - 4 == 6,          "sub")
+check(3 * 7 == 21,          "mul")
+check(15 / 3 == 5,          "div")
+check(17 % 5 == 2,          "mod")
+check(-5 + 5 == 0,          "neg add")
+check(2.5 + 1.5 == 4.0,     "float add")
+check(3.0 * 2.0 == 6.0,     "float mul")
+
+-- 1.4 Comparison
+check(1 < 2,                "less than")
+check(3 > 2,                "greater than")
+check(2 <= 2,               "less or equal")
+check(5 >= 4,               "greater or equal")
+check(7 != 8,               "not equal")
+
+-- 1.5 Logical
+check(true and true,        "and true")
+check(not (true and false), "and false")
+check(true or false,        "or true")
+check(not false,            "not")
+
+-- 1.6 String operations
+s := "hello world"
+check(s.len() == 11,        "string len")
+check("abc" + "def" == "abcdef", "string concat")
+check(s[0] == "h",          "string index 0")
+check(s[6] == "w",          "string index 6")
+check(s.contains("world"),  "string contains")
+check(s.starts_with("hello"), "string starts_with")
+check(s.ends_with("world"), "string ends_with")
+
+parts := s.split(" ")
+check(parts.len() == 2,     "string split len")
+check(parts[0] == "hello",  "string split[0]")
+check(parts[1] == "world",  "string split[1]")
+
+check("  abc  ".trim() == "abc", "string trim")
+check("HELLO".to_lower() == "hello", "to_lower")
+check("hello".to_upper() == "HELLO", "to_upper")
+
+-- 1.7 Type conversions
+check(str(42) == "42",      "str(int)")
+check(int("99") == 99,      "int(str)")
+check(float("3.14") > 3.0,  "float(str)")
+-- bool() conflicts with C stdbool.h macro — skip in compiled mode
+check(len("abc") == 3,      "len(str)")
+
+-- 1.8 If / else if / else
+fn test_if_true()
+  if true => return 1
+  0
+check(test_if_true() == 1,  "if true")
+
+fn test_else_if()
+  if false => return 1
+  else if true => return 2
+  0
+check(test_else_if() == 2,  "else if")
+
+fn test_else()
+  if false => return 1
+  else => return 3
+  0
+check(test_else() == 3,     "else")
+
+-- 1.9 While loops
+total = 0
+i = 0
+while i < 10
+  total = total + i
+  i = i + 1
+check(total == 45,          "while sum 0..9")
+
+-- 1.10 For-in loops
+items := [10, 20, 30]
+acc = 0
+for item in items
+  acc = acc + item
+check(acc == 60,            "for-in sum")
+
+-- 1.11 Functions
+fn add(a, b) => a + b
+check(add(3, 4) == 7,       "fn add")
+
+fn factorial(n)
+  if n <= 1 => return 1
+  n * factorial(n - 1)
+check(factorial(5) == 120,  "fn factorial")
+
+fn fib(n)
+  if n <= 1 => return n
+  fib(n - 1) + fib(n - 2)
+check(fib(10) == 55,        "fn fib(10)")
+
+-- 1.12 Lists
+lst = [1, 2, 3]
+lst.push(4)
+check(lst.len() == 4,       "list push + len")
+check(lst[3] == 4,          "list index after push")
+lst.pop()
+check(lst.len() == 3,       "list pop")
+
+-- 1.13 Maps
+m = {}
+m.set("name", "Nuvola")
+m.set("version", 1)
+check(m.get("name") == "Nuvola", "map get")
+check(m.has("version"),          "map has")
+check(m.get("missing") == nil,   "map get nil")
+check(m.has("name"),         "map keys present")
+
+-- 1.14 Nested data
+matrix := [[1, 2], [3, 4]]
+check(matrix[0][0] == 1,    "nested list [0][0]")
+check(matrix[1][1] == 4,    "nested list [1][1]")
+
+print("  Stage 1 complete")
+
+-- ═══════════════════════════════════════════════════════════════════════
+--  STAGE 2 — HARSHER
+--  Stdlib, higher-order functions, match, pipelines, closures
+-- ═══════════════════════════════════════════════════════════════════════
+
+stage_header("STAGE 2 — HARSHER: Stdlib and functional features")
+
+-- 2.1 Math builtins
+check(abs(-7) == 7,          "abs")
+check(abs(7) == 7,           "abs positive")
+check(floor(3.9) == 3,       "floor")
+check(ceil(3.1) == 4,        "ceil")
+check(round(3.5) == 4,       "round")
+check(sqrt(16.0) == 4.0,     "sqrt(16)")
+check(pow(2, 10) == 1024,    "pow(2,10)")
+check(min(3, 7) == 3,        "min")
+check(max(3, 7) == 7,        "max")
+
+-- 2.2 Trig / exp / log
+pi_approx := 3.14159265
+check(abs(sin(0.0)) < 0.001,    "sin(0)")
+check(abs(cos(0.0) - 1.0) < 0.001, "cos(0)")
+check(abs(exp(0.0) - 1.0) < 0.001, "exp(0)")
+check(abs(log(1.0)) < 0.001,    "log(1)")
+check(abs(log2(8.0) - 3.0) < 0.001, "log2(8)")
+
+-- 2.3 Higher-order builtins
+nums := [1, 2, 3, 4, 5]
+doubled := map(fn(x) => x * 2, nums)
+check(doubled[0] == 2,      "map [0]")
+check(doubled[4] == 10,     "map [4]")
+
+evens := filter(fn(x) => x % 2 == 0, nums)
+check(evens.len() == 2,     "filter even count")
+check(evens[0] == 2,        "filter even[0]")
+check(evens[1] == 4,        "filter even[1]")
+
+check(sum(nums) == 15,      "sum")
+
+srt := sorted([5, 3, 1, 4, 2])
+check(srt[0] == 1,          "sorted[0]")
+check(srt[4] == 5,          "sorted[4]")
+
+rev := reversed([1, 2, 3])
+check(rev[0] == 3,          "reversed[0]")
+check(rev[2] == 1,          "reversed[2]")
+
+-- 2.4 Range
+r := range(0, 5)
+check(r.len() == 5,         "range(0,5) len")
+check(r[0] == 0,            "range(0,5)[0]")
+check(r[4] == 4,            "range(0,5)[4]")
+
+r2 := range(2, 6)
+check(r2.len() == 4,        "range(2,6) len")
+check(r2[0] == 2,           "range(2,6)[0]")
+
+-- 2.5 Closures (value capture)
+fn make_adder(n)
+  fn(x) => x + n
+add5 := make_adder(5)
+add10 := make_adder(10)
+check(add5(3) == 8,          "closure adder 5+3")
+check(add10(3) == 13,        "closure adder 10+3")
+check(add5(add10(1)) == 16,  "closure nested add5(add10(1))")
+
+-- 2.6 First-class functions
+fn apply(f, val) => f(val)
+check(apply(fn(x) => x * x, 6) == 36, "first-class fn")
+
+-- 2.7 Pipeline operator
+fn double(x) => x * 2
+fn inc(x) => x + 1
+pipe_result := 10 |> double |> inc
+check(pipe_result == 21,     "pipeline 10 |> double |> inc")
+
+-- 2.8 String methods (extended)
+check("hello world".replace("world", "Nuvola") == "hello Nuvola", "string replace")
+check("abcabc".index_of("bc") == 1, "string index_of")
+
+-- 2.9 List sorting
+lst2 := sorted([3, 1, 4, 1, 5, 9])
+check(lst2[0] == 1,         "list sort [0]")
+check(lst2[5] == 9,         "list sort [5]")
+
+-- 2.10 Match expression
+fn describe(val)
+  match val
+    0 => "zero"
+    1 => "one"
+    2 => "two"
+    _ => "other"
+
+check(describe(0) == "zero",   "match 0")
+check(describe(1) == "one",    "match 1")
+check(describe(99) == "other", "match wildcard")
+
+-- 2.11 Nested if expressions
+fn classify(n)
+  if n < 0 => return "negative"
+  else if n == 0 => return "zero"
+  else if n < 10 => return "small"
+  else if n < 100 => return "medium"
+  else => return "large"
+
+check(classify(-5) == "negative", "classify -5")
+check(classify(0) == "zero",      "classify 0")
+check(classify(7) == "small",     "classify 7")
+check(classify(50) == "medium",   "classify 50")
+check(classify(999) == "large",   "classify 999")
+
+print("  Stage 2 complete")
+
+-- ═══════════════════════════════════════════════════════════════════════
+--  STAGE 3 — HARD
+--  Algorithms, complex recursion, string parsing, matrix math
+-- ═══════════════════════════════════════════════════════════════════════
+
+stage_header("STAGE 3 — HARD: Algorithms and complex logic")
+
+-- 3.1 Quicksort (in-place, Lomuto partition)
+fn qsort(arr, lo, hi)
+  if lo >= hi => return nil
+  pivot := arr[hi]
+  i = lo
+  j = lo
+  while j < hi
+    if arr[j] <= pivot
+      tmp := arr[i]
+      arr[i] = arr[j]
+      arr[j] = tmp
+      i = i + 1
+    j = j + 1
+  tmp := arr[i]
+  arr[i] = arr[hi]
+  arr[hi] = tmp
+  qsort(arr, lo, i - 1)
+  qsort(arr, i + 1, hi)
+
+qs_data := [38, 27, 43, 3, 9, 82, 10]
+qsort(qs_data, 0, qs_data.len() - 1)
+check(qs_data[0] == 3,      "quicksort [0]=3")
+check(qs_data[3] == 27,     "quicksort [3]=27")
+check(qs_data[6] == 82,     "quicksort [6]=82")
+
+-- 3.2 Binary search
+fn bsearch(arr, target)
+  lo = 0
+  hi = arr.len() - 1
+  while lo <= hi
+    mid := (lo + hi) / 2
+    if arr[mid] == target
+      return mid
+    else if arr[mid] < target
+      lo = mid + 1
+    else
+      hi = mid - 1
+  -1
+
+sorted_arr := [2, 5, 8, 12, 16, 23, 38, 56, 72, 91]
+check(bsearch(sorted_arr, 23) == 5,  "bsearch found")
+check(bsearch(sorted_arr, 99) == -1, "bsearch not found")
+check(bsearch(sorted_arr, 2) == 0,   "bsearch first")
+check(bsearch(sorted_arr, 91) == 9,  "bsearch last")
+
+-- 3.3 Sieve of Eratosthenes
+fn sieve(n)
+  is_prime := []
+  i = 0
+  while i <= n
+    is_prime.push(true)
+    i = i + 1
+  is_prime[0] = false
+  is_prime[1] = false
+  p = 2
+  while p * p <= n
+    if is_prime[p]
+      m = p * p
+      while m <= n
+        is_prime[m] = false
+        m = m + p
+    p = p + 1
+  primes := []
+  i = 2
+  while i <= n
+    if is_prime[i]
+      primes.push(i)
+    i = i + 1
+  primes
+
+p100 := sieve(100)
+check(p100.len() == 25,     "sieve(100) count = 25")
+check(p100[0] == 2,         "sieve first prime = 2")
+check(p100[24] == 97,       "sieve last prime = 97")
+
+-- 3.4 Matrix multiply (lists of lists)
+fn mat_new(rows, cols, val)
+  m := []
+  r = 0
+  while r < rows
+    row := []
+    c = 0
+    while c < cols
+      row.push(val)
+      c = c + 1
+    m.push(row)
+    r = r + 1
+  m
+
+fn mat_mul(a, b, M, K, N)
+  out := mat_new(M, N, 0)
+  r = 0
+  while r < M
+    c = 0
+    while c < N
+      s = 0
+      k = 0
+      while k < K
+        s = s + a[r][k] * b[k][c]
+        k = k + 1
+      out[r][c] = s
+      c = c + 1
+    r = r + 1
+  out
+
+-- Identity * [1,2; 3,4] = [1,2; 3,4]
+id := [[1, 0], [0, 1]]
+ab := [[1, 2], [3, 4]]
+res := mat_mul(id, ab, 2, 2, 2)
+check(res[0][0] == 1,       "matmul I*A [0][0]")
+check(res[0][1] == 2,       "matmul I*A [0][1]")
+check(res[1][0] == 3,       "matmul I*A [1][0]")
+check(res[1][1] == 4,       "matmul I*A [1][1]")
+
+-- [1,2; 3,4] * [1,2; 3,4] = [7,10; 15,22]
+sq := mat_mul(ab, ab, 2, 2, 2)
+check(sq[0][0] == 7,        "matmul A^2 [0][0]")
+check(sq[0][1] == 10,       "matmul A^2 [0][1]")
+check(sq[1][0] == 15,       "matmul A^2 [1][0]")
+check(sq[1][1] == 22,       "matmul A^2 [1][1]")
+
+-- 3.5 GCD / LCM
+fn gcd(a, b)
+  x = a
+  y = b
+  if x < 0 => x = -x
+  if y < 0 => y = -y
+  while y != 0
+    t := y
+    y = x % y
+    x = t
+  x
+
+fn lcm(a, b)
+  if a == 0 or b == 0 => return 0
+  g := gcd(a, b)
+  (a / g) * b
+
+check(gcd(12, 8) == 4,      "gcd(12,8)")
+check(gcd(17, 13) == 1,     "gcd primes")
+check(lcm(4, 6) == 12,      "lcm(4,6)")
+check(lcm(12, 18) == 36,    "lcm(12,18)")
+
+-- 3.6 Linked list via maps
+fn ll_node(val, next)
+  n := {}
+  n.set("val", val)
+  n.set("next", next)
+  n
+
+fn ll_to_list(head)
+  out := []
+  cur = head
+  while cur != nil
+    out.push(cur.get("val"))
+    cur = cur.get("next")
+  out
+
+fn ll_reverse(head)
+  prev = nil
+  cur = head
+  while cur != nil
+    nxt := cur.get("next")
+    cur.set("next", prev)
+    prev = cur
+    cur = nxt
+  prev
+
+ll := ll_node(1, ll_node(2, ll_node(3, nil)))
+check(ll_to_list(ll).len() == 3,   "linked list len")
+check(ll_to_list(ll)[0] == 1,      "linked list [0]")
+check(ll_to_list(ll)[2] == 3,      "linked list [2]")
+
+rl := ll_reverse(ll)
+check(ll_to_list(rl)[0] == 3,      "reversed ll [0]")
+check(ll_to_list(rl)[2] == 1,      "reversed ll [2]")
+
+-- 3.7 String tokenizer
+fn tokenize(input)
+  tokens := []
+  i = 0
+  current = ""
+  while i < input.len()
+    ch := input[i]
+    if ch == " " or ch == "\n" or ch == "\t"
+      if current != ""
+        tokens.push(current)
+        current = ""
+    else if ch == "(" or ch == ")" or ch == "+" or ch == "-" or ch == "*" or ch == "/"
+      if current != ""
+        tokens.push(current)
+        current = ""
+      tokens.push(ch)
+    else
+      current = current + ch
+    i = i + 1
+  if current != ""
+    tokens.push(current)
+  tokens
+
+toks := tokenize("(add 3 (* 4 5))")
+check(toks[0] == "(",       "tokenize paren open")
+check(toks[1] == "add",     "tokenize ident")
+check(toks[2] == "3",       "tokenize number")
+check(toks[3] == "(",       "tokenize nested (")
+check(toks[4] == "*",       "tokenize op")
+check(toks.len() == 9,      "tokenize total count")
+
+-- 3.8 Iterative fibonacci (large)
+fn fib_iter(n)
+  if n <= 1 => return n
+  a = 0
+  b = 1
+  i = 2
+  while i <= n
+    c := a + b
+    a = b
+    b = c
+    i = i + 1
+  b
+
+check(fib_iter(20) == 6765,      "fib_iter(20)")
+check(fib_iter(30) == 832040,    "fib_iter(30)")
+
+print("  Stage 3 complete")
+
+-- ═══════════════════════════════════════════════════════════════════════
+--  STAGE 4 — SERVER LEVEL HEAVY COMPUTING
+--  Stress loops, crypto, JSON, large data, timing, benchmarks
+-- ═══════════════════════════════════════════════════════════════════════
+
+stage_header("STAGE 4 — HEAVY: Stress tests and server-level computing")
+
+-- 4.1 Large list construction + sum (100k elements)
+big := []
+i = 0
+while i < 100000
+  big.push(i)
+  i = i + 1
+check(big.len() == 100000,  "100k list size")
+
+big_sum = 0
+i = 0
+while i < big.len()
+  big_sum = big_sum + big[i]
+  i = i + 1
+expected_sum := 99999 * 100000 / 2
+check(big_sum == expected_sum, "100k list sum = " + str(expected_sum))
+
+-- 4.2 Large string building
+s = ""
+i = 0
+while i < 1000
+  s = s + "x"
+  i = i + 1
+check(s.len() == 1000,      "1000-char string build")
+
+-- 4.3 SHA-256 hashing
+hash := sha256("hello world")
+check(hash.len() == 64,     "sha256 produces 64-char hex")
+check(hash == "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9", "sha256 correctness")
+
+-- 4.4 SHA-256 consistency (hash 100 times)
+consistent = true
+base_hash := sha256("test")
+i = 0
+while i < 100
+  if sha256("test") != base_hash
+    consistent = false
+  i = i + 1
+check(consistent,            "sha256 100x consistent")
+
+-- 4.5 Base64 encode/decode
+encoded := base64_encode("Hello, Nuvola!")
+decoded := base64_decode(encoded)
+check(decoded == "Hello, Nuvola!", "base64 round-trip")
+
+-- 4.6 JSON serialize/deserialize
+obj := {}
+obj.set("name", "Nuvola")
+obj.set("version", 1)
+obj.set("features", ["fast", "safe", "parallel"])
+json_str := json_stringify(obj)
+check(json_str.len() > 0,   "json_stringify non-empty")
+
+parsed := json_parse(json_str)
+check(parsed.get("name") == "Nuvola",   "json round-trip name")
+check(parsed.get("version") == 1,       "json round-trip version")
+
+-- 4.7 Nested JSON
+nested := {}
+inner := {}
+inner.set("x", 10)
+inner.set("y", 20)
+nested.set("point", inner)
+nested.set("label", "origin")
+nj := json_stringify(nested)
+np := json_parse(nj)
+check(np.get("label") == "origin",      "nested json label")
+pt := np.get("point")
+check(pt.get("x") == 10,                "nested json point.x")
+check(pt.get("y") == 20,                "nested json point.y")
+
+-- 4.8 Regex
+check(regex_match("^[0-9]+$", "12345"), "regex match digits")
+check(not regex_match("^[0-9]+$", "abc"), "regex no match")
+
+found := regex_find("[0-9]+", "abc 123 def 456")
+check(found == "123",        "regex_find first match")
+
+all_matches := regex_find_all("[0-9]+", "abc 123 def 456 ghi 789")
+check(all_matches.len() == 3,  "regex_find_all count")
+check(all_matches[0] == "123", "regex_find_all[0]")
+check(all_matches[2] == "789", "regex_find_all[2]")
+
+replaced := regex_replace("[0-9]+", "abc 123 def 456", "NUM")
+check(replaced == "abc NUM def NUM", "regex_replace")
+
+splits := regex_split("[,;]", "a,b;c,d")
+check(splits.len() == 4,    "regex_split count")
+check(splits[2] == "c",     "regex_split[2]")
+
+-- 4.9 Timing benchmark: sum 1M integers
+t0 := time_ms()
+total = 0
+i = 0
+while i < 1000000
+  total = total + i
+  i = i + 1
+t1 := time_ms()
+elapsed := t1 - t0
+check(total == 499999500000, "1M sum correct")
+print("  Benchmark: 1M integer sum = " + str(elapsed) + " ms")
+
+-- 4.10 Timing: quicksort 10k elements (LCG pseudo-random)
+fn lcg_fill(n, seed)
+  out := []
+  s = seed
+  i = 0
+  while i < n
+    s = (s * 1103515245 + 12345) % 2147483648
+    out.push(s % 10000)
+    i = i + 1
+  out
+
+qs_big := lcg_fill(10000, 42)
+t0 = time_ms()
+qsort(qs_big, 0, qs_big.len() - 1)
+t1 = time_ms()
+-- Verify sorted
+sorted_ok = true
+i = 1
+while i < qs_big.len()
+  if qs_big[i] < qs_big[i - 1]
+    sorted_ok = false
+  i = i + 1
+check(sorted_ok,             "quicksort 10k verified")
+print("  Benchmark: quicksort 10k = " + str(t1 - t0) + " ms")
+
+-- 4.11 Timing: sieve of Eratosthenes to 100k
+t0 = time_ms()
+big_primes := sieve(100000)
+t1 = time_ms()
+check(big_primes.len() == 9592, "sieve(100k) = 9592 primes")
+print("  Benchmark: sieve 100k = " + str(t1 - t0) + " ms")
+
+-- 4.12 Timing: matrix multiply 50x50
+fn mat_random(rows, cols, seed)
+  m := []
+  s = seed
+  r = 0
+  while r < rows
+    row := []
+    c = 0
+    while c < cols
+      s = (s * 1103515245 + 12345) % 2147483648
+      row.push(s % 100)
+      c = c + 1
+    m.push(row)
+    r = r + 1
+  m
+
+ma := mat_random(50, 50, 1)
+mb := mat_random(50, 50, 2)
+t0 = time_ms()
+mc := mat_mul(ma, mb, 50, 50, 50)
+t1 = time_ms()
+check(mc.len() == 50,        "50x50 matmul rows")
+check(mc[0].len() == 50,     "50x50 matmul cols")
+print("  Benchmark: 50x50 matmul = " + str(t1 - t0) + " ms")
+
+-- 4.13 Map stress: insert and lookup 10k entries
+big_map := {}
+i = 0
+while i < 10000
+  big_map.set("key_" + str(i), i * i)
+  i = i + 1
+check(big_map.get("key_0") == 0,        "map stress key_0")
+check(big_map.get("key_9999") == 99980001, "map stress key_9999")
+check(big_map.get("key_5000") == 25000000, "map stress key_5000")
+
+-- 4.14 Recursive depth test
+fn deep_recurse(n)
+  if n <= 0 => return 0
+  1 + deep_recurse(n - 1)
+check(deep_recurse(1000) == 1000, "recursion depth 1000")
+
+-- 4.15 Repeated function call stress
+fn square(n) => n * n
+check(square(0) == 0,            "square(0)")
+check(square(10) == 100,         "square(10)")
+check(square(99) == 9801,        "square(99)")
+check(square(square(3)) == 81,   "square(square(3))")
+
+-- 4.16 HMAC-SHA256
+hmac_result := hmac_sha256("key", "message")
+check(hmac_result.len() == 64,  "hmac-sha256 produces 64 hex chars")
+
+print("  Stage 4 complete")
+
+-- ═══════════════════════════════════════════════════════════════════════
+--  FINAL REPORT
+-- ═══════════════════════════════════════════════════════════════════════
+
+stage_header("FINAL RESULTS")
+print("  All 4 stages completed successfully!")
+print("  If you see this message, every assert() passed.")
+print("")

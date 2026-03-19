@@ -1,0 +1,211 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Nuvola Benchmark Runner — written in Nuvola (dogfooding the language)
+-- Compiles + times: Nuvola (nuvc), C (clang -O3), Python 3
+-- Uses extern C FFI for high-res timing and subprocess execution.
+--
+-- Build + run:
+--   cd /mnt/data/Nuvola/stage0
+--   cargo run --release -- ../bench/run.nvl -o /tmp/nvbench
+--   /tmp/nvbench
+-- ─────────────────────────────────────────────────────────────────────────────
+
+@cinclude("time.h")
+@cinclude("sys/wait.h")
+
+-- ── ANSI colours (\e = ESC) ───────────────────────────────────────────────────
+RED    := "\e[91m"
+GREEN  := "\e[92m"
+YELLOW := "\e[93m"
+BLUE   := "\e[94m"
+CYAN   := "\e[96m"
+BOLD   := "\e[1m"
+DIM    := "\e[2m"
+RST    := "\e[0m"
+
+-- ── paths (computed at startup) ───────────────────────────────────────────────
+-- Locate stage0/ as sibling of bench/, bench/ is where this binary lives.
+-- We find the project root from argv[0] or just use absolute paths.
+STAGE0  := "/mnt/data/Nuvola/stage0"
+BENCH   := "/mnt/data/Nuvola/bench"
+NUVC    := STAGE0 + "/target/release/nuvc"
+TRIALS  := 5
+
+-- ── helpers ───────────────────────────────────────────────────────────────────
+fn banner(msg)
+  line = ""
+  i = 0
+  while i < 72
+    line = line + "\xe2\x95\x90"   -- UTF-8 ═
+    i = i + 1
+  -- fallback: ascii line
+  line = "========================================================================"
+  print(BOLD + CYAN + line + RST)
+  print(BOLD + CYAN + "  " + msg + RST)
+  print(BOLD + CYAN + line + RST)
+
+fn fmt_ns(ns)
+  if ns <= 0
+    return RED + "FAIL" + RST
+  if ns < 1000000
+    return str(ns // 1000) + " us"
+  if ns < 1000000000
+    ms10 := int(float(ns) / 100000.0 + 0.5)
+    return str(ms10 // 10) + "." + str(ms10 % 10) + " ms"
+  s10 := int(float(ns) / 100000000.0 + 0.5)
+  return str(s10 // 10) + "." + str(s10 % 10) + " s "
+
+fn ratio_str(nvl_ns, ref_ns)
+  if nvl_ns <= 0 or ref_ns <= 0
+    return "  n/a  "
+  r100 := (ref_ns * 100) // nvl_ns
+  return str(r100 // 100) + "." + str((r100 % 100) // 10) + "x"
+
+fn fmt_ratio(nvl_ns, ref_ns, lbl)
+  if nvl_ns <= 0 or ref_ns <= 0
+    return DIM + "n/a" + RST
+  r100 := (ref_ns * 100) // nvl_ns
+  rs   := str(r100 // 100) + "." + str((r100 % 100) // 10) + "x"
+  if r100 >= 150
+    return GREEN + BOLD + rs + " vs " + lbl + RST
+  if r100 >= 95
+    return YELLOW + BOLD + rs + " vs " + lbl + RST
+  return RED + BOLD + rs + " vs " + lbl + RST
+
+fn time_best(cmd, trials)
+  best := -1
+  i := 0
+  while i < trials
+    t0      := nv_clock_ns()
+    rc      := nv_shell(cmd + " >/dev/null 2>&1")
+    t1      := nv_clock_ns()
+    if rc != 0
+      return -1
+    elapsed := t1 - t0
+    if best < 0 or elapsed < best
+      best = elapsed
+    i = i + 1
+  best
+
+-- ── benchmark definitions ────────────────────────────────────────────────────
+names  := ["fib",      "mandelbrot",          "primes",                  "quicksort",            "nbody"]
+labels := ["Fibonacci(40)",  "Mandelbrot 200x200",  "Sieve of Eratosthenes 1M",  "Quicksort 100k ints",  "N-body 500k steps"]
+descs  := [
+  "call overhead, int specialisation",
+  "float throughput, scalar specialisation",
+  "list alloc, bool-array specialisation",
+  "list indexing, int-array specialisation",
+  "18-var scalar main, float math"
+]
+
+nvl_ns_list  := []
+c_ns_list    := []
+py_ns_list   := []
+nvl_str_list := []
+c_str_list   := []
+py_str_list  := []
+
+-- ── header ────────────────────────────────────────────────────────────────────
+banner("Nuvola Benchmark Runner  |  " + str(TRIALS) + " trials, best-of taken")
+print("  nuvc   : " + NUVC)
+print("  bench  : " + BENCH)
+print("")
+
+-- ── run each benchmark ────────────────────────────────────────────────────────
+i := 0
+while i < names.len
+  name  := names[i]
+  label := labels[i]
+  desc  := descs[i]
+
+  nvl_src := BENCH + "/" + name + ".nvl"
+  c_src   := BENCH + "/" + name + ".c"
+  py_src  := BENCH + "/" + name + ".py"
+  nvl_bin := "/tmp/nvbench_" + name + "_nvl"
+  c_bin   := "/tmp/nvbench_" + name + "_c"
+
+  print(BOLD + "-- " + label + RST + "  (" + desc + ")")
+
+  -- Nuvola
+  rc_nvl := nv_shell(NUVC + " " + nvl_src + " -o " + nvl_bin + " 2>/dev/null")
+  nvl_t  := -1
+  if rc_nvl == 0
+    nvl_t = time_best(nvl_bin, TRIALS)
+  nvl_s := fmt_ns(nvl_t)
+  nvl_ns_list.push(nvl_t)
+  nvl_str_list.push(nvl_s)
+  if nvl_t > 0
+    print("  " + GREEN + "Nuvola " + RST + "  " + nvl_s)
+  else
+    print("  " + RED + "Nuvola  FAILED" + RST)
+
+  -- C
+  compile_c := "clang -O3 -march=native -ffast-math -Wno-unused-variable " + c_src + " -lm -o " + c_bin + " 2>/dev/null"
+  rc_c := nv_shell(compile_c)
+  c_t  := -1
+  if rc_c == 0
+    c_t = time_best(c_bin, TRIALS)
+  c_s := fmt_ns(c_t)
+  c_ns_list.push(c_t)
+  c_str_list.push(c_s)
+  if c_t > 0
+    print("  " + BLUE + "C      " + RST + "  " + c_s)
+  else
+    print("  " + RED + "C       FAILED" + RST)
+
+  -- Python
+  py_t := time_best("python3 " + py_src, TRIALS)
+  py_s := fmt_ns(py_t)
+  py_ns_list.push(py_t)
+  py_str_list.push(py_s)
+  if py_t > 0
+    print("  " + YELLOW + "Python " + RST + "  " + py_s)
+  else
+    print("  " + RED + "Python  FAILED" + RST)
+
+  print("  " + BOLD + "Speedup: " + fmt_ratio(nvl_t, c_t, "C") + "   " + fmt_ratio(nvl_t, py_t, "Python") + RST)
+  print("")
+
+  i = i + 1
+
+-- ── summary ───────────────────────────────────────────────────────────────────
+banner("SUMMARY")
+print("  " + BOLD +
+  "Benchmark                    Nuvola     C(clang)    Python     vs C       vs Py" + RST)
+print("  " + "--------------------------------------------------------------------------------")
+
+wins_c  := 0
+wins_py := 0
+k := 0
+while k < names.len
+  nv  := nvl_ns_list[k]
+  ct  := c_ns_list[k]
+  pyt := py_ns_list[k]
+
+  vs_c := DIM + "  n/a " + RST
+  if nv > 0 and ct > 0
+    r100 := (ct * 100) // nv
+    rs   := str(r100 // 100) + "." + str((r100 % 100) // 10) + "x"
+    if r100 >= 95
+      wins_c = wins_c + 1
+      vs_c = GREEN + rs + RST
+    else
+      vs_c = RED + rs + RST
+
+  vs_py := DIM + "  n/a " + RST
+  if nv > 0 and pyt > 0
+    rp100 := (pyt * 100) // nv
+    vs_py = GREEN + str(rp100 // 100) + "." + str((rp100 % 100) // 10) + "x" + RST
+    wins_py = wins_py + 1
+
+  print("  " + labels[k] + "  " +
+        nvl_str_list[k] + "    " +
+        c_str_list[k]   + "    " +
+        py_str_list[k]  + "    " +
+        vs_c + "    " + vs_py)
+
+  k = k + 1
+
+print("")
+print(BOLD + "  " + str(wins_c) + "/" + str(names.len) + " match/beat C" +
+      "  *  " + str(wins_py) + "/" + str(names.len) + " beat Python" + RST)
+print("")

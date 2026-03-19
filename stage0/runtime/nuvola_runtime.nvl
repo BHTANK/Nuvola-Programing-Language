@@ -1,0 +1,383 @@
+import stage0.self.hardware
+
+-- nuvola_runtime.nvl — Nuvola-native view of the Stage-0 runtime
+--
+-- This file serves two purposes:
+--   1. Documents every primitive the Nuvola runtime exposes to user programs.
+--   2. Provides Nuvola-level wrappers and higher-level facilities built on top.
+--
+-- The actual low-level primitives (nv_int, nv_list_push, etc.) are implemented
+-- in stage0/runtime/nuvola.h (C) and stage0/runtime/nuvola_cuda.cu (CUDA).
+-- This file is the "self-describing" Nuvola layer that sits above that C layer.
+--
+-- Memory model (mirrors nuvola.h):
+--   Values are 16-byte tagged unions: NIL | INT | FLOAT | BOOL | STR | LIST | MAP | FN | PTR | CHAN
+--   Strings are heap-allocated UTF-8; lists/maps are heap-dynamic arrays.
+--   Optional Boehm GC via -DNUVOLA_GC; otherwise manual (arena or explicit free).
+--   VRAM fast-path: see stage0/self/hardware.nvl — large tensors live in VRAM.
+--
+-- Value tag constants
+TAG_NIL   := 0
+TAG_INT   := 1
+TAG_FLOAT := 2
+TAG_BOOL  := 3
+TAG_STR   := 4
+TAG_LIST  := 5
+TAG_MAP   := 6
+TAG_FN    := 7
+TAG_PTR   := 8
+TAG_CHAN  := 9
+
+-- ── Value constructors (thin Nuvola wrappers over C builtins) ─────────────────
+
+fn rt_nil()
+  -- The nil value.
+  nil
+
+fn rt_int(n)
+  -- Wrap integer. Range: signed 64-bit.
+  int(n)
+
+fn rt_float(f)
+  -- Wrap float. IEEE-754 double.
+  float(f)
+
+fn rt_bool(b)
+  -- Wrap boolean.
+  bool(b)
+
+fn rt_str(s)
+  -- Heap-copy and wrap string.
+  str(s)
+
+fn rt_list()
+  -- Empty dynamic list.
+  []
+
+fn rt_map()
+  -- Empty string-keyed map.
+  {}
+
+-- ── Type predicates ───────────────────────────────────────────────────────────
+
+fn rt_is_nil(v)
+  v == nil
+
+fn rt_is_int(v)
+  -- True if v is an integer value.
+  -- Implemented: type_tag(v) == TAG_INT in C; approximated in Nuvola by:
+  v != nil and v == int(v)
+
+fn rt_is_float(v)
+  -- True if v is a float.
+  v != nil and v == float(v) and not rt_is_int(v)
+
+fn rt_is_bool(v)
+  v == true or v == false
+
+fn rt_is_str(v)
+  v != nil and not rt_is_bool(v) and not rt_is_int(v) and not rt_is_float(v) and v.is_str()
+
+fn rt_is_list(v)
+  v != nil and v.is_list()
+
+fn rt_is_map(v)
+  v != nil and v.is_map()
+
+fn rt_is_fn(v)
+  v != nil and v.is_fn()
+
+fn rt_type_name(v)
+  if v == nil          => return "nil"
+  if rt_is_bool(v)     => return "bool"
+  if rt_is_int(v)      => return "int"
+  if rt_is_float(v)    => return "float"
+  if rt_is_str(v)      => return "str"
+  if rt_is_list(v)     => return "list"
+  if rt_is_map(v)      => return "map"
+  if rt_is_fn(v)       => return "fn"
+  "ptr"
+
+-- ── String operations (wrapping C nv_str_* builtins) ─────────────────────────
+
+fn rt_str_len(s)
+  s.len()
+
+fn rt_str_concat(a, b)
+  a + b
+
+fn rt_str_eq(a, b)
+  a == b
+
+fn rt_str_lt(a, b)
+  -- Lexicographic less-than; uses C strcmp internally.
+  a < b
+
+fn rt_str_char_at(s, i)
+  -- Return single-char string at index i.
+  s[i]
+
+fn rt_str_slice(s, lo, hi)
+  s.slice(lo, hi)
+
+fn rt_str_to_int(s)
+  int(s)
+
+fn rt_str_to_float(s)
+  float(s)
+
+fn rt_int_to_str(n)
+  str(n)
+
+fn rt_float_to_str(f)
+  str(f)
+
+fn rt_bool_to_str(b)
+  if b => return "true"
+  "false"
+
+-- ── List operations (wrapping C nv_list_* builtins) ──────────────────────────
+
+fn rt_list_new()
+  []
+
+fn rt_list_push(lst, val)
+  lst.push(val)
+
+fn rt_list_pop(lst)
+  lst.pop()
+
+fn rt_list_get(lst, i)
+  lst[i]
+
+fn rt_list_set(lst, i, val)
+  lst[i] = val
+
+fn rt_list_len(lst)
+  lst.len()
+
+fn rt_list_slice(lst, lo, hi)
+  out := []
+  i   := lo
+  while i < hi and i < lst.len()
+    out.push(lst[i])
+    i = i + 1
+  out
+
+fn rt_list_concat(a, b)
+  out := []
+  i   := 0
+  while i < a.len()
+    out.push(a[i])
+    i = i + 1
+  i = 0
+  while i < b.len()
+    out.push(b[i])
+    i = i + 1
+  out
+
+fn rt_list_eq(a, b)
+  if a.len() != b.len()
+    return false
+  i := 0
+  while i < a.len()
+    if a[i] != b[i]
+      return false
+    i = i + 1
+  true
+
+-- ── Map operations (wrapping C nv_map_* builtins) ────────────────────────────
+
+fn rt_map_new()
+  {}
+
+fn rt_map_set(m, key, val)
+  m.set(key, val)
+
+fn rt_map_get(m, key)
+  m.get(key)
+
+fn rt_map_has(m, key)
+  m.has(key)
+
+fn rt_map_del(m, key)
+  m.del(key)
+
+fn rt_map_keys(m)
+  m.keys()
+
+fn rt_map_values(m)
+  m.values()
+
+fn rt_map_len(m)
+  m.keys().len()
+
+fn rt_map_merge(a, b)
+  -- Return new map with a's entries overwritten by b's.
+  out  := {}
+  ak   := a.keys()
+  i    := 0
+  while i < ak.len()
+    out.set(ak[i], a.get(ak[i]))
+    i = i + 1
+  bk := b.keys()
+  i  = 0
+  while i < bk.len()
+    out.set(bk[i], b.get(bk[i]))
+    i = i + 1
+  out
+
+-- ── Arithmetic builtins ───────────────────────────────────────────────────────
+
+fn rt_sqrt(x)
+  sqrt(x)
+
+fn rt_abs(x)
+  if x < 0 => return -x
+  x
+
+fn rt_pow(base, exp)
+  -- Integer exponentiation by squaring.
+  if exp == 0 => return 1
+  if exp == 1 => return base
+  if exp % 2 == 0
+    half := rt_pow(base, exp / 2)
+    return half * half
+  base * rt_pow(base, exp - 1)
+
+fn rt_powf(base, exp)
+  -- Float power using log/exp identity: base^exp = e^(exp*ln(base))
+  -- Delegated to C math.h expf/logf via nv_shell or direct linking
+  float(base) ** float(exp)
+
+fn rt_min(a, b)
+  if a < b => return a
+  b
+
+fn rt_max(a, b)
+  if a > b => return a
+  b
+
+fn rt_clamp(val, lo, hi)
+  if val < lo => return lo
+  if val > hi => return hi
+  val
+
+fn rt_floor(x)
+  floor(x)
+
+fn rt_ceil(x)
+  ceil(x)
+
+fn rt_round(x)
+  floor(x + 0.5)
+
+-- ── I/O builtins ──────────────────────────────────────────────────────────────
+
+fn rt_print(s)
+  print(s)
+
+fn rt_println(s)
+  print(s + "\n")
+
+fn rt_print_err(s)
+  -- Write to stderr. Uses nv_shell in stage0; direct syscall in native mode.
+  nv_shell("echo " + s + " >&2")
+
+fn rt_read_line()
+  -- Read one line from stdin.
+  nv_read_line()
+
+fn rt_read_file(path)
+  nv_read_file(path)
+
+fn rt_write_file(path, content)
+  nv_write_file(path, content)
+
+fn rt_append_file(path, content)
+  -- Append content to file.
+  existing := nv_read_file(path)
+  nv_write_file(path, existing + content)
+
+-- ── Channel / concurrency primitives ─────────────────────────────────────────
+-- Channels are backed by pthread mutex+condvar in nuvola.h (NvChan).
+-- The Nuvola layer exposes them as opaque handles.
+
+fn rt_chan_new(capacity)
+  -- Create a buffered channel with given capacity.
+  nv_chan_new(capacity)
+
+fn rt_chan_send(ch, val)
+  nv_chan_send(ch, val)
+
+fn rt_chan_recv(ch)
+  nv_chan_recv(ch)
+
+fn rt_chan_try_recv(ch)
+  -- Non-blocking receive. Returns nil if empty.
+  nv_chan_try_recv(ch)
+
+fn rt_chan_close(ch)
+  nv_chan_close(ch)
+
+fn rt_spawn(f)
+  -- Spawn f as a concurrent task (pthread in stage0, goroutine-style).
+  nv_spawn(f)
+
+-- ── Arena (per-request memory) ───────────────────────────────────────────────
+
+fn rt_arena_begin()
+  -- Activate the 4 MB per-thread bump arena.
+  -- All subsequent string allocations come from the arena.
+  nv_arena_begin()
+
+fn rt_arena_end()
+  -- Reset the arena (free all arena-allocated strings atomically).
+  nv_arena_end()
+
+-- ── Hardware dispatch (VRAM-first) ────────────────────────────────────────────
+-- Delegates to stage0/self/hardware.nvl for GPU/CPU routing.
+
+fn rt_hw_alloc(name, size_bytes)
+  -- Allocate a named VRAM buffer if GPU present, else no-op.
+  -- Returns 0 on success, non-zero on failure.
+  vram_alloc(name, size_bytes)
+
+fn rt_hw_free(name)
+  -- Release a named VRAM buffer.
+  vram_free(name)
+
+fn rt_hw_upload(host_file, gpu_name)
+  -- Copy host file into a named VRAM buffer (host → VRAM).
+  vram_upload(host_file, gpu_name)
+
+fn rt_hw_download(gpu_name, host_file)
+  -- Copy VRAM buffer back to host file (VRAM → host).
+  vram_download(gpu_name, host_file)
+
+fn rt_hw_run(bin, input_file, data_size, is_parallel)
+  -- Dispatch to GPU or CPU depending on should_use_gpu(data_size).
+  hw_run(bin, input_file, data_size, is_parallel)
+
+-- ── Runtime diagnostics ───────────────────────────────────────────────────────
+
+fn rt_stack_trace()
+  -- Print the current Nuvola call stack (uses NV_ENTER frames from C runtime).
+  nv_print_trace()
+
+fn rt_gc_collect()
+  -- Force GC collection if compiled with -DNUVOLA_GC.
+  nv_gc_collect()
+
+fn rt_mem_stats()
+  -- Return {heap_bytes, arena_bytes, vram_bytes} usage map.
+  nv_mem_stats()
+
+fn rt_version()
+  -- Runtime version string.
+  "nuvola-stage0/1.0.0"
+
+fn rt_describe()
+  -- Print full runtime info: platform, GPU, version.
+  hw_print_info()
+  print("Runtime: " + rt_version())

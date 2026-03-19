@@ -1,0 +1,251 @@
+-- lexer.nvl — Nuvola lexer written in Nuvola, compiled to native binary
+-- This is Milestone M6: Stage 1 self-hosting begins here.
+-- The lexer tokenizes Nuvola source and emits tokens identical to the Rust lexer.
+--
+-- Token format: each token is a map {kind, val, line, col}
+-- Token kinds: "int" "float" "str" "bool" "nil" "ident" "kw" "op" "nl" "indent" "dedent" "eof"
+--
+-- Usage: ./lexer <file.nvl>   (prints tokens one per line)
+
+-- ── Character predicates ─────────────────────────────────────────────────────
+
+fn is_alpha(c)
+  (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_"
+
+fn is_digit(c)
+  c >= "0" and c <= "9"
+
+fn is_alnum(c)
+  is_alpha(c) or is_digit(c)
+
+fn is_space(c)
+  c == " " or c == "\t"
+
+-- ── Keyword table ────────────────────────────────────────────────────────────
+
+fn is_keyword(w)
+  kws := ["fn", "async", "return", "if", "elif", "else", "for", "in",
+          "while", "break", "continue", "match", "true", "false", "nil",
+          "and", "or", "not", "comptime", "extern", "unsafe", "spawn",
+          "await", "import", "trait", "impl", "type", "where", "skip"]
+  for k in kws
+    if k == w
+      return true
+  false
+
+-- ── Safe peek ────────────────────────────────────────────────────────────────
+
+fn peek(chars, i, n)
+  if i < n
+    return chars[i]
+  ""
+
+-- ── Token constructor ─────────────────────────────────────────────────────────
+
+fn make_tok(kind, val, line, col)
+  t = {}
+  t.set("kind", kind)
+  t.set("val",  val)
+  t.set("line", str(line))
+  t.set("col",  str(col))
+  t
+
+fn is_two_char_op(c, p)
+  ops := [":=", "=>", "|>", "->", "==", "!=", "<=", ">=", "**", "..", "//", "+=", "-=", "*=", "/="]
+  for op in ops
+    if op == c + p
+      return true
+  false
+
+-- ── Main lexer ───────────────────────────────────────────────────────────────
+
+fn lex(src)
+  chars  := src.chars()
+  n      := chars.len
+  i      = 0
+  line   = 1
+  col    = 1
+  tokens = []
+  indent_stack = [0]   -- stack of indent levels (starting at 0)
+  bracket_depth = 0    -- inside () [] {} → suppress INDENT/DEDENT
+
+  while i < n
+    c  := chars[i]
+    p  := peek(chars, i + 1, n)
+
+    -- ── newline ──────────────────────────────────────────────────────────
+    if c == "\n"
+      if bracket_depth == 0
+        tokens.push(make_tok("nl", "\\n", line, col))
+        -- measure indent of next non-blank line
+        j = i + 1
+        spaces = 0
+        while j < n and (chars[j] == " " or chars[j] == "\t")
+          spaces = spaces + 1
+          j = j + 1
+        -- skip blank / comment-only lines (don't emit indent/dedent for them)
+        next_real := peek(chars, j, n)
+        is_blank := next_real == "\n" or next_real == "\r" or next_real == ""
+        is_comment := next_real == "-" and peek(chars, j + 1, n) == "-"
+        if not is_blank and not is_comment
+          top := indent_stack[indent_stack.len - 1]
+          if spaces > top
+            indent_stack.push(spaces)
+            tokens.push(make_tok("indent", str(spaces), line + 1, 1))
+          else
+            while spaces < indent_stack[indent_stack.len - 1]
+              indent_stack.pop()
+              tokens.push(make_tok("dedent", "", line + 1, 1))
+      line = line + 1
+      col  = 1
+      i    = i + 1
+
+    -- ── carriage return ──────────────────────────────────────────────────
+    else if c == "\r"
+      i = i + 1
+
+    -- ── line comment ──────────────────────────────────────────────────────
+    else if c == "-" and p == "-"
+      while i < n and chars[i] != "\n"
+        i   = i + 1
+        col = col + 1
+
+    -- ── string literal ────────────────────────────────────────────────────
+    else if c == "\""
+      i   = i + 1
+      col = col + 1
+      s   = ""
+      while i < n and chars[i] != "\""
+        ch := chars[i]
+        if ch == "\\"
+          i   = i + 1
+          col = col + 1
+          esc := peek(chars, i, n)
+          if esc == "n"
+            s = s + "\n"
+          else if esc == "t"
+            s = s + "\t"
+          else if esc == "\\"
+            s = s + "\\"
+          else if esc == "\""
+            s = s + "\""
+          else
+            s = s + esc
+        else
+          s = s + ch
+        i   = i + 1
+        col = col + 1
+      tokens.push(make_tok("str", s, line, col))
+      i   = i + 1
+      col = col + 1
+
+    -- ── number literal ───────────────────────────────────────────────────
+    else if is_digit(c)
+      num   = ""
+      is_f  = false
+      start_col := col
+      while i < n and (is_digit(chars[i]) or (chars[i] == "." and peek(chars, i + 1, n) != "."))
+        if chars[i] == "."
+          is_f = true
+        num = num + chars[i]
+        i   = i + 1
+        col = col + 1
+      if is_f
+        tokens.push(make_tok("float", num, line, start_col))
+      else
+        tokens.push(make_tok("int", num, line, start_col))
+
+    -- ── identifier or keyword ─────────────────────────────────────────────
+    else if is_alpha(c)
+      word      = ""
+      start_col := col
+      while i < n and is_alnum(chars[i])
+        word = word + chars[i]
+        i    = i + 1
+        col  = col + 1
+      if word == "true" or word == "false"
+        tokens.push(make_tok("bool", word, line, start_col))
+      else if word == "nil"
+        tokens.push(make_tok("nil", "nil", line, start_col))
+      else if is_keyword(word)
+        tokens.push(make_tok("kw", word, line, start_col))
+      else
+        tokens.push(make_tok("ident", word, line, start_col))
+
+    -- ── annotation @name ──────────────────────────────────────────────────
+    else if c == "@"
+      i   = i + 1
+      col = col + 1
+      name = ""
+      while i < n and is_alnum(chars[i])
+        name = name + chars[i]
+        i    = i + 1
+        col  = col + 1
+      tokens.push(make_tok("annot", "@" + name, line, col))
+
+    -- ── brackets (track depth for indent suppression) ─────────────────────
+    else if c == "(" or c == "[" or c == "{"
+      bracket_depth = bracket_depth + 1
+      tokens.push(make_tok("op", c, line, col))
+      i   = i + 1
+      col = col + 1
+
+    else if c == ")" or c == "]" or c == "}"
+      bracket_depth = bracket_depth - 1
+      tokens.push(make_tok("op", c, line, col))
+      i   = i + 1
+      col = col + 1
+
+    -- ── whitespace ────────────────────────────────────────────────────────
+    else if is_space(c)
+      i   = i + 1
+      col = col + 1
+
+    -- ── ..= three-char op ─────────────────────────────────────────────
+    else if c == "." and p == "." and peek(chars, i + 2, n) == "="
+      tokens.push(make_tok("op", "..=", line, col))
+      i   = i + 3
+      col = col + 3
+
+    -- ── two-char operators ───────────────────────────────────────────────
+    else if is_two_char_op(c, p)
+      tokens.push(make_tok("op", c + p, line, col))
+      i   = i + 2
+      col = col + 2
+
+    -- ── single-char operators ─────────────────────────────────────────────
+    else
+      tokens.push(make_tok("op", c, line, col))
+      i   = i + 1
+      col = col + 1
+
+  -- flush remaining dedents
+  while indent_stack.len > 1
+    indent_stack.pop()
+    tokens.push(make_tok("dedent", "", line, col))
+  tokens.push(make_tok("eof", "", line, col))
+  tokens
+
+-- ── Printer ──────────────────────────────────────────────────────────────────
+
+fn print_tokens(tokens)
+  for tok in tokens
+    kind := tok.get("kind")
+    val  := tok.get("val")
+    ln   := tok.get("line")
+    cl   := tok.get("col")
+    if kind == "nl" or kind == "indent" or kind == "dedent" or kind == "eof"
+      print(ln + ":" + cl + "  " + kind)
+    else
+      print(ln + ":" + cl + "  " + kind + "  " + val)
+
+-- ── Entry point ───────────────────────────────────────────────────────────────
+
+argv := args()
+if argv.len < 2
+  print("Usage: lexer <file.nvl>")
+else
+  src    := read_file(argv[1])
+  tokens := lex(src)
+  print("Lexed " + argv[1] + " — " + str(tokens.len) + " tokens")
+  print_tokens(tokens)

@@ -1,0 +1,674 @@
+-- features_test.nvl — tests for all new language features
+-- Tests: regex, sha256, base64, utf8, popen, format_str, TCO, csv, result, crypto
+
+import "std/regex.nvl"
+import "std/crypto.nvl"
+import "std/csv.nvl"
+import "std/result.nvl"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REGEX
+-- ─────────────────────────────────────────────────────────────────────────────
+assert(regex_match("[0-9]+", "hello 42 world"), "regex_match: found number")
+assert(not regex_match("^[0-9]+$", "hello"), "regex_match: no full match")
+
+found := regex_find("[a-z]+", "123abc456def")
+assert(found == "abc", "regex_find: first lower word")
+
+all := regex_find_all("[0-9]+", "x1y22z333")
+assert(all.len == 3, "regex_find_all: count")
+assert(all[0] == "1",   "regex_find_all[0]")
+assert(all[1] == "22",  "regex_find_all[1]")
+assert(all[2] == "333", "regex_find_all[2]")
+
+replaced := regex_replace("[aeiou]", "hello world", "*")
+assert(replaced == "h*ll* w*rld", "regex_replace")
+
+parts := regex_split(",\\s*", "a, b,c,  d")
+assert(parts.len == 4, "regex_split: count")
+assert(parts[0] == "a", "regex_split[0]")
+assert(parts[3] == "d", "regex_split[3]")
+
+assert(re_is_email("foo@bar.com"), "re_is_email valid")
+assert(not re_is_email("notanemail"), "re_is_email invalid")
+assert(re_is_int("42"),     "re_is_int")
+assert(not re_is_int("3.14"), "re_is_int rejects float")
+
+emails := re_extract_emails("contact us at hello@nuvola.dev and admin@example.org for help")
+assert(emails.len == 2, "re_extract_emails count")
+assert(emails[0] == "hello@nuvola.dev", "re_extract_emails[0]")
+
+stripped := re_strip_html("<b>Hello</b> <em>World</em>")
+assert(stripped == "Hello World", "re_strip_html")
+
+print("PASS: regex (" + str(regex_find_all("[A-Z]", "AaBbCc").len) + " caps found)")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SHA-256 / CRYPTO
+-- ─────────────────────────────────────────────────────────────────────────────
+h := sha256("hello")
+assert(h == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", "sha256 hello")
+
+h2 := sha256("")
+assert(h2 == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "sha256 empty")
+
+-- HMAC-SHA256
+hm := hmac_sha256("key", "message")
+assert(hm == "6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a", "hmac_sha256")
+
+-- Base64
+enc := base64_encode("Hello, World!")
+assert(enc == "SGVsbG8sIFdvcmxkIQ==", "base64_encode")
+dec := base64_decode("SGVsbG8sIFdvcmxkIQ==")
+assert(dec == "Hello, World!", "base64_decode")
+
+enc2 := base64_encode("Man")
+assert(enc2 == "TWFu", "base64 Man")
+dec2 := base64_decode("TWFu")
+assert(dec2 == "Man", "base64 decode Man")
+
+-- Round-trip
+orig := "Nuvola is fast!"
+assert(base64_decode(base64_encode(orig)) == orig, "base64 round-trip")
+
+print("PASS: crypto (sha256, hmac, base64)")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- UTF-8
+-- ─────────────────────────────────────────────────────────────────────────────
+s := "Hello"
+assert(utf8_len(s) == 5, "utf8_len ASCII")
+-- Note: multi-byte chars need actual UTF-8 bytes. Test with ASCII for portability.
+chars := utf8_chars("abc")
+assert(chars.len == 3, "utf8_chars count")
+assert(chars[0] == "a", "utf8_chars[0]")
+assert(chars[2] == "c", "utf8_chars[2]")
+assert(utf8_at("hello", 1) == "e", "utf8_at")
+
+print("PASS: utf8")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- POPEN_READ (subprocess capture)
+-- ─────────────────────────────────────────────────────────────────────────────
+out := popen_read("echo hello")
+assert(out == "hello", "popen_read echo")
+
+out2 := popen_read("echo -n nuvola")
+assert(out2 == "nuvola", "popen_read no-newline")
+
+wc := popen_read("echo -e 'a\\nb\\nc' | wc -l")
+assert(int(wc.trim()) == 3, "popen_read wc -l")
+
+print("PASS: popen_read")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FORMAT_STR
+-- ─────────────────────────────────────────────────────────────────────────────
+msg := format_str("Hello, {{0}}! You are {{1}} years old.", ["World", 42])
+assert(msg == "Hello, World! You are 42 years old.", "format_str basic")
+
+msg2 := format_str("{{0}} + {{1}} = {{2}}", [1, 2, 3])
+assert(msg2 == "1 + 2 = 3", "format_str numbers")
+
+msg3 := format_str("no placeholders", [])
+assert(msg3 == "no placeholders", "format_str empty args")
+
+print("PASS: format_str")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TCO — tail-call optimized accumulator
+-- ─────────────────────────────────────────────────────────────────────────────
+fn sum_tail(n, acc)
+  if n <= 0 => return acc
+  return sum_tail(n - 1, acc + n)
+
+assert(sum_tail(100, 0) == 5050, "TCO sum_tail 100")
+assert(sum_tail(1000, 0) == 500500, "TCO sum_tail 1000")
+-- Deep recursion that would blow the stack without TCO
+-- (100_000 levels deep — safe with TCO)
+big := sum_tail(100000, 0)
+assert(big == 5000050000, "TCO sum_tail 100000")
+
+fn fib_tail(n, a, b)
+  if n == 0 => return a
+  return fib_tail(n - 1, b, a + b)
+
+assert(fib_tail(10, 0, 1) == 55, "TCO fib_tail(10)")
+assert(fib_tail(30, 0, 1) == 832040, "TCO fib_tail(30)")
+
+print("PASS: TCO (tail-call optimization)")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CSV
+-- ─────────────────────────────────────────────────────────────────────────────
+csv_text := "name,age,city\nAlice,30,NYC\nBob,25,LA"
+rows := csv_parse(csv_text, ",")
+assert(rows.len == 3, "csv_parse row count")
+assert(rows[0][0] == "name", "csv header[0]")
+assert(rows[1][0] == "Alice", "csv row1[0]")
+assert(rows[2][1] == "25", "csv row2[1]")
+
+maps := csv_parse_maps(csv_text, ",")
+assert(maps.len == 2, "csv_parse_maps count")
+assert(maps[0].get("name") == "Alice", "csv_maps name")
+assert(maps[0].get("age") == "30", "csv_maps age")
+assert(maps[1].get("city") == "LA", "csv_maps city")
+
+-- Round-trip
+re_enc := csv_encode(rows, ",")
+rows2  := csv_parse(re_enc, ",")
+assert(rows2[1][0] == "Alice", "csv round-trip")
+
+-- Quoting
+csv_q := "a,\"b,c\",d"
+qrow  := csv_parse_line(csv_q, ",")
+assert(qrow.len == 3, "csv quoted: 3 fields")
+assert(qrow[1] == "b,c", "csv quoted field")
+
+print("PASS: csv")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- RESULT / OPTION
+-- ─────────────────────────────────────────────────────────────────────────────
+r1 := Ok(42)
+assert(is_ok(r1), "Ok is_ok")
+assert(not is_err(r1), "Ok not is_err")
+assert(unwrap(r1) == 42, "unwrap Ok")
+
+r2 := Err("oops")
+assert(is_err(r2), "Err is_err")
+assert(unwrap_or(r2, 99) == 99, "unwrap_or Err")
+assert(unwrap_err(r2) == "oops", "unwrap_err")
+
+r3 := result_map(r1, fn(x) => x * 2)
+assert(unwrap(r3) == 84, "result_map Ok")
+
+r4 := result_map(r2, fn(x) => x * 2)
+assert(is_err(r4), "result_map Err passthrough")
+
+-- result_try
+fn _try_ok() => 42
+fn _try_fail()
+  throw "bad"
+  0
+
+r5 := result_try(_try_ok)
+assert(is_ok(r5), "result_try ok")
+assert(unwrap(r5) == 42, "result_try value")
+
+r6 := result_try(_try_fail)
+assert(is_err(r6), "result_try err")
+
+-- Option
+o1 := Some(10)
+assert(is_some(o1), "Some is_some")
+assert(option_unwrap(o1) == 10, "option_unwrap Some")
+
+o2 := None()
+assert(is_none(o2), "None is_none")
+assert(option_unwrap_or(o2, 99) == 99, "option_unwrap_or None")
+
+o3 := to_option(nil)
+assert(is_none(o3), "to_option nil → None")
+o4 := to_option(42)
+assert(is_some(o4), "to_option 42 → Some")
+
+-- result_collect
+results := [Ok(1), Ok(2), Ok(3)]
+collected := result_collect(results)
+assert(is_ok(collected), "result_collect ok")
+assert(unwrap(collected).len == 3, "result_collect values")
+
+results2 := [Ok(1), Err("fail"), Ok(3)]
+collected2 := result_collect(results2)
+assert(is_err(collected2), "result_collect short-circuits on Err")
+
+print("PASS: result/option")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MATH stdlib
+-- ─────────────────────────────────────────────────────────────────────────────
+import "std/math.nvl"
+
+assert(PI > 3.14159 and PI < 3.14160, "PI value")
+assert(TAU > 6.28318 and TAU < 6.28319, "TAU value")
+assert(E  > 2.71828 and E  < 2.71829,  "E value")
+
+assert(clamp(5, 1, 10) == 5,  "clamp mid")
+assert(clamp(0, 1, 10) == 1,  "clamp lo")
+assert(clamp(20, 1, 10) == 10, "clamp hi")
+
+assert(lerp(0.0, 10.0, 0.5) == 5.0, "lerp half")
+assert(lerp(0.0, 10.0, 0.0) == 0.0, "lerp start")
+assert(lerp(0.0, 10.0, 1.0) == 10.0, "lerp end")
+
+assert(sign(42) == 1,  "sign pos")
+assert(sign(-7) == -1, "sign neg")
+assert(sign(0)  == 0,  "sign zero")
+
+assert(ipow(2, 10) == 1024, "ipow 2^10")
+assert(ipow(3, 4)  == 81,   "ipow 3^4")
+assert(ipow(5, 0)  == 1,    "ipow x^0")
+
+assert(gcd(12, 8)   == 4,  "gcd 12,8")
+assert(gcd(100, 75) == 25, "gcd 100,75")
+assert(lcm(4, 6)    == 12, "lcm 4,6")
+
+assert(list_sum([1, 2, 3, 4, 5]) == 15,   "list_sum")
+assert(list_product([1, 2, 3, 4]) == 24,   "list_product")
+assert(mean([2, 4, 6, 8]) == 5.0,          "mean")
+assert(std_dev([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]) > 1.9, "std_dev nonzero")
+
+assert(is_prime(2),     "is_prime 2")
+assert(is_prime(17),    "is_prime 17")
+assert(not is_prime(1), "is_prime 1 false")
+assert(not is_prime(4), "is_prime 4 false")
+
+assert(fib(0) == 0,  "fib(0)")
+assert(fib(1) == 1,  "fib(1)")
+assert(fib(10) == 55, "fib(10)")
+
+assert(math_abs(-7) == 7, "math_abs")
+assert(math_floor(2.9) == 2.0, "math_floor")
+assert(math_ceil(2.1)  == 3.0, "math_ceil")
+assert(math_round(2.5) == 3.0, "math_round")
+
+rad := deg_to_rad(180.0)
+assert(rad > 3.14158 and rad < 3.14160, "deg_to_rad 180")
+deg := rad_to_deg(PI)
+assert(deg > 179.9 and deg < 180.1, "rad_to_deg PI")
+
+print("PASS: math")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- STRING stdlib
+-- ─────────────────────────────────────────────────────────────────────────────
+import "std/string.nvl"
+
+assert(str_pad_left("hi", 5, " ") == "   hi",  "str_pad_left")
+assert(str_pad_right("hi", 5, "-") == "hi---",  "str_pad_right")
+assert(str_pad_center("hi", 6, "*") == "**hi**", "str_pad_center")
+
+assert(str_count("hello world", "l") == 3,    "str_count l")
+assert(str_count("abcabc", "abc") == 2,       "str_count abc")
+assert(str_count("nope", "xyz") == 0,         "str_count 0")
+
+assert(str_replace_all("foo bar foo", "foo", "baz") == "baz bar baz", "str_replace_all")
+assert(str_replace_all("aaa", "a", "bb") == "bbbbbb",                 "str_replace_all overlap")
+
+lines := str_lines("line1\nline2\nline3")
+assert(lines.len == 3,       "str_lines count")
+assert(lines[0] == "line1",  "str_lines[0]")
+assert(lines[2] == "line3",  "str_lines[2]")
+
+words := str_words("  hello   world  ")
+assert(words.len == 2,       "str_words count")
+assert(words[0] == "hello",  "str_words[0]")
+assert(words[1] == "world",  "str_words[1]")
+
+assert(str_is_int("42"),    "str_is_int pos")
+assert(str_is_int("-7"),    "str_is_int neg")
+assert(not str_is_int("3.14"), "str_is_int float false")
+assert(not str_is_int("abc"),  "str_is_int alpha false")
+
+assert(str_reverse("hello") == "olleh", "str_reverse")
+assert(str_reverse("a")     == "a",     "str_reverse single")
+assert(str_reverse("")      == "",      "str_reverse empty")
+
+assert(str_title("hello world") == "Hello World", "str_title")
+assert(str_title("the quick brown fox") == "The Quick Brown Fox", "str_title multi")
+
+print("PASS: string")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- LIST stdlib
+-- ─────────────────────────────────────────────────────────────────────────────
+import "std/list.nvl"
+
+doubled := list_map([1, 2, 3], fn(x) => x * 2)
+assert(doubled[0] == 2 and doubled[1] == 4 and doubled[2] == 6, "list_map")
+
+evens := list_filter([1, 2, 3, 4, 5, 6], fn(x) => x % 2 == 0)
+assert(evens.len == 3 and evens[0] == 2, "list_filter")
+
+total := list_reduce([1, 2, 3, 4], fn(acc, x) => acc + x, 0)
+assert(total == 10, "list_reduce sum")
+
+assert(list_any([1, 3, 5, 4], fn(x) => x % 2 == 0), "list_any true")
+assert(not list_any([1, 3, 5], fn(x) => x % 2 == 0), "list_any false")
+assert(list_all([2, 4, 6], fn(x) => x % 2 == 0),     "list_all true")
+assert(not list_all([2, 3, 6], fn(x) => x % 2 == 0),  "list_all false")
+
+assert(list_count([1, 2, 3, 4, 5], fn(x) => x > 3) == 2, "list_count")
+
+found_item := list_find([10, 20, 30], fn(x) => x > 15)
+assert(found_item == 20, "list_find")
+assert(list_find([1, 2, 3], fn(x) => x > 99) == nil, "list_find nil")
+
+chunks := list_chunk([1, 2, 3, 4, 5], 2)
+assert(chunks.len == 3,          "list_chunk count")
+assert(chunks[0].len == 2,       "list_chunk first size")
+assert(chunks[2].len == 1,       "list_chunk last size")
+assert(chunks[0][0] == 1,        "list_chunk[0][0]")
+
+parts2 := list_partition([1, 2, 3, 4, 5, 6], fn(x) => x % 2 == 0)
+assert(parts2[0].len == 3, "list_partition yes count")
+assert(parts2[1].len == 3, "list_partition no count")
+
+rep := list_repeat(7, 4)
+assert(rep.len == 4 and rep[0] == 7 and rep[3] == 7, "list_repeat")
+
+lr := list_range(1, 6, 1)
+assert(lr.len == 5 and lr[0] == 1 and lr[4] == 5, "list_range")
+lr2 := list_range(0, 10, 3)
+assert(lr2.len == 4 and lr2[3] == 9, "list_range step 3")
+
+u := list_union([1, 2, 3], [2, 3, 4])
+assert(u.len == 4, "list_union")
+i_l := list_intersection([1, 2, 3], [2, 3, 4])
+assert(i_l.len == 2 and i_l[0] == 2, "list_intersection")
+d := list_difference([1, 2, 3, 4], [2, 4])
+assert(d.len == 2 and d[0] == 1 and d[1] == 3, "list_difference")
+
+matrix := [[1, 2, 3], [4, 5, 6]]
+t := list_transpose(matrix)
+assert(t.len == 3,       "list_transpose cols")
+assert(t[0].len == 2,    "list_transpose rows")
+assert(t[0][0] == 1,     "list_transpose[0][0]")
+assert(t[1][1] == 5,     "list_transpose[1][1]")
+assert(t[2][0] == 3,     "list_transpose[2][0]")
+
+best := list_max_by(["apple", "kiwi", "banana"], fn(s) => s.len)
+assert(best == "banana", "list_max_by")
+worst := list_min_by(["apple", "kiwi", "banana"], fn(s) => s.len)
+assert(worst == "kiwi", "list_min_by")
+
+print("PASS: list")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- JSON stdlib
+-- ─────────────────────────────────────────────────────────────────────────────
+import "std/json.nvl"
+
+-- JSON strings use {{}} to escape literal { } (Nuvola string interpolation)
+parsed := json_load("{{\"x\": 1, \"y\": 2}}")
+assert(parsed != nil,        "json_load not nil")
+assert(parsed.get("x") == 1, "json_load x")
+assert(parsed.get("y") == 2, "json_load y")
+
+bad := json_load("not valid json")
+assert(bad == nil, "json_load invalid → nil")
+
+pretty := json_pretty({"name": "Nuvola", "version": 1})
+assert(pretty.len > 5, "json_pretty non-empty")
+
+base_map := {"a": 1, "b": 2}
+over_map := {"b": 99, "c": 3}
+merged := json_merge(base_map, over_map)
+assert(merged.get("a") == 1,  "json_merge a")
+assert(merged.get("b") == 99, "json_merge override b")
+assert(merged.get("c") == 3,  "json_merge new c")
+
+nested := {"user": {"name": "tank", "score": 42}}
+assert(json_get_path(nested, "user.name")  == "tank", "json_get_path name")
+assert(json_get_path(nested, "user.score") == 42,     "json_get_path score")
+assert(json_get_path(nested, "user.missing") == nil,  "json_get_path missing")
+
+print("PASS: json")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REGEX helpers (std/regex.nvl wrappers)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+assert(re_match("[0-9]+", "abc 99 xyz"),     "re_match found")
+assert(not re_match("^[0-9]+$", "99x"),      "re_match not anchored")
+assert(re_find("[0-9]+", "abc 99 xyz") == "99", "re_find")
+assert(re_all("[0-9]+", "a1b22c333").len == 3,  "re_all count")
+assert(re_replace("[aeiou]", "hello", "*") == "h*ll*", "re_replace")
+assert(re_split(",", "a,b,c").len == 3,            "re_split")
+assert(re_count("[0-9]", "a1b2c3") == 3,           "re_count")
+assert(re_contains("[0-9]", "abc9xyz"),             "re_contains")
+assert(not re_contains("[0-9]", "abcxyz"),          "re_contains false")
+
+stripped := re_strip_html("<b>hello</b> <i>world</i>")
+assert(stripped == "hello world", "re_strip_html")
+
+nums := re_extract_numbers("price: 3.14, count: 7")
+assert(nums.len >= 2, "re_extract_numbers count")
+
+assert(re_is_email("user@example.com"),           "re_is_email valid")
+assert(not re_is_email("notanemail"),              "re_is_email invalid")
+assert(re_is_url("https://example.com"),           "re_is_url valid")
+assert(not re_is_url("ftp://example.com"),         "re_is_url ftp false")
+assert(re_is_int("42"),                            "re_is_int")
+assert(re_is_int("-7"),                            "re_is_int neg")
+assert(not re_is_int("3.14"),                      "re_is_int float false")
+assert(re_is_float("3.14"),                        "re_is_float")
+assert(re_is_float("-2.5e10"),                     "re_is_float sci")
+assert(not re_is_float("abc"),                     "re_is_float alpha false")
+
+print("PASS: regex helpers")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- OS stdlib
+-- ─────────────────────────────────────────────────────────────────────────────
+import "std/os.nvl"
+
+assert(os_basename("/foo/bar/baz.nvl") == "baz.nvl", "os_basename")
+assert(os_basename("file.txt")         == "file.txt", "os_basename no dir")
+assert(os_dirname("/foo/bar/baz.nvl")  == "/foo/bar", "os_dirname")
+assert(os_dirname("file.txt")          == ".",         "os_dirname no dir")
+assert(os_join("/tmp", "out.c")        == "/tmp/out.c", "os_join")
+assert(os_join(".", "foo.nvl")         == "foo.nvl",    "os_join dot")
+assert(os_ext("file.nvl")              == ".nvl",       "os_ext")
+assert(os_ext("noext")                 == "",            "os_ext none")
+
+cwd := os_getcwd()
+assert(cwd.len > 0, "os_getcwd non-empty")
+
+-- Write, read, check, remove a temp file
+tmp_path := "/tmp/_nuvola_ft_test.txt"
+write_file(tmp_path, "hello nuvola")
+assert(os_exists(tmp_path),   "os_exists after write")
+assert(os_is_file(tmp_path),  "os_is_file")
+assert(not os_is_dir(tmp_path), "os_is_dir false")
+assert(os_file_size(tmp_path) > 0, "os_file_size > 0")
+os_remove(tmp_path)
+assert(not os_exists(tmp_path), "os_exists after remove")
+
+-- Env
+home := os_getenv_default("HOME", "/tmp")
+assert(home.len > 0, "os_getenv_default HOME")
+
+print("PASS: os")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CLOSURES / HIGHER-ORDER FUNCTIONS
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Closure capturing outer variable
+fn make_adder(n)
+  fn(x) => x + n
+
+add5 := make_adder(5)
+add10 := make_adder(10)
+assert(add5(3)  == 8,  "closure add5")
+assert(add10(3) == 13, "closure add10")
+
+-- Closure mutating captured state via map
+fn make_counter()
+  state = {"n": 0}
+  fn()
+    state.set("n", state.get("n") + 1)
+    state.get("n")
+
+cnt := make_counter()
+assert(cnt() == 1, "counter 1")
+assert(cnt() == 2, "counter 2")
+assert(cnt() == 3, "counter 3")
+
+-- Function composition
+fn compose(f, g)
+  fn(x) => f(g(x))
+
+double := fn(x) => x * 2
+inc    := fn(x) => x + 1
+double_then_inc := compose(inc, double)
+assert(double_then_inc(4) == 9, "compose double+inc")
+
+-- Placeholder lambda (identity and field)
+nums2 := [1, 2, 3, 4, 5]
+big_nums := filter(fn(x) => x > 3, nums2)
+assert(big_nums.len == 2 and big_nums[0] == 4, "filter > 3")
+
+sq := map(fn(x) => x * x, [1, 2, 3, 4])
+assert(sq[0] == 1 and sq[3] == 16, "map square")
+
+-- Currying via HOF
+fn multiply_by(n)
+  fn(x) => x * n
+
+triple := multiply_by(3)
+assert(triple(7) == 21, "curried triple")
+
+print("PASS: closures/HOF")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- STRUCTS AND ENUMS (type declarations)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type Point
+  x: int
+  y: int
+
+type Size
+  Small
+  Medium
+  Large
+
+p := Point { x: 3, y: 4 }
+assert(p.x == 3, "struct field x")
+assert(p.y == 4, "struct field y")
+
+p2 := Point { x: p.x + 1, y: p.y + 1 }
+assert(p2.x == 4 and p2.y == 5, "struct field copy+modify")
+
+-- Struct methods via function
+type Vec3
+  x: int
+  y: int
+  z: int
+
+fn vec3_sum(v) => v.x + v.y + v.z
+
+v1 := Vec3 { x: 1, y: 2, z: 3 }
+assert(vec3_sum(v1) == 6, "struct method sum")
+
+-- String-keyed "enum" via match (pattern from medium.nvl)
+fn color_name(kind)
+  match kind
+    "red"   => "RED"
+    "green" => "GREEN"
+    "blue"  => "BLUE"
+    _       => "UNKNOWN"
+
+assert(color_name("red")   == "RED",     "color match red")
+assert(color_name("green") == "GREEN",   "color match green")
+assert(color_name("other") == "UNKNOWN", "color match fallback")
+
+print("PASS: structs/enums")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MATCH EXPRESSIONS
+-- ─────────────────────────────────────────────────────────────────────────────
+
+fn classify(n)
+  match n
+    0         => "zero"
+    1         => "one"
+    2..=5     => "small"
+    6..=99    => "medium"
+    _         => "large"
+
+assert(classify(0)   == "zero",   "match 0")
+assert(classify(1)   == "one",    "match 1")
+assert(classify(3)   == "small",  "match range 2..=5")
+assert(classify(50)  == "medium", "match range 6..=99")
+assert(classify(100) == "large",  "match wildcard")
+
+-- Match guard (using if-else since binding guards not fully supported)
+fn abs_val(n)
+  if n >= 0 => return n
+  -n
+
+assert(abs_val(5)  == 5,  "abs pos")
+assert(abs_val(-3) == 3,  "abs neg")
+assert(abs_val(0)  == 0,  "abs zero")
+
+-- Match on type (string)
+fn type_label(v)
+  t := type(v)
+  match t
+    "int"   => "integer"
+    "float" => "decimal"
+    "str"   => "text"
+    "bool"  => "boolean"
+    "nil"   => "nothing"
+    _       => "other"
+
+assert(type_label(42)    == "integer", "type match int")
+assert(type_label(3.14)  == "decimal", "type match float")
+assert(type_label("hi")  == "text",    "type match str")
+assert(type_label(true)  == "boolean", "type match bool")
+assert(type_label(nil)   == "nothing", "type match nil")
+
+print("PASS: match")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- DESTRUCTURING AND TUPLES
+-- ─────────────────────────────────────────────────────────────────────────────
+
+fn min_max(lst)
+  lo = lst[0]
+  hi = lst[0]
+  for x in lst
+    if x < lo => lo = x
+    if x > hi => hi = x
+  (lo, hi)
+
+(lo, hi) := min_max([3, 1, 4, 1, 5, 9, 2, 6])
+assert(lo == 1, "destructure min")
+assert(hi == 9, "destructure max")
+
+-- For-loop with map entries destructure
+pair_map := {"a": 1, "b": 2, "c": 3}
+pair_keys = []
+for (k, v) in pair_map.entries()
+  pair_keys.push(k)
+assert(pair_keys.len == 3, "for destructure map entries count")
+
+print("PASS: destructuring")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- STRING INTERPOLATION
+-- ─────────────────────────────────────────────────────────────────────────────
+
+name2 := "Nuvola"
+ver  := 1
+s_interp := "Hello from {name2} v{ver}!"
+assert(s_interp == "Hello from Nuvola v1!", "string interp simple")
+
+x2 := 7
+y2 := 3
+s2 := "{x2} + {y2} = {x2 + y2}"
+assert(s2 == "7 + 3 = 10", "string interp expr")
+
+-- Nested expressions
+items := [1, 2, 3]
+s3 := "count={items.len} first={items[0]}"
+assert(s3 == "count=3 first=1", "string interp method+index")
+
+print("PASS: string interpolation")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+print("ALL FEATURES PASS")

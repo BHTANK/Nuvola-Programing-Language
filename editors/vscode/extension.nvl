@@ -1,0 +1,59 @@
+-- Nuvola VSCode Extension — Language Server Protocol client
+
+@io
+module extension
+
+use std.os.path  -- join, is_absolute, exists
+use std.io       -- print
+
+-- VSCode extension API bindings
+use vscode       -- workspace, window
+use vscode.lsp   -- LanguageClient, TransportKind
+
+client = None
+
+@io
+fn activate(context: vscode.ExtensionContext)
+  -- Look for nuvola-lsp in several locations
+  candidates := [
+    -- Built from source (stage0)
+    path.join(context.extension_path, "..", "..", "stage0", "target", "release", "nuvola-lsp")
+    -- System PATH
+    "nuvola-lsp"
+  ]
+
+  server_path = None
+  for c in candidates
+    if path.is_absolute(c) and path.exists(c)
+      server_path = c
+      break
+
+  if server_path == None
+    server_path = "nuvola-lsp"
+
+  server_options := {
+    "run":   { "command": server_path, "transport": TransportKind.stdio }
+    "debug": { "command": server_path, "transport": TransportKind.stdio }
+  }
+
+  client_options := {
+    "documentSelector": [{ "scheme": "file", "language": "nuvola" }]
+    "synchronize": {
+      "fileEvents": workspace.create_file_watcher("**/*.nvl")
+    }
+  }
+
+  client = lsp.LanguageClient.new(
+    "nuvolaLsp"
+    "Nuvola Language Server"
+    server_options
+    client_options
+  )
+
+  client.start()
+
+@io
+fn deactivate()
+  match client
+    Some(c) -> c.stop()
+    None    -> ()

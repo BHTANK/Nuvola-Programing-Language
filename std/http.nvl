@@ -1,0 +1,65 @@
+-- std/http.nvl — Nuvola HTTP utilities
+-- Import with: import "std/http.nvl"
+
+-- ── JSON API client ───────────────────────────────────────────────────────
+fn http_get_json(url)
+  -- GET a URL and parse the response as JSON
+  body := http_get(url)
+  if body == nil => return nil
+  try
+    return json_parse(body)
+  catch _
+    return nil
+
+fn http_post_json(url, data)
+  -- POST JSON-encoded data and parse the response as JSON
+  body     := json_stringify(data)
+  response := http_post(url, body)
+  if response == nil => return nil
+  try
+    return json_parse(response)
+  catch _
+    return nil
+
+-- ── Response builder helpers ──────────────────────────────────────────────
+fn resp_ok(body)
+  http_response(200, body)
+
+fn resp_created(body)
+  http_response(201, body)
+
+fn resp_bad_request(msg)
+  ob := "{"
+  cb := "}"
+  http_response(400, ob + "\"error\":\"" + msg + "\"" + cb)
+
+fn resp_not_found(msg)
+  ob := "{"
+  cb := "}"
+  http_response(404, ob + "\"error\":\"" + msg + "\"" + cb)
+
+fn resp_error(msg)
+  ob := "{"
+  cb := "}"
+  http_response(500, ob + "\"error\":\"" + msg + "\"" + cb)
+
+fn resp_json(status, data)
+  http_response(status, json_stringify(data))
+
+-- ── Route dispatcher ──────────────────────────────────────────────────────
+fn route(req, routes)
+  -- routes: list of [method, path, handler_fn] triples
+  method := req.get("method")
+  path   := req.get("path")
+  for r in routes
+    if r[0] == method and r[1] == path
+      return r[2](req)
+  ob := "{"
+  cb := "}"
+  http_response(404, ob + "\"error\":\"not found\"" + cb)
+
+-- ── Start a server in the background ──────────────────────────────────────
+fn serve(port, handler)
+  -- Spawn the server in a background thread, sleep briefly to let it bind
+  spawn(http_serve, port)
+  sleep_ms(50)

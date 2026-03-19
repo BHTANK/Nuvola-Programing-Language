@@ -1,0 +1,80 @@
+-- token.nvl — Token kinds, constants, and helpers for the Nuvola self-hosted compiler
+-- Token format: each token is a map {kind, val, line, col}
+-- Token kinds: "int" "float" "str" "bool" "nil" "ident" "kw" "annot"
+--              "op" "nl" "indent" "dedent" "eof"
+
+-- ── Kind constants ────────────────────────────────────────────────────────────
+-- (Used as plain string literals throughout; listed here for documentation.)
+--
+--   KIND_INT    = "int"
+--   KIND_FLOAT  = "float"
+--   KIND_STR    = "str"
+--   KIND_BOOL   = "bool"
+--   KIND_NIL    = "nil"
+--   KIND_IDENT  = "ident"
+--   KIND_KW     = "kw"
+--   KIND_ANNOT  = "annot"
+--   KIND_OP     = "op"
+--   KIND_NL     = "nl"
+--   KIND_INDENT = "indent"
+--   KIND_DEDENT = "dedent"
+--   KIND_EOF    = "eof"
+
+-- ── Keyword list ──────────────────────────────────────────────────────────────
+
+KW_LIST := ["fn", "async", "return", "if", "elif", "else", "for", "in",
+            "while", "break", "continue", "match", "true", "false", "nil",
+            "and", "or", "not", "comptime", "extern", "unsafe", "spawn",
+            "await", "import", "as", "trait", "impl", "type", "where", "skip",
+            "try", "catch", "throw"]
+
+-- ── Operator lists ────────────────────────────────────────────────────────────
+
+TWO_CHAR_OPS := [":=", "=>", "|>", "->", "==", "!=", "<=", ">=",
+                 "**", "..", "//", "+=", "-=", "*=", "/="]
+
+THREE_CHAR_OPS := ["..=", "..."]
+
+-- ── Token constructor ─────────────────────────────────────────────────────────
+
+fn make_token(kind, val, line, col)
+  t = {}
+  t.set("kind", kind)
+  t.set("val",  val)
+  t.set("line", line)
+  t.set("col",  col)
+  t
+
+-- ── Token accessors ───────────────────────────────────────────────────────────
+
+fn token_kind(tok)
+  tok.get("kind")
+
+fn token_val(tok)
+  tok.get("val")
+
+fn token_line(tok)
+  tok.get("line")
+
+fn token_col(tok)
+  tok.get("col")
+
+-- ── Keyword predicate ─────────────────────────────────────────────────────────
+
+fn is_kw(word)
+  for k in KW_LIST
+    if k == word
+      return true
+  false
+
+-- ── Debug formatter ───────────────────────────────────────────────────────────
+
+fn tok_to_str(tok)
+  kind := tok.get("kind")
+  val  := tok.get("val")
+  ln   := tok.get("line")
+  cl   := tok.get("col")
+  loc  := str(ln) + ":" + str(cl)
+  if kind == "nl" or kind == "indent" or kind == "dedent" or kind == "eof"
+    return loc + "  " + kind
+  loc + "  " + kind + "  " + val

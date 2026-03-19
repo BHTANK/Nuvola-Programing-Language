@@ -1,0 +1,393 @@
+-- stdlib/string.nvl — String utilities for Nuvola
+-- Pure Nuvola implementations; no external calls needed.
+
+-- ── Padding ───────────────────────────────────────────────────────────────────
+
+fn str_pad_right(s, width, ch)
+  -- Pad s on the right with ch until at least width chars wide.
+  result := s
+  while result.len() < width
+    result = result + ch
+  result
+
+fn str_pad_left(s, width, ch)
+  -- Pad s on the left with ch until at least width chars wide.
+  result := s
+  while result.len() < width
+    result = ch + result
+  result
+
+fn str_pad_center(s, width, ch)
+  -- Center s within width, padding with ch on both sides.
+  total := width - s.len()
+  if total <= 0
+    return s
+  left  := total / 2
+  right := total - left
+  str_repeat(ch, left) + s + str_repeat(ch, right)
+
+-- ── Repetition ────────────────────────────────────────────────────────────────
+
+fn str_repeat(s, n)
+  -- Repeat string s exactly n times.
+  result := ""
+  i := 0
+  while i < n
+    result = result + s
+    i = i + 1
+  result
+
+-- ── Whitespace stripping ──────────────────────────────────────────────────────
+
+fn str_is_ws(c)
+  c == " " or c == "\t" or c == "\n" or c == "\r"
+
+fn str_ltrim(s)
+  -- Remove leading whitespace.
+  i := 0
+  while i < s.len() and str_is_ws(s[i])
+    i = i + 1
+  s.slice(i, s.len())
+
+fn str_rtrim(s)
+  -- Remove trailing whitespace.
+  i := s.len() - 1
+  while i >= 0 and str_is_ws(s[i])
+    i = i - 1
+  s.slice(0, i + 1)
+
+fn str_trim(s)
+  -- Remove leading and trailing whitespace.
+  str_rtrim(str_ltrim(s))
+
+-- ── Splitting and joining ─────────────────────────────────────────────────────
+
+fn str_split(s, sep)
+  -- Split s by sep. Returns list of strings.
+  -- sep must be at least 1 character.
+  parts := []
+  slen  := sep.len()
+  start := 0
+  i     := 0
+  while i <= s.len() - slen
+    match := true
+    j     := 0
+    while j < slen
+      if s[i + j] != sep[j]
+        match = false
+      j = j + 1
+    if match
+      parts.push(s.slice(start, i))
+      i     = i + slen
+      start = i
+    else
+      i = i + 1
+  parts.push(s.slice(start, s.len()))
+  parts
+
+fn str_split_lines(s)
+  -- Split on newlines, handling \r\n and \n.
+  -- Returns list of lines without newline chars.
+  lines := []
+  start := 0
+  i     := 0
+  while i < s.len()
+    c := s[i]
+    if c == "\n"
+      line := s.slice(start, i)
+      if line.len() > 0 and line[line.len() - 1] == "\r"
+        line = line.slice(0, line.len() - 1)
+      lines.push(line)
+      start = i + 1
+    i = i + 1
+  -- Last segment (may be empty if s ends with \n)
+  tail := s.slice(start, s.len())
+  if tail.len() > 0
+    lines.push(tail)
+  lines
+
+fn str_join(parts, sep)
+  -- Join list of strings with sep between each.
+  if parts.len() == 0
+    return ""
+  result := parts[0]
+  i := 1
+  while i < parts.len()
+    result = result + sep + parts[i]
+    i = i + 1
+  result
+
+-- ── Searching ─────────────────────────────────────────────────────────────────
+
+fn str_index_of(s, sub)
+  -- Return first index of sub in s, or -1 if not found.
+  slen := sub.len()
+  if slen == 0
+    return 0
+  i := 0
+  while i <= s.len() - slen
+    match := true
+    j     := 0
+    while j < slen
+      if s[i + j] != sub[j]
+        match = false
+      j = j + 1
+    if match
+      return i
+    i = i + 1
+  -1
+
+fn str_last_index_of(s, sub)
+  -- Return last index of sub in s, or -1 if not found.
+  slen := sub.len()
+  if slen == 0
+    return s.len()
+  i := s.len() - slen
+  while i >= 0
+    match := true
+    j     := 0
+    while j < slen
+      if s[i + j] != sub[j]
+        match = false
+      j = j + 1
+    if match
+      return i
+    i = i - 1
+  -1
+
+fn str_contains(s, sub)
+  str_index_of(s, sub) >= 0
+
+fn str_starts_with(s, prefix)
+  if prefix.len() > s.len()
+    return false
+  s.slice(0, prefix.len()) == prefix
+
+fn str_ends_with(s, suffix)
+  if suffix.len() > s.len()
+    return false
+  s.slice(s.len() - suffix.len(), s.len()) == suffix
+
+fn str_count(s, sub)
+  -- Count non-overlapping occurrences of sub in s.
+  slen  := sub.len()
+  count := 0
+  i     := 0
+  while i <= s.len() - slen
+    match := true
+    j     := 0
+    while j < slen
+      if s[i + j] != sub[j]
+        match = false
+      j = j + 1
+    if match
+      count = count + 1
+      i     = i + slen
+    else
+      i = i + 1
+  count
+
+-- ── Replacement ───────────────────────────────────────────────────────────────
+
+fn str_replace(s, old_sub, new_sub)
+  -- Replace first occurrence of old_sub with new_sub.
+  idx := str_index_of(s, old_sub)
+  if idx < 0
+    return s
+  s.slice(0, idx) + new_sub + s.slice(idx + old_sub.len(), s.len())
+
+fn str_replace_all(s, old_sub, new_sub)
+  -- Replace all non-overlapping occurrences of old_sub with new_sub.
+  if old_sub.len() == 0
+    return s
+  result := ""
+  i      := 0
+  slen   := old_sub.len()
+  while i <= s.len() - slen
+    match := true
+    j     := 0
+    while j < slen
+      if s[i + j] != old_sub[j]
+        match = false
+      j = j + 1
+    if match
+      result = result + new_sub
+      i      = i + slen
+    else
+      result = result + s[i]
+      i      = i + 1
+  -- Append remainder
+  while i < s.len()
+    result = result + s[i]
+    i = i + 1
+  result
+
+-- ── Case conversion ───────────────────────────────────────────────────────────
+
+fn char_to_upper(c)
+  code := char_code(c)
+  if code >= 97 and code <= 122   -- 'a'..'z'
+    return char_from(code - 32)
+  c
+
+fn char_to_lower(c)
+  code := char_code(c)
+  if code >= 65 and code <= 90    -- 'A'..'Z'
+    return char_from(code + 32)
+  c
+
+fn str_to_upper(s)
+  result := ""
+  i := 0
+  while i < s.len()
+    result = result + char_to_upper(s[i])
+    i = i + 1
+  result
+
+fn str_to_lower(s)
+  result := ""
+  i := 0
+  while i < s.len()
+    result = result + char_to_lower(s[i])
+    i = i + 1
+  result
+
+fn str_title_case(s)
+  -- Capitalise first letter of each word.
+  result    := ""
+  at_start  := true
+  i         := 0
+  while i < s.len()
+    c := s[i]
+    if str_is_ws(c)
+      result   = result + c
+      at_start = true
+    elif at_start
+      result   = result + char_to_upper(c)
+      at_start = false
+    else
+      result = result + char_to_lower(c)
+    i = i + 1
+  result
+
+-- ── Slicing ───────────────────────────────────────────────────────────────────
+
+fn str_slice(s, start, end)
+  -- Return s[start:end]. Negative indices count from end.
+  len   := s.len()
+  s_idx := start
+  e_idx := end
+  if s_idx < 0
+    s_idx = len + s_idx
+  if e_idx < 0
+    e_idx = len + e_idx
+  if s_idx < 0
+    s_idx = 0
+  if e_idx > len
+    e_idx = len
+  if s_idx >= e_idx
+    return ""
+  s.slice(s_idx, e_idx)
+
+fn str_take(s, n)
+  -- First n characters.
+  if n >= s.len()
+    return s
+  s.slice(0, n)
+
+fn str_drop(s, n)
+  -- Drop first n characters.
+  if n >= s.len()
+    return ""
+  s.slice(n, s.len())
+
+fn str_take_right(s, n)
+  -- Last n characters.
+  if n >= s.len()
+    return s
+  s.slice(s.len() - n, s.len())
+
+-- ── Char utilities ────────────────────────────────────────────────────────────
+
+fn str_chars(s)
+  -- Return list of individual character strings.
+  chars := []
+  i := 0
+  while i < s.len()
+    chars.push(s[i])
+    i = i + 1
+  chars
+
+fn str_from_chars(chars)
+  result := ""
+  i := 0
+  while i < chars.len()
+    result = result + chars[i]
+    i = i + 1
+  result
+
+fn str_reverse(s)
+  result := ""
+  i := s.len() - 1
+  while i >= 0
+    result = result + s[i]
+    i = i - 1
+  result
+
+-- ── Numeric conversions ───────────────────────────────────────────────────────
+
+fn str_to_int(s)
+  -- Parse integer from string. Returns 0 if not valid.
+  int(str_trim(s))
+
+fn str_to_float(s)
+  -- Parse float from string. Returns 0.0 if not valid.
+  float(str_trim(s))
+
+fn int_to_hex(n)
+  -- Convert non-negative integer to hex string (e.g. 255 → "ff").
+  if n == 0
+    return "0"
+  digits := "0123456789abcdef"
+  result := ""
+  v := n
+  while v > 0
+    result = digits[v % 16] + result
+    v = v / 16
+  result
+
+fn int_to_bin(n)
+  -- Convert non-negative integer to binary string.
+  if n == 0
+    return "0"
+  result := ""
+  v := n
+  while v > 0
+    result = str(v % 2) + result
+    v = v / 2
+  result
+
+-- ── Format helpers ────────────────────────────────────────────────────────────
+
+fn str_fmt_int(n, width)
+  -- Right-align integer in field of width.
+  str_pad_left(str(n), width, " ")
+
+fn str_fmt_float(f, decimals)
+  -- Format float with fixed decimal places (simple implementation).
+  -- Uses str() then truncates/pads.
+  s     := str(f)
+  dot   := str_index_of(s, ".")
+  if dot < 0
+    s   = s + "."
+    dot = s.len() - 1
+  cur_dec := s.len() - dot - 1
+  if cur_dec < decimals
+    s = s + str_repeat("0", decimals - cur_dec)
+  else
+    s = s.slice(0, dot + 1 + decimals)
+  s
+
+fn str_lines(s)
+  -- Alias for str_split_lines.
+  str_split_lines(s)

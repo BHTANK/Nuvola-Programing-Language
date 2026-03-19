@@ -1,0 +1,74 @@
+-- std/json.nvl — Nuvola JSON utilities
+-- Import with: import "std/json.nvl"
+-- Wraps built-in json_parse / json_stringify with helpers.
+
+-- ── Parse with error handling ─────────────────────────────────────────────
+fn json_load(s)
+  -- Parse JSON string; returns nil on error
+  result = nil
+  try
+    result = json_parse(s)
+  catch _
+    result = nil
+  result
+
+fn json_load_file(path)
+  -- Read a file and parse as JSON; returns nil on error
+  src := read_file(path)
+  if src == nil => return nil
+  json_load(src)
+
+fn json_dump_file(path, val)
+  -- Serialize val to JSON and write to file
+  write_file(path, json_stringify(val))
+
+-- ── Pretty-print (indented) ───────────────────────────────────────────────
+fn _json_indent(v, depth)
+  ind   := "  ".repeat(depth)
+  ind1  := "  ".repeat(depth + 1)
+  k     := type(v)
+  if k == "nil"   => return "null"
+  if k == "bool"  => return str(v)
+  if k == "int"   => return str(v)
+  if k == "float" => return str(v)
+  if k == "str"   => return json_stringify(v)
+  if k == "list"
+    if v.len == 0 => return "[]"
+    lines = []
+    for item in v
+      lines.push(ind1 + _json_indent(item, depth + 1))
+    return "[\n" + lines.join(",\n") + "\n" + ind + "]"
+  if k == "map"
+    entries := v.entries()
+    if entries.len == 0 => return "{" + "}"
+    lines = []
+    for pair in entries
+      key_s   := json_stringify(pair[0])
+      val_s   := _json_indent(pair[1], depth + 1)
+      lines.push(ind1 + key_s + ": " + val_s)
+    ob := "{"
+    cb := "}"
+    return ob + "\n" + lines.join(",\n") + "\n" + ind + cb
+  "null"
+
+fn json_pretty(v)
+  _json_indent(v, 0)
+
+-- ── Deep merge of two maps ────────────────────────────────────────────────
+fn json_merge(base, override_map)
+  -- Shallow merge: keys from override_map overwrite base
+  result = {}
+  for pair in base.entries()
+    result.set(pair[0], pair[1])
+  for pair in override_map.entries()
+    result.set(pair[0], pair[1])
+  result
+
+-- ── Get nested value by dot-path: "a.b.c" ───────────────────────────────
+fn json_get_path(obj, path)
+  parts := path.split(".")
+  cur   = obj
+  for key in parts
+    if cur == nil => return nil
+    cur = cur.get(key)
+  cur

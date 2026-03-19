@@ -1,0 +1,35 @@
+import "std/csv.nvl"
+import "std/result.nvl"
+
+fn _try_ok() => 42
+fn _try_fail()
+  throw "bad"
+  0
+
+-- exact csv section from features_test
+csv_text := "name,age,city\nAlice,30,NYC\nBob,25,LA"
+rows := csv_parse(csv_text, ",")
+maps := csv_parse_maps(csv_text, ",")
+re_enc := csv_encode(rows, ",")
+rows2 := csv_parse(re_enc, ",")
+csv_q := "a,\"b,c\",d"
+qrow := csv_parse_line(csv_q, ",")
+
+-- result section
+r1 := Ok(42)
+r2 := Err("oops")
+r3 := result_map(r1, fn(x) => x * 2)
+r4 := result_map(r2, fn(x) => x * 2)
+r5 := result_try(_try_ok)
+r6 := result_try(_try_fail)
+
+-- result_collect
+results := [Ok(1), Ok(2), Ok(3)]
+collected := result_collect(results)
+results2 := [Ok(1), Err("fail"), Ok(3)]
+collected2 := result_collect(results2)
+
+-- option section
+o1 := Some(10)
+print(str(is_some(o1)))
+print(str(option_unwrap(o1)))

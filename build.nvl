@@ -1,0 +1,143 @@
+-- build.nvl — Nuvola self-hosted build and test runner
+-- Usage:
+--   ./stage0/self/a.out run build.nvl          # run all tests
+--   ./stage0/self/a.out run build.nvl test      # same
+--   ./stage0/self/a.out run build.nvl check     # syntax-check only
+--   ./stage0/self/a.out run build.nvl bootstrap # rebuild self/a.out
+
+import "std/os.nvl"
+import "std/string.nvl"
+import "std/list.nvl"
+
+-- ── Config ─────────────────────────────────────────────────────────────────
+COMPILER := "stage0/self/a.out"
+TMP_BIN  := "/tmp/nvl_build_test"
+
+-- Core tests (must all pass)
+CORE_TESTS := [
+  "tests/simple.nvl",
+  "tests/medium.nvl",
+  "tests/hard.nvl",
+  "tests/insane.nvl",
+  "tests/nuclear.nvl",
+  "tests/advanced.nvl",
+  "tests/ai_core.nvl"
+]
+
+-- Demo tests (should compile and exit 0)
+DEMO_TESTS := [
+  "demos/tiny_gpt.nvl",
+  "demos/rnn_sequence.nvl",
+  "demos/cnn_mnist.nvl"
+]
+
+-- Stdlib integration tests
+STDLIB_TESTS := [
+  "tests/stdlib_test.nvl",
+  "tests/stdlib_import_test.nvl"
+]
+
+-- Universal standard code test (covers all language departments)
+UNIVERSAL_TESTS := [
+  "tests/universal_test.nvl"
+]
+
+-- ── Helpers ────────────────────────────────────────────────────────────────
+fn run_test(path)
+  -- Returns "PASS", "FAIL", or "ERROR: <msg>"
+  out := popen_read(COMPILER + " build " + path + " -o " + TMP_BIN + " 2>&1")
+  if not os_exists(TMP_BIN)
+    return "FAIL (compile: " + out.trim() + ")"
+  result := popen_read(TMP_BIN + " 2>&1; echo __EXIT__$?")
+  nv_shell("rm -f " + TMP_BIN)
+  -- Extract exit code
+  lines   := result.split("\n")
+  exit_line = ""
+  i = 0
+  while i < lines.len
+    if lines[i].startswith("__EXIT__")
+      exit_line = lines[i]
+    i = i + 1
+  code_str := exit_line.replace("__EXIT__", "")
+  code := int(code_str.trim())
+  if code == 0
+    return "PASS"
+  "FAIL (exit " + code_str.trim() + ")"
+
+fn run_suite(label, tests)
+  print("─── " + label + " ───")
+  passed = 0
+  failed = 0
+  for path in tests
+    result := run_test(path)
+    name   := os_basename(path)
+    pad    := str_pad_right(name, 28, " ")
+    print("  " + pad + result)
+    if result == "PASS"
+      passed = passed + 1
+    else
+      failed = failed + 1
+  print("  " + str(passed) + "/" + str(passed + failed) + " passed")
+  print("")
+  failed
+
+fn check_suite(label, tests)
+  print("─── " + label + " ───")
+  ok = 0
+  bad = 0
+  for path in tests
+    out  := popen_read(COMPILER + " check " + path + " 2>&1")
+    name := os_basename(path)
+    pad  := str_pad_right(name, 28, " ")
+    if out.contains("nuvc: ok")
+      print("  " + pad + "OK")
+      ok = ok + 1
+    else
+      print("  " + pad + "FAIL: " + out.trim())
+      bad = bad + 1
+  print("  " + str(ok) + "/" + str(ok + bad) + " ok")
+  print("")
+  bad
+
+-- ── Commands ───────────────────────────────────────────────────────────────
+argv := args()
+cmd  = "test"
+if argv.len >= 2
+  cmd = argv[1]
+
+if cmd == "bootstrap"
+  -- Rebuild self/a.out from codegen.nvl using Rust nuvc
+  print("Rebuilding stage0/self/a.out via Rust nuvc...")
+  out := popen_read("cd stage0 && cargo build --release 2>&1 | tail -3")
+  print(out.trim())
+  out2 := popen_read("stage0/target/release/nuvc stage0/self/codegen.nvl -o stage0/self/a.out 2>&1")
+  print(out2.trim())
+  if os_exists("stage0/self/a.out")
+    print("bootstrap: OK — stage0/self/a.out rebuilt")
+  else
+    print("bootstrap: FAILED")
+
+else if cmd == "check"
+  total_bad = 0
+  total_bad = total_bad + check_suite("Core tests", CORE_TESTS)
+  total_bad = total_bad + check_suite("Demo tests", DEMO_TESTS)
+  total_bad = total_bad + check_suite("Stdlib tests", STDLIB_TESTS)
+  total_bad = total_bad + check_suite("Universal tests", UNIVERSAL_TESTS)
+  if total_bad == 0
+    print("check: all OK")
+  else
+    print("check: " + str(total_bad) + " issues found")
+
+else
+  -- Default: test
+  print("Nuvola build test — " + COMPILER)
+  print("")
+  total_fail = 0
+  total_fail = total_fail + run_suite("Core tests", CORE_TESTS)
+  total_fail = total_fail + run_suite("Demo tests", DEMO_TESTS)
+  total_fail = total_fail + run_suite("Stdlib tests", STDLIB_TESTS)
+  total_fail = total_fail + run_suite("Universal tests", UNIVERSAL_TESTS)
+  if total_fail == 0
+    print("ALL TESTS PASSED")
+  else
+    print(str(total_fail) + " TESTS FAILED")

@@ -1,0 +1,399 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Nuvola",
+  "scopeName": "source.nuvola",
+  "fileTypes": ["nvl"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#annotations" },
+    { "include": "#keywords" },
+    { "include": "#storage" },
+    { "include": "#constants" },
+    { "include": "#builtins" },
+    { "include": "#function-def" },
+    { "include": "#type-def" },
+    { "include": "#function-call" },
+    { "include": "#operators" },
+    { "include": "#punctuation" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-dash.nuvola",
+          "match": "--.*$"
+        }
+      ]
+    },
+
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.triple.nuvola",
+          "begin": "\"\"\"",
+          "end": "\"\"\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.nuvola",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.nuvola",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.nuvola",
+              "match": "\\\\[ntr\\\\\"e0{}]"
+            },
+            {
+              "name": "meta.interpolation.nuvola",
+              "begin": "(?<!\\\\)\\{",
+              "end": "\\}",
+              "beginCaptures": {
+                "0": { "name": "punctuation.section.interpolation.begin.nuvola" }
+              },
+              "endCaptures": {
+                "0": { "name": "punctuation.section.interpolation.end.nuvola" }
+              },
+              "patterns": [
+                { "include": "source.nuvola" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.nuvola",
+          "match": "\\b[0-9][0-9_]*(\\.[0-9][0-9_]*)?([eE][+-]?[0-9][0-9_]*)?(f16|f32|f64|f128)?\\b",
+          "comment": "Floats with optional scientific notation and type suffix"
+        },
+        {
+          "name": "constant.numeric.float.nuvola",
+          "match": "\\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f16|f32|f64|f128)?\\b",
+          "comment": "Floats starting with dot"
+        },
+        {
+          "name": "constant.numeric.hex.nuvola",
+          "match": "\\b0[xX][0-9a-fA-F_]+\\b"
+        },
+        {
+          "name": "constant.numeric.binary.nuvola",
+          "match": "\\b0[bB][01_]+\\b"
+        },
+        {
+          "name": "constant.numeric.octal.nuvola",
+          "match": "\\b0[oO][0-7_]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.nuvola",
+          "match": "\\b[0-9][0-9_]*(u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize)?\\b"
+        }
+      ]
+    },
+
+    "annotations": {
+      "patterns": [
+        {
+          "name": "meta.annotation.nuvola",
+          "match": "@([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "0": { "name": "entity.name.decorator.nuvola" }
+          }
+        }
+      ]
+    },
+
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.flow.nuvola",
+          "match": "\\b(if|elif|else|for|while|loop|match|return|break|continue|throw|try|catch)\\b"
+        },
+        {
+          "name": "keyword.control.import.nuvola",
+          "match": "\\b(import|export|from|as)\\b"
+        },
+        {
+          "name": "keyword.operator.logical.nuvola",
+          "match": "\\b(and|or|not|is|in)\\b"
+        },
+        {
+          "name": "keyword.other.nuvola",
+          "match": "\\b(async|await|spawn|comptime|extern|unsafe|where)\\b"
+        }
+      ]
+    },
+
+    "storage": {
+      "patterns": [
+        {
+          "name": "storage.type.function.nuvola",
+          "match": "\\b(fn)\\b"
+        },
+        {
+          "name": "storage.type.nuvola",
+          "match": "\\b(type|trait|impl|class)\\b"
+        }
+      ]
+    },
+
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.true.nuvola",
+          "match": "\\b(true)\\b"
+        },
+        {
+          "name": "constant.language.boolean.false.nuvola",
+          "match": "\\b(false)\\b"
+        },
+        {
+          "name": "constant.language.null.nuvola",
+          "match": "\\b(nil|None)\\b"
+        },
+        {
+          "name": "variable.language.self.nuvola",
+          "match": "\\b(self)\\b"
+        }
+      ]
+    },
+
+    "builtins": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.nuvola",
+          "match": "\\b(print|assert|len|str|int|float|bool|type|abs|sqrt|max|min|range|sorted|reversed|sum|map|filter|push|pop|append|contains|take|drop|join|split)\\b(?=\\s*\\(|\\s*$)"
+        },
+        {
+          "name": "support.function.io.nuvola",
+          "match": "\\b(read_file|write_file|eprint|args|exit|env_get|file_exists)\\b"
+        },
+        {
+          "name": "support.function.crypto.nuvola",
+          "match": "\\b(sha256|sha256_bytes|hmac_sha256|base64_encode|base64_decode)\\b"
+        },
+        {
+          "name": "support.function.json.nuvola",
+          "match": "\\b(json_parse|json_stringify)\\b"
+        },
+        {
+          "name": "support.function.http.nuvola",
+          "match": "\\b(http_get|http_post|http_serve|http_response)\\b"
+        },
+        {
+          "name": "support.function.regex.nuvola",
+          "match": "\\b(regex_match|regex_find|regex_find_all|regex_replace|regex_split)\\b"
+        },
+        {
+          "name": "support.function.math.nuvola",
+          "match": "\\b(sin|cos|tan|exp|log|log2|log10|floor|ceil|round|pow|hypot|atan2)\\b"
+        },
+        {
+          "name": "support.function.concurrency.nuvola",
+          "match": "\\b(spawn|channel|sleep_ms|parallel_map|parallel_for|cpu_count)\\b"
+        },
+        {
+          "name": "support.function.time.nuvola",
+          "match": "\\b(time_ms)\\b"
+        },
+        {
+          "name": "support.type.result.nuvola",
+          "match": "\\b(Some|Ok|Err)\\b"
+        }
+      ]
+    },
+
+    "function-def": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "storage.type.function.nuvola" },
+            "2": { "name": "entity.name.function.nuvola" }
+          }
+        },
+        {
+          "match": "\\b(async)\\s+(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "keyword.other.nuvola" },
+            "2": { "name": "storage.type.function.nuvola" },
+            "3": { "name": "entity.name.function.nuvola" }
+          }
+        }
+      ]
+    },
+
+    "type-def": {
+      "patterns": [
+        {
+          "match": "\\b(type|trait|class)\\s+([A-Z][a-zA-Z0-9_]*)\\b",
+          "captures": {
+            "1": { "name": "storage.type.nuvola" },
+            "2": { "name": "entity.name.type.nuvola" }
+          }
+        },
+        {
+          "match": "\\b(impl)\\s+([A-Z][a-zA-Z0-9_]*)\\b",
+          "captures": {
+            "1": { "name": "storage.type.nuvola" },
+            "2": { "name": "entity.name.type.nuvola" }
+          }
+        }
+      ]
+    },
+
+    "function-call": {
+      "patterns": [
+        {
+          "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.call.nuvola" }
+          }
+        }
+      ]
+    },
+
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.pipe.nuvola",
+          "match": "\\|>"
+        },
+        {
+          "name": "keyword.operator.arrow.fat.nuvola",
+          "match": "=>"
+        },
+        {
+          "name": "keyword.operator.arrow.thin.nuvola",
+          "match": "->"
+        },
+        {
+          "name": "keyword.operator.walrus.nuvola",
+          "match": ":="
+        },
+        {
+          "name": "keyword.operator.nullcoalesce.nuvola",
+          "match": "\\?\\?"
+        },
+        {
+          "name": "keyword.operator.optionalchain.nuvola",
+          "match": "\\?\\."
+        },
+        {
+          "name": "keyword.operator.range.inclusive.nuvola",
+          "match": "\\.\\.\\.|\\.\\.\\.="
+        },
+        {
+          "name": "keyword.operator.range.nuvola",
+          "match": "\\.\\."
+        },
+        {
+          "name": "keyword.operator.comparison.nuvola",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.assignment.compound.nuvola",
+          "match": "\\+=|-=|\\*=|/="
+        },
+        {
+          "name": "keyword.operator.assignment.nuvola",
+          "match": "="
+        },
+        {
+          "name": "keyword.operator.power.nuvola",
+          "match": "\\*\\*"
+        },
+        {
+          "name": "keyword.operator.intdiv.nuvola",
+          "match": "//"
+        },
+        {
+          "name": "keyword.operator.arithmetic.nuvola",
+          "match": "[+\\-*/%]"
+        },
+        {
+          "name": "keyword.operator.bitwise.nuvola",
+          "match": "<<|>>|[&|^~]"
+        },
+        {
+          "name": "keyword.operator.logical.symbol.nuvola",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.matmul.nuvola",
+          "match": "@(?=[a-zA-Z0-9(])"
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.comma.nuvola",
+          "match": ","
+        },
+        {
+          "name": "punctuation.terminator.semicolon.nuvola",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.accessor.dot.nuvola",
+          "match": "\\."
+        },
+        {
+          "name": "punctuation.section.parens.begin.nuvola",
+          "match": "\\("
+        },
+        {
+          "name": "punctuation.section.parens.end.nuvola",
+          "match": "\\)"
+        },
+        {
+          "name": "punctuation.section.brackets.begin.nuvola",
+          "match": "\\["
+        },
+        {
+          "name": "punctuation.section.brackets.end.nuvola",
+          "match": "\\]"
+        },
+        {
+          "name": "punctuation.section.braces.begin.nuvola",
+          "match": "\\{"
+        },
+        {
+          "name": "punctuation.section.braces.end.nuvola",
+          "match": "\\}"
+        },
+        {
+          "name": "punctuation.type.annotation.nuvola",
+          "match": ":"
+        }
+      ]
+    },
+
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "entity.name.type.nuvola",
+          "match": "\\b[A-Z][a-zA-Z0-9_]*\\b",
+          "comment": "Uppercase identifiers treated as type/constructor names"
+        },
+        {
+          "name": "variable.other.nuvola",
+          "match": "\\b[a-z_][a-zA-Z0-9_]*\\b"
+        }
+      ]
+    }
+  }
+}

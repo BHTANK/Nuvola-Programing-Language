@@ -1,0 +1,18 @@
+-- Benchmark 8: Integer arithmetic throughput — 10M ops
+-- Tests: loop overhead, integer multiply/add/mod, conditionals
+
+fn intmath_run(n)
+  sum := 0
+  i := 0
+  while i < n
+    x := i * 7 + 3
+    y := x % 97
+    if y > 50
+      sum = sum + y
+    else
+      sum = sum - y
+    i = i + 1
+  sum
+
+result := intmath_run(10000000)
+print("intmath 10M ops, sum=" + str(result))

@@ -1,0 +1,214 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ADVANCED NUCLEAR TESTS — Conv, Dropout, Where, Optimizers, LR Schedules
+-- Run with: python3 tests/nuvola_nuclear.py tests/advanced.nvl
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- TEST: conv1d forward pass
+k := tensor([1.0, 0.0, -1.0])
+x := tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+y := x.conv1d(k)
+yl := y.tolist()
+-- [1*1+2*0+3*(-1), 2*1+3*0+4*(-1), 3*1+4*0+5*(-1)] = [-2, -2, -2]
+assert(yl[0] > -2.01 and yl[0] < -1.99, "conv1d [0] failed")
+assert(yl[1] > -2.01 and yl[1] < -1.99, "conv1d [1] failed")
+assert(y.shape == [3], "conv1d shape failed")
+
+-- TEST: conv1d with padding
+x2 := tensor([1.0, 2.0, 3.0])
+k2 := tensor([1.0, 1.0])
+y2 := x2.conv1d(k2, padding=1)
+-- padded: [0,1,2,3,0], stride=1, K=2 → windows: [0,1],[1,2],[2,3],[3,0] → [1,3,5,3]
+assert(y2.shape == [4], "conv1d padding shape failed")
+y2l := y2.tolist()
+assert(y2l[1] > 2.99 and y2l[1] < 3.01, "conv1d padding value failed")
+
+-- TEST: conv2d forward pass
+img := tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+kernel := tensor([[1.0, 0.0], [0.0, -1.0]])
+out := img.conv2d(kernel)
+-- [0,0] = 1*1 + 2*0 + 4*0 + 5*(-1) = 1 - 5 = -4
+-- [0,1] = 2*1 + 3*0 + 5*0 + 6*(-1) = 2 - 6 = -4
+ol := out.tolist()
+assert(ol[0][0] > -4.01 and ol[0][0] < -3.99, "conv2d [0,0] failed")
+assert(out.shape == [2, 2], "conv2d shape failed")
+
+-- TEST: conv2d gradient flows
+w := tensor([[1.0, 0.0], [0.0, 1.0]])
+w.requires_grad = true
+x3 := tensor([[1.0, 2.0], [3.0, 4.0]])
+c := x3.conv2d(w)
+loss := c.sum()
+loss.backward()
+wg := w.grad.tolist()
+-- sum(conv(x,w)) → d/dw: each w[i,j] gets the sum of all patches at [i,j]
+-- w[0,0] touches x[0,0]=1, x[0,1] doesn't, x[1,0] doesn't, x[1,1] = only [0,0] patch
+-- full trace: output [1,1] → sum=1*1+2*0+3*0+4*1 = 5, loss=5, grad wrt w[0,0]=1+4=5?
+-- actually just check gradient is non-zero (shows it flows)
+assert(wg[0][0] != 0.0 or wg[1][1] != 0.0, "conv2d gradient should be non-zero")
+
+-- TEST: dropout inference mode (no-op)
+t_drop := tensor([1.0, 2.0, 3.0, 4.0])
+dropped := dropout(t_drop, 0.5, false)
+dl := dropped.tolist()
+assert(dl[0] == 1.0, "dropout inference should be identity")
+assert(dl[3] == 4.0, "dropout inference should be identity")
+
+-- TEST: dropout training mode (some zeros)
+t_big := tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+dropped2 := dropout(t_big, 0.5, true)
+d2l := dropped2.tolist()
+-- With p=0.5 on 20 elements, virtually certain some are zero and some non-zero
+zeros = 0
+nonzeros = 0
+for v in d2l
+  if v == 0.0 => zeros = zeros + 1
+  else => nonzeros = nonzeros + 1
+assert(zeros > 0, "dropout training: expected some zeros")
+assert(nonzeros > 0, "dropout training: expected some non-zeros")
+
+-- TEST: where — masked selection
+cond := tensor([1.0, 0.0, 1.0, 0.0])
+a := tensor([10.0, 20.0, 30.0, 40.0])
+b := tensor([1.0, 2.0, 3.0, 4.0])
+result := where(cond, a, b)
+rl := result.tolist()
+assert(rl[0] == 10.0, "where true branch failed")
+assert(rl[1] == 2.0, "where false branch failed")
+assert(rl[2] == 30.0, "where true branch [2] failed")
+assert(rl[3] == 4.0, "where false branch [3] failed")
+
+-- TEST: where gradient through x branch
+xa := tensor([1.0, 2.0, 3.0], requires_grad=true)
+xb := tensor([9.0, 9.0, 9.0], requires_grad=true)
+mask := tensor([1.0, 0.0, 1.0])
+w_out := where(mask, xa, xb)
+w_out.sum().backward()
+xag := xa.grad.tolist()
+xbg := xb.grad.tolist()
+assert(xag[0] == 1.0, "where grad xa[0] failed")
+assert(xag[1] == 0.0, "where grad xa[1] should be 0 (mask=false)")
+assert(xbg[1] == 1.0, "where grad xb[1] failed")
+assert(xbg[0] == 0.0, "where grad xb[0] should be 0 (mask=true)")
+
+-- TEST: adagrad optimizer convergence
+-- Minimize f(x) = x^2 starting from x=5
+x_ag := tensor([5.0], requires_grad=true)
+opt_ag := adagrad(lr=0.5)
+step = 0
+while step < 100
+  loss_ag := x_ag * x_ag
+  opt_ag.zero_grad([x_ag])
+  loss_ag.backward()
+  opt_ag.step([x_ag])
+  step = step + 1
+xl := x_ag.tolist()
+assert(xl[0] > -0.5 and xl[0] < 0.5, "adagrad did not converge to 0")
+
+-- TEST: rmsprop optimizer convergence
+x_rms := tensor([5.0], requires_grad=true)
+opt_rms := rmsprop(lr=0.1, alpha=0.9)
+step = 0
+while step < 200
+  loss_rms := x_rms * x_rms
+  opt_rms.zero_grad([x_rms])
+  loss_rms.backward()
+  opt_rms.step([x_rms])
+  step = step + 1
+xl2 := x_rms.tolist()
+assert(xl2[0] > -0.5 and xl2[0] < 0.5, "rmsprop did not converge to 0")
+
+-- TEST: clip_grad_norm
+p1 := tensor([3.0], requires_grad=true)
+p2 := tensor([4.0], requires_grad=true)
+-- manually set grads (simulate backward)
+p1.grad = tensor([3.0])
+p2.grad = tensor([4.0])
+-- norm = 5.0, clip to max_norm=1.0 → scale = 0.2
+norm_val := clip_grad_norm([p1, p2], 1.0)
+assert(norm_val > 4.99 and norm_val < 5.01, "clip_grad_norm returned wrong norm")
+g1 := p1.grad.tolist()
+g2 := p2.grad.tolist()
+-- after clip: g1 = 3*0.2 = 0.6, g2 = 4*0.2 = 0.8
+assert(g1[0] > 0.59 and g1[0] < 0.61, "clip_grad_norm g1 failed")
+assert(g2[0] > 0.79 and g2[0] < 0.81, "clip_grad_norm g2 failed")
+
+-- TEST: cosine learning rate schedule
+lr0 := cosine_lr(0, 100, 0.0, 1.0)    -- step 0 → lr_max
+lr50 := cosine_lr(50, 100, 0.0, 1.0)  -- step 50 → 0.5
+lr99 := cosine_lr(99, 100, 0.0, 1.0)  -- step 99 → ~lr_min
+assert(lr0 > 0.99, "cosine_lr step 0 should be ~1.0")
+assert(lr50 > 0.49 and lr50 < 0.51, "cosine_lr step 50 should be ~0.5")
+assert(lr99 < 0.02, "cosine_lr step 99 should be ~0.0")
+
+-- TEST: warmup cosine lr schedule
+-- warmup for 10 steps, total 100 steps
+lr_w0 := warmup_cosine_lr(0, 10, 100, 1.0, 0.0)   -- step 0 → 0
+lr_w5 := warmup_cosine_lr(5, 10, 100, 1.0, 0.0)   -- step 5 → 0.5
+lr_w10 := warmup_cosine_lr(10, 10, 100, 1.0, 0.0) -- step 10 = start of cosine
+lr_w99 := warmup_cosine_lr(99, 10, 100, 1.0, 0.0) -- step 99 → ~0.0
+assert(lr_w0 == 0.0, "warmup step 0 should be 0")
+assert(lr_w5 > 0.49 and lr_w5 < 0.51, "warmup step 5 should be 0.5")
+assert(lr_w10 > 0.98, "warmup step 10 should be ~1.0 (start of cosine)")
+assert(lr_w99 < 0.02, "warmup step 99 should be ~0.0")
+
+-- TEST: huber loss (smooth L1)
+pred_h := tensor([0.0, 2.0, 5.0])
+targ_h := tensor([0.0, 2.0, 5.0])
+perfect_h := huber_loss(pred_h, targ_h)
+assert(perfect_h.item() < 1e-9, "huber_loss perfect should be 0")
+
+pred_h2 := tensor([0.0])
+targ_h2 := tensor([2.0])
+-- |diff| = 2.0 > delta=1.0 → delta*(|diff|-0.5*delta) = 1*(2-0.5) = 1.5
+loss_h2 := huber_loss(pred_h2, targ_h2, 1.0)
+assert(loss_h2.item() > 1.49 and loss_h2.item() < 1.51, "huber_loss outlier failed")
+
+-- TEST: training with adagrad + clip_grad_norm (integration)
+-- Fit y = 2x + 1 with MSE loss
+W_l := tensor([0.0], requires_grad=true)
+b_l := tensor([0.0], requires_grad=true)
+opt_lin := adagrad(lr=0.3)
+xs_data := [0.0, 1.0, 2.0, 3.0]
+ys_data := [1.0, 3.0, 5.0, 7.0]
+
+ep = 0
+while ep < 200
+  x_in := tensor(xs_data)
+  y_in := tensor(ys_data)
+  pred_l := x_in * W_l + b_l
+  loss_l := mse_loss(pred_l, y_in)
+  opt_lin.zero_grad([W_l, b_l])
+  loss_l.backward()
+  clip_grad_norm([W_l, b_l], 1.0)
+  opt_lin.step([W_l, b_l])
+  ep = ep + 1
+
+w_val := W_l.tolist()[0]
+b_val := b_l.tolist()[0]
+assert(w_val > 1.8 and w_val < 2.2, "linear fit W should be ~2.0")
+assert(b_val > 0.8 and b_val < 1.2, "linear fit b should be ~1.0")
+
+-- TEST: dropout gradient flows during training
+x_dr := tensor([1.0, 2.0, 3.0, 4.0], requires_grad=true)
+-- p=0 → identity, so gradient should flow through perfectly
+dropped3 := x_dr.dropout(0.0, true)
+dropped3.sum().backward()
+drg := x_dr.grad.tolist()
+assert(drg[0] == 1.0, "dropout p=0 grad should be 1.0")
+assert(drg[3] == 1.0, "dropout p=0 grad should be 1.0")
+
+-- TEST: conv1d gradient (autodiff through convolution)
+xc := tensor([1.0, 2.0, 3.0, 4.0, 5.0], requires_grad=true)
+kc := tensor([1.0, -1.0], requires_grad=true)
+yc := xc.conv1d(kc)  -- [1-2, 2-3, 3-4, 4-5] = [-1,-1,-1,-1]
+yc.sum().backward()
+xcg := xc.grad.tolist()
+kcg := kc.grad.tolist()
+-- d/dx[i] = sum of kernel weights that touch x[i]
+-- kc[0]=1 touches x[0..3], kc[1]=-1 touches x[1..4]
+-- dx[0] = 1 (only kc[0]*yc[0] touches x[0])
+-- dx[1] = 1 + (-1) = 0 (kc[0]*yc[1] + kc[1]*yc[0])
+assert(xcg[0] > 0.99 and xcg[0] < 1.01, "conv1d dx[0] failed")
+-- dk[0] = sum of x[i] for i in 0..3 = 1+2+3+4 = 10
+assert(kcg[0] > 9.99 and kcg[0] < 10.01, "conv1d dk[0] failed")

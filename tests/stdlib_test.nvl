@@ -1,0 +1,26 @@
+-- M14.4 stdlib test: string ops + file I/O
+
+-- String methods
+s := "  Hello, World!  "
+assert(s.trim() == "Hello, World!", "trim failed")
+assert(s.trim().lower() == "hello, world!", "lower failed")
+assert(s.trim().upper() == "HELLO, WORLD!", "upper failed")
+
+w := "hello world foo"
+parts := w.split(" ")
+assert(parts.len == 3, "split len failed")
+assert(parts[0] == "hello", "split[0] failed")
+assert(parts[2] == "foo", "split[2] failed")
+
+assert("hello world".contains("world"), "contains failed")
+assert("hello".starts_with("hel"), "starts_with failed")
+assert("hello".ends_with("llo"), "ends_with failed")
+assert("hello world".replace("world", "Nuvola") == "hello Nuvola", "replace failed")
+
+-- File I/O
+path := "/tmp/nuvola_stdlib_test.txt"
+file_write(path, "Nuvola file I/O works!\n")
+contents := file_read(path)
+assert(contents == "Nuvola file I/O works!\n", "file read failed")
+
+print("stdlib OK: string + file I/O")

@@ -1,0 +1,38 @@
+-- M14.5 HTTP stdlib test
+
+-- HTTP server runs in a background thread, client hits it, checks response.
+
+fn handle_request(req)
+  path   := req.get("path")
+  method := req.get("method")
+  if path == "/hello"
+    return http_response(200, "Hello from Nuvola!")
+  if path == "/echo"
+    body := req.get("body")
+    return http_response(200, body)
+  http_response(404, "Not Found")
+
+fn main()
+  -- Start server on a background thread
+  port := 17435
+  spawn(http_serve_bg, port)
+
+  -- Give the server a moment to bind
+  sleep_ms(50)
+
+  -- GET /hello
+  r1 := http_get("http://127.0.0.1:17435/hello")
+  assert(r1 == "Hello from Nuvola!", "GET /hello failed: {r1}")
+
+  -- POST /echo
+  r2 := http_post("http://127.0.0.1:17435/echo", "ping")
+  assert(r2 == "ping", "POST /echo failed: {r2}")
+
+  -- 404
+  r3 := http_get("http://127.0.0.1:17435/missing")
+  assert(r3.contains("Not Found"), "404 failed")
+
+  print("HTTP OK: GET + POST + 404")
+
+fn http_serve_bg(port)
+  http_serve(port, handle_request)

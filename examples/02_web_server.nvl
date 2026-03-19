@@ -1,0 +1,154 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 02_web_server.nvl — Full HTTP API server in ~80 lines
+-- Features: routing, middleware, JSON, database, auth, WebSockets
+-- ─────────────────────────────────────────────────────────────────────────────
+
+import http.{Server, Router, Request, Response, Middleware}
+import db.{Pool, query}
+import auth.{JWT, require_auth}
+import json
+import log
+
+-- ─── Database setup ───────────────────────────────────────────────────────────
+
+@comptime DB_SCHEMA := """
+  CREATE TABLE IF NOT EXISTS users (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    email      TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS posts (
+    id         BIGSERIAL PRIMARY KEY,
+    user_id    BIGINT REFERENCES users(id),
+    title      TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+"""
+
+pool := Pool.connect(env("DATABASE_URL"), max_connections: 20)
+
+-- ─── Types ────────────────────────────────────────────────────────────────────
+
+type User
+  id:         i64
+  name:       str
+  email:      str
+  created_at: str
+
+type Post
+  id:         i64
+  user_id:    i64
+  title:      str
+  body:       str
+
+type CreateUserRequest
+  name:  str
+  email: str
+
+type ErrorResponse
+  error:   str
+  details: str = ""
+
+-- ─── Middleware ───────────────────────────────────────────────────────────────
+
+fn logging_middleware(req: Request, next: fn(Request) -> Response) -> Response
+  start := time.now()
+  res   := next(req)
+  ms    := (time.now() - start).millis()
+  log.info("{req.method} {req.path} → {res.status} ({ms}ms)")
+  res
+
+fn cors_middleware(req: Request, next: fn(Request) -> Response) -> Response
+  res := next(req)
+  res.header("Access-Control-Allow-Origin", "*")
+     .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+     .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+-- ─── Route handlers ───────────────────────────────────────────────────────────
+
+@io
+fn get_users(req: Request) -> Response
+  users := pool |> query("SELECT * FROM users ORDER BY created_at DESC LIMIT 50") as [User]
+  Response.json(users)
+
+@io
+fn get_user(req: Request) -> Response
+  id := req.params["id"].parse_i64() catch _ => return Response.bad_request("Invalid ID")
+
+  user := pool
+    |> query("SELECT * FROM users WHERE id = $1", id) as Option(User)
+    ?? return Response.not_found("User {id} not found")
+
+  Response.json(user)
+
+@io
+fn create_user(req: Request) -> Response
+  body := req.json(CreateUserRequest) catch e =>
+    return Response.bad_request("Invalid request body: {e}")
+
+  -- Validation
+  if body.name.is_empty() => return Response.bad_request("Name is required")
+  if not body.email.is_valid_email() => return Response.bad_request("Invalid email")
+
+  user := pool
+    |> query("""
+      INSERT INTO users (name, email) VALUES ($1, $2)
+      RETURNING *
+    """, body.name, body.email) as User
+    catch DbError.UniqueViolation =>
+      return Response.conflict("Email already exists")
+
+  Response.created(user)
+
+@io
+fn get_user_posts(req: Request) -> Response
+  user_id := req.params["id"].parse_i64() catch _ => return Response.bad_request("Invalid ID")
+  posts := pool
+    |> query("SELECT * FROM posts WHERE user_id = $1 ORDER BY created_at DESC", user_id) as [Post]
+  Response.json(posts)
+
+-- WebSocket handler
+@io
+fn ws_notifications(req: Request) -> Response
+  ws := req.upgrade_websocket()
+
+  spawn =>
+    db_changes~ = pool.watch("SELECT * FROM posts ORDER BY created_at DESC LIMIT 1")
+    @on(db_changes~)
+    fn on_new_post()
+      ws.send_json({ type: "new_post", data: db_changes~ })
+
+  for msg in ws.messages()
+    match msg
+      "ping" => ws.send("pong")
+      _      => log.debug("WS message: {msg}")
+
+-- ─── Router and server ────────────────────────────────────────────────────────
+
+router := Router.new()
+  .use(logging_middleware)
+  .use(cors_middleware)
+
+  .get("/health",              => Response.json({ status: "ok", uptime: process.uptime() }))
+  .get("/users",               get_users)
+  .get("/users/:id",           get_user)
+  .post("/users",              create_user)
+  .get("/users/:id/posts",     get_user_posts)
+  .get("/ws/notifications",    ws_notifications)
+
+  -- Protected routes (require valid JWT)
+  .group("/admin", middleware: require_auth("admin"))
+    .get("/stats",  => Response.json(pool |> query("SELECT COUNT(*) FROM users") as i64))
+    .delete("/users/:id", fn(req) =>
+      id := req.params["id"].parse_i64()?
+      pool |> query("DELETE FROM users WHERE id = $1", id)
+      Response.no_content()
+    )
+
+Server.new(router)
+  .port(env("PORT", default: "8080").parse_i64())
+  .workers(cpu.count() * 2)
+  .start()
+  .await_shutdown()

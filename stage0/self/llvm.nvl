@@ -1,0 +1,762 @@
+-- llvm.nvl — LLVM IR emitter for the Nuvola self-hosted compiler
+-- Translates Nuvola AST directly to LLVM IR text, bypassing the C backend.
+-- Output is written to a .ll file; then `llc` + `clang` assemble to native binary.
+--
+-- Architecture:
+--   new_state()       → mutable code-gen state (registers, labels, globals)
+--   codegen_program() → top-level entry: emits all functions + globals
+--   codegen_fn()      → emits a single function definition
+--   codegen_stmt()    → emits statements (let, assign, if, while, return, expr)
+--   codegen_expr()    → emits expressions, returns (tmp_name, type) pair
+--   assemble_module() → writes .ll file and invokes llc+clang
+
+-- ── LLVM type system ───────────────────────────────────────────────────────────
+
+fn llvm_type(nv_type)
+  if nv_type == "int"   => return "i64"
+  if nv_type == "float" => return "double"
+  if nv_type == "bool"  => return "i1"
+  if nv_type == "str"   => return "ptr"
+  if nv_type == "nil"   => return "void"
+  -- Default: opaque pointer for maps/lists/fns
+  "ptr"
+
+fn llvm_null(nv_type)
+  if nv_type == "int"   => return "0"
+  if nv_type == "float" => return "0.0"
+  if nv_type == "bool"  => return "false"
+  "null"
+
+-- ── Codegen state ─────────────────────────────────────────────────────────────
+
+fn new_state()
+  s := {}
+  s.set("reg",     0)      -- next SSA register index
+  s.set("label",   0)      -- next basic-block label index
+  s.set("lines",   [])     -- accumulated IR lines
+  s.set("globals", [])     -- global string / const declarations
+  s.set("scope",   {})     -- var_name → alloca register
+  s.set("fn_name", "")     -- current function being compiled
+  s.set("fn_type", "void") -- return type of current function
+  s
+
+fn fresh_tmp(s)
+  n := s.get("reg")
+  s.set("reg", n + 1)
+  "%t" + str(n)
+
+fn fresh_label(s)
+  n := s.get("label")
+  s.set("label", n + 1)
+  "L" + str(n)
+
+fn emit(s, line)
+  lines := s.get("lines")
+  lines.push(line)
+  s.set("lines", lines)
+
+fn emit_global(s, line)
+  gs := s.get("globals")
+  gs.push(line)
+  s.set("globals", gs)
+
+-- ── Primitive IR emitters ──────────────────────────────────────────────────────
+
+fn emit_alloca(s, name, ty)
+  -- %name = alloca ty
+  emit(s, "  " + name + " = alloca " + ty + ", align 8")
+
+fn emit_store(s, ty, val, ptr)
+  emit(s, "  store " + ty + " " + val + ", ptr " + ptr + ", align 8")
+
+fn emit_load(s, dst, ty, ptr)
+  emit(s, "  " + dst + " = load " + ty + ", ptr " + ptr + ", align 8")
+
+fn emit_add(s, dst, ty, a, b)
+  if ty == "double"
+    emit(s, "  " + dst + " = fadd double " + a + ", " + b)
+  else
+    emit(s, "  " + dst + " = add i64 " + a + ", " + b)
+
+fn emit_sub(s, dst, ty, a, b)
+  if ty == "double"
+    emit(s, "  " + dst + " = fsub double " + a + ", " + b)
+  else
+    emit(s, "  " + dst + " = sub i64 " + a + ", " + b)
+
+fn emit_mul(s, dst, ty, a, b)
+  if ty == "double"
+    emit(s, "  " + dst + " = fmul double " + a + ", " + b)
+  else
+    emit(s, "  " + dst + " = mul i64 " + a + ", " + b)
+
+fn emit_div(s, dst, ty, a, b)
+  if ty == "double"
+    emit(s, "  " + dst + " = fdiv double " + a + ", " + b)
+  else
+    emit(s, "  " + dst + " = sdiv i64 " + a + ", " + b)
+
+fn emit_mod(s, dst, a, b)
+  emit(s, "  " + dst + " = srem i64 " + a + ", " + b)
+
+fn emit_icmp(s, dst, pred, a, b)
+  emit(s, "  " + dst + " = icmp " + pred + " i64 " + a + ", " + b)
+
+fn emit_fcmp(s, dst, pred, a, b)
+  emit(s, "  " + dst + " = fcmp " + pred + " double " + a + ", " + b)
+
+fn emit_br(s, label)
+  emit(s, "  br label %" + label)
+
+fn emit_cond_br(s, cond, t_label, f_label)
+  emit(s, "  br i1 " + cond + ", label %" + t_label + ", label %" + f_label)
+
+fn emit_ret(s, ty, val)
+  if ty == "void"
+    emit(s, "  ret void")
+  else
+    emit(s, "  ret " + ty + " " + val)
+
+fn emit_label(s, lbl)
+  emit(s, lbl + ":")
+
+fn emit_call(s, dst, ret_ty, fn_name, args_str)
+  -- args_str: "i64 %t0, double %t1" etc.
+  if ret_ty == "void"
+    emit(s, "  call void @" + fn_name + "(" + args_str + ")")
+  else
+    emit(s, "  " + dst + " = call " + ret_ty + " @" + fn_name + "(" + args_str + ")")
+
+fn emit_phi(s, dst, ty, pairs)
+  -- pairs: list of [val, label] pairs
+  parts := []
+  i := 0
+  while i < pairs.len()
+    p := pairs[i]
+    parts.push("[ " + p[0] + ", %" + p[1] + " ]")
+    i = i + 1
+  emit(s, "  " + dst + " = phi " + ty + " " + parts.join(", "))
+
+-- ── Global string constant ─────────────────────────────────────────────────────
+
+fn global_str(s, text)
+  -- Returns a ptr to a global null-terminated string constant.
+  n   := s.get("reg")
+  s.set("reg", n + 1)
+  gname := "@.str" + str(n)
+  -- Escape text for LLVM IR
+  escaped := llvm_escape_str(text)
+  len     := text.len() + 1  -- include null terminator
+  emit_global(s, gname + " = private unnamed_addr constant [" + str(len) + " x i8] c\"" + escaped + "\\00\", align 1")
+  -- Return a ptr getelementptr
+  tmp := fresh_tmp(s)
+  emit(s, "  " + tmp + " = getelementptr inbounds [" + str(len) + " x i8], ptr " + gname + ", i64 0, i64 0")
+  tmp
+
+fn llvm_escape_str(text)
+  -- Escape special characters for LLVM IR string constants
+  result := ""
+  i := 0
+  while i < text.len()
+    c := text[i]
+    if c == "\n"
+      result = result + "\\0A"
+    elif c == "\t"
+      result = result + "\\09"
+    elif c == "\\"
+      result = result + "\\\\"
+    elif c == "\""
+      result = result + "\\22"
+    else
+      result = result + c
+    i = i + 1
+  result
+
+-- ── Expression codegen ────────────────────────────────────────────────────────
+
+fn codegen_expr(s, expr)
+  -- Returns [tmp_reg, llvm_type_str]
+  kind := expr.get("kind")
+
+  if kind == "int_lit"
+    tmp := fresh_tmp(s)
+    emit(s, "  " + tmp + " = add i64 0, " + str(expr.get("val")))
+    return [tmp, "i64"]
+
+  if kind == "float_lit"
+    tmp := fresh_tmp(s)
+    emit(s, "  " + tmp + " = fadd double 0.0, " + str(expr.get("val")))
+    return [tmp, "double"]
+
+  if kind == "bool_lit"
+    tmp := fresh_tmp(s)
+    v   := "false"
+    if expr.get("val") == true
+      v = "true"
+    emit(s, "  " + tmp + " = add i1 0, " + v)
+    return [tmp, "i1"]
+
+  if kind == "str_lit"
+    ptr := global_str(s, expr.get("val"))
+    return [ptr, "ptr"]
+
+  if kind == "nil_lit"
+    return ["null", "ptr"]
+
+  if kind == "ident"
+    name := expr.get("name")
+    scope := s.get("scope")
+    if scope.has(name)
+      alloca_reg := scope.get(name)
+      tmp        := fresh_tmp(s)
+      -- Infer type from scope metadata if stored; default i64
+      ty := "i64"
+      if scope.has(name + "__ty")
+        ty = scope.get(name + "__ty")
+      emit_load(s, tmp, ty, alloca_reg)
+      return [tmp, ty]
+    -- Unknown: treat as external global ptr
+    return ["@" + name, "ptr"]
+
+  if kind == "binop"
+    op := expr.get("op")
+    lr := codegen_expr(s, expr.get("left"))
+    rr := codegen_expr(s, expr.get("right"))
+    lv := lr[0]
+    rv := rr[0]
+    lt := lr[1]
+    dst := fresh_tmp(s)
+
+    if op == "+"
+      emit_add(s, dst, lt, lv, rv)
+      return [dst, lt]
+    if op == "-"
+      emit_sub(s, dst, lt, lv, rv)
+      return [dst, lt]
+    if op == "*"
+      emit_mul(s, dst, lt, lv, rv)
+      return [dst, lt]
+    if op == "/"
+      emit_div(s, dst, lt, lv, rv)
+      return [dst, lt]
+    if op == "%"
+      emit_mod(s, dst, lv, rv)
+      return [dst, "i64"]
+
+    -- Comparisons → i1
+    if op == "=="
+      if lt == "double"
+        emit_fcmp(s, dst, "oeq", lv, rv)
+      else
+        emit_icmp(s, dst, "eq", lv, rv)
+      return [dst, "i1"]
+    if op == "!="
+      if lt == "double"
+        emit_fcmp(s, dst, "une", lv, rv)
+      else
+        emit_icmp(s, dst, "ne", lv, rv)
+      return [dst, "i1"]
+    if op == "<"
+      if lt == "double"
+        emit_fcmp(s, dst, "olt", lv, rv)
+      else
+        emit_icmp(s, dst, "slt", lv, rv)
+      return [dst, "i1"]
+    if op == "<="
+      if lt == "double"
+        emit_fcmp(s, dst, "ole", lv, rv)
+      else
+        emit_icmp(s, dst, "sle", lv, rv)
+      return [dst, "i1"]
+    if op == ">"
+      if lt == "double"
+        emit_fcmp(s, dst, "ogt", lv, rv)
+      else
+        emit_icmp(s, dst, "sgt", lv, rv)
+      return [dst, "i1"]
+    if op == ">="
+      if lt == "double"
+        emit_fcmp(s, dst, "oge", lv, rv)
+      else
+        emit_icmp(s, dst, "sge", lv, rv)
+      return [dst, "i1"]
+
+    -- Logical
+    if op == "and"
+      emit(s, "  " + dst + " = and i1 " + lv + ", " + rv)
+      return [dst, "i1"]
+    if op == "or"
+      emit(s, "  " + dst + " = or i1 " + lv + ", " + rv)
+      return [dst, "i1"]
+
+    -- String concat — call runtime __nv_str_concat
+    if op == "++" or (op == "+" and lt == "ptr")
+      emit_call(s, dst, "ptr", "__nv_str_concat", "ptr " + lv + ", ptr " + rv)
+      return [dst, "ptr"]
+
+    return ["null", "ptr"]
+
+  if kind == "unary"
+    op  := expr.get("op")
+    res := codegen_expr(s, expr.get("operand"))
+    v   := res[0]
+    ty  := res[1]
+    dst := fresh_tmp(s)
+    if op == "-"
+      if ty == "double"
+        emit(s, "  " + dst + " = fneg double " + v)
+      else
+        emit(s, "  " + dst + " = sub i64 0, " + v)
+      return [dst, ty]
+    if op == "not"
+      emit(s, "  " + dst + " = xor i1 " + v + ", true")
+      return [dst, "i1"]
+    return [v, ty]
+
+  if kind == "call"
+    fn_name  := expr.get("fn").get("name")
+    arg_list := expr.get("args")
+    arg_parts := []
+    i := 0
+    while i < arg_list.len()
+      ar := codegen_expr(s, arg_list[i])
+      arg_parts.push(ar[1] + " " + ar[0])
+      i = i + 1
+    args_str := arg_parts.join(", ")
+    dst := fresh_tmp(s)
+    -- Infer return type from known builtins
+    ret_ty := infer_call_ret(fn_name)
+    emit_call(s, dst, ret_ty, fn_name, args_str)
+    return [dst, ret_ty]
+
+  if kind == "index"
+    -- arr[idx] — call runtime __nv_list_get
+    ar  := codegen_expr(s, expr.get("obj"))
+    ir  := codegen_expr(s, expr.get("idx"))
+    dst := fresh_tmp(s)
+    emit_call(s, dst, "ptr", "__nv_list_get", "ptr " + ar[0] + ", i64 " + ir[0])
+    return [dst, "ptr"]
+
+  if kind == "field"
+    -- obj.field — call runtime __nv_map_get
+    or2 := codegen_expr(s, expr.get("obj"))
+    key_ptr := global_str(s, expr.get("field"))
+    dst := fresh_tmp(s)
+    emit_call(s, dst, "ptr", "__nv_map_get", "ptr " + or2[0] + ", ptr " + key_ptr)
+    return [dst, "ptr"]
+
+  if kind == "pipe"
+    -- left |> right  ≡  right(left)
+    lr2 := codegen_expr(s, expr.get("left"))
+    fn_name := expr.get("right").get("name")
+    dst := fresh_tmp(s)
+    ret_ty := infer_call_ret(fn_name)
+    emit_call(s, dst, ret_ty, fn_name, "ptr " + lr2[0])
+    return [dst, ret_ty]
+
+  if kind == "list_lit"
+    -- Build list via runtime
+    elems := expr.get("elems")
+    dst   := fresh_tmp(s)
+    emit_call(s, dst, "ptr", "__nv_list_new", "i64 " + str(elems.len()))
+    i := 0
+    while i < elems.len()
+      er := codegen_expr(s, elems[i])
+      emit_call(s, fresh_tmp(s), "void", "__nv_list_push", "ptr " + dst + ", " + er[1] + " " + er[0])
+      i = i + 1
+    return [dst, "ptr"]
+
+  if kind == "map_lit"
+    pairs := expr.get("pairs")
+    dst   := fresh_tmp(s)
+    emit_call(s, dst, "ptr", "__nv_map_new", "i64 " + str(pairs.len()))
+    i := 0
+    while i < pairs.len()
+      p   := pairs[i]
+      kp  := global_str(s, p[0])
+      vr  := codegen_expr(s, p[1])
+      emit_call(s, fresh_tmp(s), "void", "__nv_map_set",
+                "ptr " + dst + ", ptr " + kp + ", " + vr[1] + " " + vr[0])
+      i = i + 1
+    return [dst, "ptr"]
+
+  -- Fallback
+  ["null", "ptr"]
+
+fn infer_call_ret(fn_name)
+  if fn_name == "print"      => return "void"
+  if fn_name == "str"        => return "ptr"
+  if fn_name == "int"        => return "i64"
+  if fn_name == "float"      => return "double"
+  if fn_name == "bool"       => return "i1"
+  if fn_name == "len"        => return "i64"
+  if fn_name == "sqrt"       => return "double"
+  if fn_name == "abs"        => return "double"
+  if fn_name == "floor"      => return "i64"
+  if fn_name == "ceil"       => return "i64"
+  if fn_name == "push"       => return "void"
+  if fn_name == "pop"        => return "ptr"
+  if fn_name == "keys"       => return "ptr"
+  if fn_name == "values"     => return "ptr"
+  if fn_name == "has"        => return "i1"
+  if fn_name == "exit"       => return "void"
+  -- Unknown: assume ptr (heap value)
+  "ptr"
+
+-- ── Statement codegen ─────────────────────────────────────────────────────────
+
+fn codegen_stmt(s, stmt)
+  kind := stmt.get("kind")
+
+  if kind == "let" or kind == "var"
+    name  := stmt.get("name")
+    er    := codegen_expr(s, stmt.get("val"))
+    val   := er[0]
+    ty    := er[1]
+    alloca := "%" + name + "_slot"
+    emit_alloca(s, alloca, ty)
+    emit_store(s, ty, val, alloca)
+    scope := s.get("scope")
+    scope.set(name, alloca)
+    scope.set(name + "__ty", ty)
+    s.set("scope", scope)
+    return nil
+
+  if kind == "assign"
+    name := stmt.get("name")
+    er   := codegen_expr(s, stmt.get("val"))
+    val  := er[0]
+    ty   := er[1]
+    scope := s.get("scope")
+    if scope.has(name)
+      emit_store(s, ty, val, scope.get(name))
+    return nil
+
+  if kind == "index_assign"
+    -- arr[idx] = val — call runtime __nv_list_set
+    ar  := codegen_expr(s, stmt.get("obj"))
+    ir  := codegen_expr(s, stmt.get("idx"))
+    vr  := codegen_expr(s, stmt.get("val"))
+    emit_call(s, fresh_tmp(s), "void", "__nv_list_set",
+              "ptr " + ar[0] + ", i64 " + ir[0] + ", " + vr[1] + " " + vr[0])
+    return nil
+
+  if kind == "field_assign"
+    -- obj.field = val
+    or2  := codegen_expr(s, stmt.get("obj"))
+    vr   := codegen_expr(s, stmt.get("val"))
+    kp   := global_str(s, stmt.get("field"))
+    emit_call(s, fresh_tmp(s), "void", "__nv_map_set",
+              "ptr " + or2[0] + ", ptr " + kp + ", " + vr[1] + " " + vr[0])
+    return nil
+
+  if kind == "return"
+    if stmt.has("val") and stmt.get("val") != nil
+      er   := codegen_expr(s, stmt.get("val"))
+      emit_ret(s, er[1], er[0])
+    else
+      emit(s, "  ret void")
+    return nil
+
+  if kind == "expr_stmt"
+    codegen_expr(s, stmt.get("expr"))
+    return nil
+
+  if kind == "if"
+    cr    := codegen_expr(s, stmt.get("cond"))
+    t_lbl := fresh_label(s)
+    f_lbl := fresh_label(s)
+    e_lbl := fresh_label(s)
+    emit_cond_br(s, cr[0], t_lbl, f_lbl)
+    -- then block
+    emit_label(s, t_lbl)
+    codegen_block(s, stmt.get("then"))
+    emit_br(s, e_lbl)
+    -- else block
+    emit_label(s, f_lbl)
+    if stmt.has("else") and stmt.get("else") != nil
+      codegen_block(s, stmt.get("else"))
+    emit_br(s, e_lbl)
+    emit_label(s, e_lbl)
+    return nil
+
+  if kind == "while"
+    hdr_lbl  := fresh_label(s)
+    body_lbl := fresh_label(s)
+    exit_lbl := fresh_label(s)
+    emit_br(s, hdr_lbl)
+    emit_label(s, hdr_lbl)
+    cr := codegen_expr(s, stmt.get("cond"))
+    emit_cond_br(s, cr[0], body_lbl, exit_lbl)
+    emit_label(s, body_lbl)
+    codegen_block(s, stmt.get("body"))
+    emit_br(s, hdr_lbl)
+    emit_label(s, exit_lbl)
+    return nil
+
+  if kind == "for"
+    -- for item in iterable
+    item_name := stmt.get("item")
+    iter_r    := codegen_expr(s, stmt.get("iter"))
+    -- Get length
+    len_tmp   := fresh_tmp(s)
+    emit_call(s, len_tmp, "i64", "__nv_list_len", "ptr " + iter_r[0])
+    -- idx alloca
+    idx_slot  := "%__for_idx_" + item_name
+    emit_alloca(s, idx_slot, "i64")
+    emit_store(s, "i64", "0", idx_slot)
+    hdr_lbl  := fresh_label(s)
+    body_lbl := fresh_label(s)
+    exit_lbl := fresh_label(s)
+    emit_br(s, hdr_lbl)
+    emit_label(s, hdr_lbl)
+    idx_tmp := fresh_tmp(s)
+    emit_load(s, idx_tmp, "i64", idx_slot)
+    cond_tmp := fresh_tmp(s)
+    emit_icmp(s, cond_tmp, "slt", idx_tmp, len_tmp)
+    emit_cond_br(s, cond_tmp, body_lbl, exit_lbl)
+    emit_label(s, body_lbl)
+    -- Load item
+    item_tmp := fresh_tmp(s)
+    emit_call(s, item_tmp, "ptr", "__nv_list_get", "ptr " + iter_r[0] + ", i64 " + idx_tmp)
+    item_slot := "%" + item_name + "_slot"
+    emit_alloca(s, item_slot, "ptr")
+    emit_store(s, "ptr", item_tmp, item_slot)
+    scope := s.get("scope")
+    scope.set(item_name, item_slot)
+    scope.set(item_name + "__ty", "ptr")
+    s.set("scope", scope)
+    codegen_block(s, stmt.get("body"))
+    -- Increment idx
+    inc_tmp := fresh_tmp(s)
+    emit_add(s, inc_tmp, "i64", idx_tmp, "1")
+    emit_store(s, "i64", inc_tmp, idx_slot)
+    emit_br(s, hdr_lbl)
+    emit_label(s, exit_lbl)
+    return nil
+
+  if kind == "match"
+    -- Desugar match to chained if-else
+    val_r    := codegen_expr(s, stmt.get("val"))
+    arms     := stmt.get("arms")
+    end_lbl  := fresh_label(s)
+    codegen_match_arms(s, val_r, arms, 0, end_lbl)
+    emit_label(s, end_lbl)
+    return nil
+
+  nil
+
+fn codegen_match_arms(s, val_r, arms, i, end_lbl)
+  if i >= arms.len()
+    return nil
+  arm      := arms[i]
+  pat      := arm.get("pat")
+  body     := arm.get("body")
+  next_lbl := fresh_label(s)
+  -- Pattern matching: compare value
+  cond_tmp := pattern_cond(s, val_r, pat)
+  if cond_tmp == "true"
+    codegen_block(s, body)
+    emit_br(s, end_lbl)
+  else
+    body_lbl := fresh_label(s)
+    emit_cond_br(s, cond_tmp, body_lbl, next_lbl)
+    emit_label(s, body_lbl)
+    codegen_block(s, body)
+    emit_br(s, end_lbl)
+    emit_label(s, next_lbl)
+    codegen_match_arms(s, val_r, arms, i + 1, end_lbl)
+
+fn pattern_cond(s, val_r, pat)
+  pk := pat.get("kind")
+  if pk == "wildcard"
+    return "true"
+  if pk == "literal"
+    lit_r  := codegen_expr(s, pat.get("val"))
+    dst    := fresh_tmp(s)
+    vty    := val_r[1]
+    if vty == "double"
+      emit_fcmp(s, dst, "oeq", val_r[0], lit_r[0])
+    else
+      emit_icmp(s, dst, "eq", val_r[0], lit_r[0])
+    return dst
+  if pk == "ident"
+    -- Bind to variable
+    name      := pat.get("name")
+    item_slot := "%" + name + "_slot"
+    emit_alloca(s, item_slot, val_r[1])
+    emit_store(s, val_r[1], val_r[0], item_slot)
+    scope := s.get("scope")
+    scope.set(name, item_slot)
+    scope.set(name + "__ty", val_r[1])
+    s.set("scope", scope)
+    return "true"
+  "true"
+
+fn codegen_block(s, stmts)
+  i := 0
+  while i < stmts.len()
+    codegen_stmt(s, stmts[i])
+    i = i + 1
+
+-- ── Function codegen ──────────────────────────────────────────────────────────
+
+fn codegen_fn(s, fn_def)
+  name    := fn_def.get("name")
+  params  := fn_def.get("params")
+  body    := fn_def.get("body")
+  ret_ty  := "ptr"  -- default; improved by type inference in future passes
+  if fn_def.has("ret_type") and fn_def.get("ret_type") != nil
+    ret_ty = llvm_type(fn_def.get("ret_type"))
+
+  s.set("fn_name", name)
+  s.set("fn_type", ret_ty)
+  -- Build param string
+  param_parts := []
+  i := 0
+  while i < params.len()
+    p  := params[i]
+    pn := p.get("name")
+    pt := "ptr"
+    if p.has("type") and p.get("type") != nil
+      pt = llvm_type(p.get("type"))
+    param_parts.push(pt + " %" + pn + "_arg")
+    i = i + 1
+
+  emit(s, "")
+  emit(s, "define " + ret_ty + " @" + name + "(" + param_parts.join(", ") + ") {")
+  emit(s, "entry:")
+
+  -- Alloca + store all params so they can be reassigned
+  scope := {}
+  i = 0
+  while i < params.len()
+    p    := params[i]
+    pn   := p.get("name")
+    pt   := "ptr"
+    if p.has("type") and p.get("type") != nil
+      pt = llvm_type(p.get("type"))
+    slot := "%" + pn + "_slot"
+    emit_alloca(s, slot, pt)
+    emit_store(s, pt, "%" + pn + "_arg", slot)
+    scope.set(pn, slot)
+    scope.set(pn + "__ty", pt)
+    i = i + 1
+  s.set("scope", scope)
+
+  codegen_block(s, body)
+
+  -- Ensure function ends with a return
+  lines := s.get("lines")
+  last  := ""
+  if lines.len() > 0
+    last = lines[lines.len() - 1]
+  if not (last.starts_with("  ret") or last.starts_with("  br"))
+    if ret_ty == "void"
+      emit(s, "  ret void")
+    elif ret_ty == "i64"
+      emit(s, "  ret i64 0")
+    elif ret_ty == "double"
+      emit(s, "  ret double 0.0")
+    elif ret_ty == "i1"
+      emit(s, "  ret i1 false")
+    else
+      emit(s, "  ret ptr null")
+
+  emit(s, "}")
+
+-- ── Module assembly ───────────────────────────────────────────────────────────
+
+fn codegen_program(ast_nodes)
+  -- ast_nodes: list of top-level statements/fn defs
+  s := new_state()
+
+  -- Emit module header
+  emit(s, "; Nuvola compiled LLVM IR — generated by llvm.nvl")
+  emit(s, "target triple = \"x86_64-unknown-linux-gnu\"")
+  emit(s, "")
+  emit(s, "; External runtime declarations")
+  emit(s, "declare void @print(ptr)")
+  emit(s, "declare ptr @__nv_str_concat(ptr, ptr)")
+  emit(s, "declare ptr @__nv_str_from_int(i64)")
+  emit(s, "declare ptr @__nv_str_from_float(double)")
+  emit(s, "declare ptr @__nv_list_new(i64)")
+  emit(s, "declare void @__nv_list_push(ptr, ptr)")
+  emit(s, "declare ptr @__nv_list_get(ptr, i64)")
+  emit(s, "declare void @__nv_list_set(ptr, ptr, i64, ptr)")
+  emit(s, "declare i64 @__nv_list_len(ptr)")
+  emit(s, "declare ptr @__nv_map_new(i64)")
+  emit(s, "declare void @__nv_map_set(ptr, ptr, ptr)")
+  emit(s, "declare ptr @__nv_map_get(ptr, ptr)")
+  emit(s, "declare i1 @__nv_map_has(ptr, ptr)")
+  emit(s, "declare double @sqrt(double)")
+  emit(s, "declare double @fabs(double)")
+  emit(s, "declare double @floor(double)")
+  emit(s, "declare double @ceil(double)")
+  emit(s, "declare void @exit(i32)")
+  emit(s, "")
+
+  -- Separate fn defs from top-level stmts
+  fns   := []
+  stmts := []
+  i := 0
+  while i < ast_nodes.len()
+    node := ast_nodes[i]
+    if node.get("kind") == "fn_def"
+      fns.push(node)
+    else
+      stmts.push(node)
+    i = i + 1
+
+  -- Emit all function definitions
+  i = 0
+  while i < fns.len()
+    codegen_fn(s, fns[i])
+    i = i + 1
+
+  -- Emit main() wrapping top-level statements
+  emit(s, "")
+  emit(s, "define i32 @main() {")
+  emit(s, "entry:")
+  s.set("fn_name", "main")
+  s.set("fn_type", "i32")
+  s.set("scope", {})
+  codegen_block(s, stmts)
+  emit(s, "  ret i32 0")
+  emit(s, "}")
+
+  s
+
+fn assemble_module(s, out_path)
+  -- Combine globals + code lines into a single .ll file string
+  all_lines := []
+  gs := s.get("globals")
+  i  := 0
+  while i < gs.len()
+    all_lines.push(gs[i])
+    i = i + 1
+  if gs.len() > 0
+    all_lines.push("")
+  ls := s.get("lines")
+  i  = 0
+  while i < ls.len()
+    all_lines.push(ls[i])
+    i = i + 1
+
+  ll_text := all_lines.join("\n")
+  ll_path := out_path + ".ll"
+  nv_write_file(ll_path, ll_text)
+
+  -- Compile: llc → obj, clang → binary
+  obj_path := out_path + ".o"
+  nv_shell("llc -filetype=obj -o " + obj_path + " " + ll_path)
+  nv_shell("clang -o " + out_path + " " + obj_path + " -lnuvola_rt -lm")
+
+  out_path
+
+-- ── Convenience entry point ───────────────────────────────────────────────────
+
+fn llvm_compile(ast_nodes, out_path)
+  -- Full pipeline: AST → LLVM IR → native binary
+  s := codegen_program(ast_nodes)
+  assemble_module(s, out_path)

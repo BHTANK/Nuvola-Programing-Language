@@ -1,0 +1,2091 @@
+-- Nuvola Nuclear Evaluator — v0.1
+-- Extends nuvola_eval with:
+--   - NuvolaTensor: numpy-backed tensor with reverse-mode autodiff (micrograd-style)
+--   - NuvolaChannel: queue-backed typed channels for async communication
+--   - comptime blocks: compile-time constant evaluation + caching
+--   - trait / impl: zero-overhead trait dispatch registry
+--   - async fn / await / spawn: cooperative multitasking via threads
+--   - extern fn: FFI stubs for C/BLAS calls
+--   - unsafe blocks: raw pointer semantics (simulated)
+--   - generics: T-parameterized functions via runtime specialization
+--   - Quantization: int8/f16 tensor support
+--   - Nuclear builtins: tensor, zeros, ones, randn, eye, arange, linspace,
+--                       softmax, relu, sigmoid, tanh, gelu, layer_norm,
+--                       matmul, dot, einsum, chan, spawn_task, await_task
+
+@io module nuvola_nuclear
+
+use std.os
+use std.regex
+use std.math
+use std.cmath
+use std.time
+use std.queue
+use std.ffi
+use std.hash
+use std.thread
+use std.fs
+use std.json
+use std.net.http
+use std.process
+use std.concurrent
+use std.tensor as np
+use std.tensor.gpu as cp
+
+-- Import base interpreter
+use tests.nuvola_eval as base
+
+-- ── numpy / cupy availability ───────────────────────────────────────────────
+
+HAS_NUMPY := np.available()
+HAS_GPU   := cp.available()
+
+-- ── scipy (optional) ────────────────────────────────────────────────────────
+
+HAS_SCIPY := match np.scipy_available()
+    true  -> true
+    false -> false
+
+-- ── sympy (optional) ────────────────────────────────────────────────────────
+
+HAS_SYMPY := match np.sympy_available()
+    true  -> true
+    false -> false
+
+-- ── parallel executor ───────────────────────────────────────────────────────
+
+PAR_EXECUTOR  := concurrent.ThreadPoolExecutor(max_workers = None)
+PAR_THRESHOLD := 4096
+
+fn xp(arr: Any) -> Any
+    if HAS_GPU and arr is cp.ndarray
+        cp
+    else
+        np
+
+fn to_numpy(arr: Any) -> Any
+    if HAS_GPU and arr is cp.ndarray
+        cp.asnumpy(arr)
+    else
+        arr
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Nuclear AST nodes
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type ComptimeDecl
+    name: Str
+    expr: Any
+
+type TraitDecl
+    name:    Str
+    methods: Map(Str, Any)
+
+type ImplDecl
+    trait_name: Str
+    type_name:  Option(Str)
+    methods:    Map(Str, Any)
+
+type AsyncFnDecl
+    name:     Str
+    params:   List(Any)
+    body:     Any
+    ret_type: Option(Str) = None
+
+type Await
+    expr: Any
+
+type Spawn
+    expr: Any
+
+type ExternFn
+    name:     Str
+    params:   List(Any)
+    ret_type: Option(Str)
+    lib:      Option(Str) = None
+
+type UnsafeBlock
+    body: Any
+
+type GenericCall
+    fn:        Any
+    type_args: List(Str)
+    args:      List(Any)
+
+type TensorLit
+    data:  Any
+    dtype: Option(Str) = None
+    shape: Option(List(Int)) = None
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NuvolaTensor — numpy-backed with micrograd-style reverse-mode autodiff
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type NuvolaTensor
+    data:          Any            -- numpy array (forward value)
+    grad:          Any            -- numpy array (accumulated gradient)
+    requires_grad: Bool = false
+    label:         Str = ""
+    device:        Str = "cpu"
+    _backward:     Any = fn() => ()
+    _prev:         Set(Any) = Set()
+    _dtype_name:   Str = "f64"
+
+-- Class-level no_grad depth counter
+no_grad_depth = 0
+
+fn tensor_new(data: Any, dtype: Option(Str) = None,
+              requires_grad: Bool = false, label: Str = "",
+              device: Str = "cpu") -> NuvolaTensor
+    if not HAS_NUMPY
+        panic("NumPy required for tensors: pip install numpy")
+    raw = data
+    if raw is NuvolaTensor
+        raw = raw.data
+    if raw is Int or raw is Float
+        raw = List(raw)
+    dtype_map := Map(
+        "f64" -> np.float64, "f32" -> np.float32, "f16" -> np.float16,
+        "i64" -> np.int64,   "i32" -> np.int32,   "i16" -> np.int16,
+        "i8"  -> np.int8,    "u8"  -> np.uint8
+    )
+    np_dtype := if dtype != None then dtype_map.get(dtype, np.float64) else np.float64
+    actual_data = None
+    actual_device := device
+    if device == "cuda" and HAS_GPU
+        actual_data = cp.array(raw, dtype = np_dtype)
+        actual_device = "cuda"
+    else
+        actual_data = np.array(raw, dtype = np_dtype)
+        actual_device = "cpu"
+    NuvolaTensor(
+        data          = actual_data,
+        grad          = np.zeros_like(to_numpy(actual_data), dtype = np.float64),
+        requires_grad = requires_grad,
+        label         = label,
+        device        = actual_device,
+        _backward     = fn() => (),
+        _prev         = Set(),
+        _dtype_name   = dtype ?? "f64"
+    )
+
+-- Shape / dtype accessors
+
+fn tensor_shape(t: NuvolaTensor) -> List(Int)
+    t.data.shape().to_list()
+
+fn tensor_ndim(t: NuvolaTensor) -> Int
+    t.data.ndim()
+
+fn tensor_dtype(t: NuvolaTensor) -> Str
+    t._dtype_name
+
+fn tensor_size(t: NuvolaTensor) -> Int
+    t.data.size()
+
+-- Broadcast-aware gradient reduction
+
+fn reduce_grad(grad: Any, target_shape: List(Int)) -> Any
+    g = grad
+    while g.ndim() > target_shape.len()
+        g = g.sum(axis = 0)
+    for i in 0..target_shape.len()
+        if target_shape[i] == 1 and g.shape()[i] > 1
+            g = g.sum(axis = i, keepdims = true)
+    g
+
+-- Wrap helper for computational graph
+
+fn tensor_wrap(self_t: NuvolaTensor, data: Any, children: List(NuvolaTensor) = List(),
+               backward: Option(Any) = None) -> NuvolaTensor
+    out_data := if data is np.ndarray or (HAS_GPU and data is cp.ndarray) then data
+                else np.array(data, dtype = np.float64)
+    out := NuvolaTensor(
+        data          = out_data,
+        grad          = np.zeros_like(to_numpy(out_data), dtype = np.float64),
+        requires_grad = false,
+        label         = "",
+        device        = if HAS_GPU and out_data is cp.ndarray then "cuda" else "cpu",
+        _backward     = fn() => (),
+        _prev         = Set(),
+        _dtype_name   = self_t._dtype_name
+    )
+    if no_grad_depth > 0
+        out.requires_grad = false
+        out._prev = Set()
+    else
+        out.requires_grad = self_t.requires_grad or children.any(fn(c) => c.requires_grad)
+        out._prev = children.to_set()
+        if backward != None
+            out._backward = backward
+    out
+
+-- Arithmetic ops (build computational graph)
+
+fn tensor_add(self_t: NuvolaTensor, other: Any) -> NuvolaTensor
+    other_t := if other is NuvolaTensor then other else tensor_new(other)
+    out_data := self_t.data + other_t.data
+    ss := self_t.data.shape()
+    os := other_t.data.shape()
+    out := tensor_wrap(self_t, out_data, List(self_t, other_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += reduce_grad(out.grad, ss)
+        if other_t.requires_grad
+            other_t.grad += reduce_grad(out.grad, os)
+    out
+
+fn tensor_mul(self_t: NuvolaTensor, other: Any) -> NuvolaTensor
+    other_t := if other is NuvolaTensor then other else tensor_new(other)
+    out_data := self_t.data * other_t.data
+    ss := self_t.data.shape()
+    os := other_t.data.shape()
+    sd := self_t.data
+    od := other_t.data
+    out := tensor_wrap(self_t, out_data, List(self_t, other_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += reduce_grad(od * out.grad, ss)
+        if other_t.requires_grad
+            other_t.grad += reduce_grad(sd * out.grad, os)
+    out
+
+fn tensor_sub(self_t: NuvolaTensor, other: Any) -> NuvolaTensor
+    other_t := if other is NuvolaTensor then other else tensor_new(other)
+    out_data := self_t.data - other_t.data
+    ss := self_t.data.shape()
+    os := other_t.data.shape()
+    out := tensor_wrap(self_t, out_data, List(self_t, other_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += reduce_grad(out.grad, ss)
+        if other_t.requires_grad
+            other_t.grad -= reduce_grad(out.grad, os)
+    out
+
+fn tensor_div(self_t: NuvolaTensor, other: Any) -> NuvolaTensor
+    other_t := if other is NuvolaTensor then other else tensor_new(other)
+    out_data := self_t.data / other_t.data
+    ss := self_t.data.shape()
+    os := other_t.data.shape()
+    sd := self_t.data
+    od := other_t.data
+    out := tensor_wrap(self_t, out_data, List(self_t, other_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += reduce_grad(out.grad / od, ss)
+        if other_t.requires_grad
+            other_t.grad -= reduce_grad(out.grad * sd / (od ** 2), os)
+    out
+
+fn tensor_neg(self_t: NuvolaTensor) -> NuvolaTensor
+    tensor_mul(self_t, -1)
+
+fn tensor_pow(self_t: NuvolaTensor, exp: Any) -> NuvolaTensor
+    out_data := self_t.data ** exp
+    out := tensor_wrap(self_t, out_data, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += exp * (self_t.data ** (exp - 1)) * out.grad
+    out
+
+fn tensor_matmul(self_t: NuvolaTensor, other: Any) -> NuvolaTensor
+    other_t := if other is NuvolaTensor then other else tensor_new(other)
+    out_data := self_t.data @ other_t.data
+    sd_np := to_numpy(self_t.data)
+    od_np := to_numpy(other_t.data)
+    out := tensor_wrap(self_t, out_data, List(self_t, other_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            if sd_np.ndim() == 1
+                self_t.grad += od_np @ out.grad
+            else
+                self_t.grad += out.grad @ od_np.T()
+        if other_t.requires_grad
+            if sd_np.ndim() == 1
+                other_t.grad += np.outer(sd_np, out.grad)
+            else
+                other_t.grad += sd_np.T() @ out.grad
+    out
+
+-- Activation functions
+
+fn tensor_relu(self_t: NuvolaTensor) -> NuvolaTensor
+    xp_mod := xp(self_t.data)
+    out_data := xp_mod.maximum(0, self_t.data)
+    mask_np := to_numpy(self_t.data > 0)
+    out := tensor_wrap(self_t, out_data, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += mask_np * out.grad
+    out
+
+fn tensor_sigmoid(self_t: NuvolaTensor) -> NuvolaTensor
+    xp_mod := xp(self_t.data)
+    s_gpu := 1.0 / (1.0 + xp_mod.exp(-self_t.data.as_float64()))
+    s_np := to_numpy(s_gpu)
+    out := tensor_wrap(self_t, s_gpu, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += s_np * (1 - s_np) * out.grad
+    out
+
+fn tensor_tanh(self_t: NuvolaTensor) -> NuvolaTensor
+    xp_mod := xp(self_t.data)
+    t_gpu := xp_mod.tanh(self_t.data.as_float64())
+    t_np := to_numpy(t_gpu)
+    out := tensor_wrap(self_t, t_gpu, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += (1 - t_np ** 2) * out.grad
+    out
+
+fn tensor_gelu(self_t: NuvolaTensor) -> NuvolaTensor
+    x := to_numpy(self_t.data).as_float64()
+    cdf := 0.5 * (1.0 + np.tanh(0.7978845608 * (x + 0.044715 * x ** 3)))
+    out := tensor_wrap(self_t, x * cdf, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            pdf := np.exp(-0.5 * x ** 2) / math.sqrt(2.0 * math.PI)
+            self_t.grad += (cdf + x * pdf) * out.grad
+    out
+
+fn tensor_softmax(self_t: NuvolaTensor, axis: Int = -1) -> NuvolaTensor
+    xp_mod := xp(self_t.data)
+    x := self_t.data.as_float64()
+    e := xp_mod.exp(x - x.max(axis = axis, keepdims = true))
+    s_gpu := e / e.sum(axis = axis, keepdims = true)
+    s_np := to_numpy(s_gpu)
+    out := tensor_wrap(self_t, s_gpu, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            dot := (out.grad * s_np).sum(axis = axis, keepdims = true)
+            self_t.grad += s_np * (out.grad - dot)
+    out
+
+fn tensor_log(self_t: NuvolaTensor) -> NuvolaTensor
+    xp_mod := xp(self_t.data)
+    d := self_t.data.as_float64()
+    out_data := xp_mod.log(d + 1e-12)
+    d_np := to_numpy(d)
+    out := tensor_wrap(self_t, out_data, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += out.grad / (d_np + 1e-12)
+    out
+
+fn tensor_exp(self_t: NuvolaTensor) -> NuvolaTensor
+    xp_mod := xp(self_t.data)
+    e_gpu := xp_mod.exp(self_t.data.as_float64())
+    e_np := to_numpy(e_gpu)
+    out := tensor_wrap(self_t, e_gpu, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += e_np * out.grad
+    out
+
+fn tensor_sqrt(self_t: NuvolaTensor) -> NuvolaTensor
+    xp_mod := xp(self_t.data)
+    s_gpu := xp_mod.sqrt(xp_mod.abs(self_t.data.as_float64()) + 1e-12)
+    s_np := to_numpy(s_gpu)
+    out := tensor_wrap(self_t, s_gpu, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += 0.5 / s_np * out.grad
+    out
+
+-- Reductions
+
+fn tensor_sum(self_t: NuvolaTensor, axis: Option(Int) = None) -> NuvolaTensor
+    out_data := self_t.data.sum(axis = axis)
+    orig_shape := self_t.data.shape()
+    out := tensor_wrap(self_t, out_data, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            g := if axis == None then out.grad else np.expand_dims(out.grad, axis)
+            self_t.grad += np.ones(orig_shape, dtype = np.float64) * g
+    out
+
+fn tensor_mean(self_t: NuvolaTensor, axis: Option(Int) = None) -> NuvolaTensor
+    n := if axis == None then self_t.data.size() else self_t.data.shape()[axis]
+    tensor_mul(tensor_sum(self_t, axis), 1.0 / n)
+
+fn tensor_max(self_t: NuvolaTensor, axis: Option(Int) = None) -> NuvolaTensor
+    out_data := self_t.data.max(axis = axis)
+    d_np := to_numpy(self_t.data)
+    out := tensor_wrap(self_t, out_data, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            mask := (d_np == d_np.max(axis = axis, keepdims = true)).as_float64()
+            self_t.grad += mask * (if axis == None then out.grad else np.expand_dims(out.grad, axis))
+    out
+
+fn tensor_min(self_t: NuvolaTensor, axis: Option(Int) = None) -> NuvolaTensor
+    tensor_neg(tensor_max(tensor_neg(self_t), axis))
+
+-- Dropout
+
+fn tensor_dropout(self_t: NuvolaTensor, p: Float = 0.5, training: Bool = true) -> NuvolaTensor
+    if not training or p == 0.0
+        return self_t
+    mask_np := (np.random.rand(self_t.data.shape()) > p).as_float64() / (1.0 - p)
+    xp_mod := xp(self_t.data)
+    mask_xp := if HAS_GPU and xp_mod == cp then xp_mod.array(mask_np) else mask_np
+    out := tensor_wrap(self_t, self_t.data * mask_xp, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += mask_np * out.grad
+    out
+
+-- Convolution (1d and 2d)
+
+fn tensor_conv1d(self_t: NuvolaTensor, kernel: Any, stride: Int = 1, padding: Int = 0) -> NuvolaTensor
+    x := to_numpy(self_t.data).as_float64()
+    k := to_numpy(if kernel is NuvolaTensor then kernel.data else np.array(kernel)).as_float64()
+    if padding > 0
+        x = np.pad(x, padding)
+    L := x.len()
+    K := k.len()
+    L_out := (L - K) // stride + 1
+    out_data := np.array(List.range(L_out).map(fn(i) => np.dot(x.slice(i * stride, i * stride + K), k)))
+    parents := if kernel is NuvolaTensor then List(self_t, kernel) else List(self_t)
+    x_orig := x.copy()
+    out := tensor_wrap(self_t, out_data, parents)
+    out._backward = fn()
+        if self_t.requires_grad
+            dx := np.zeros_like(x_orig)
+            for i in 0..L_out
+                dx.slice(i * stride, i * stride + K) += k * out.grad[i]
+            if padding > 0
+                dx = dx.slice(padding, -padding)
+            self_t.grad += dx
+        if kernel is NuvolaTensor and kernel.requires_grad
+            dk := np.zeros_like(k)
+            for i in 0..L_out
+                dk += x_orig.slice(i * stride, i * stride + K) * out.grad[i]
+            kernel.grad += dk
+    out
+
+fn tensor_conv2d(self_t: NuvolaTensor, kernel: Any, stride: Int = 1,
+                 padding: Int = 0, bias: Option(Any) = None) -> NuvolaTensor
+    x := to_numpy(self_t.data).as_float64()
+    k := to_numpy(if kernel is NuvolaTensor then kernel.data else np.array(kernel)).as_float64()
+    if padding > 0
+        x = np.pad(x, List(List(padding, padding), List(padding, padding)))
+    H := x.shape()[-2]
+    W := x.shape()[-1]
+    KH := k.shape()[-2]
+    KW := k.shape()[-1]
+    H_out := (H - KH) // stride + 1
+    W_out := (W - KW) // stride + 1
+    -- Vectorized im2col
+    patches := np.as_strided(x, shape = List(H_out, W_out, KH, KW),
+                              strides = List(x.strides()[0] * stride, x.strides()[1] * stride,
+                                             x.strides()[0], x.strides()[1]))
+    out_data := (patches.reshape(H_out * W_out, KH * KW) @ k.ravel()).reshape(H_out, W_out)
+    if bias != None
+        b := if bias is NuvolaTensor then bias.item() else bias.to_float()
+        out_data += b
+    parents := List(self_t, kernel, bias).filter(fn(p) => p is NuvolaTensor)
+    x_pad := x.copy()
+    out := tensor_wrap(self_t, out_data, parents)
+    out._backward = fn()
+        if self_t.requires_grad
+            dx_pad := np.zeros_like(x_pad)
+            for i in 0..H_out
+                for j in 0..W_out
+                    dx_pad.slice_2d(i * stride, i * stride + KH, j * stride, j * stride + KW) += k * out.grad[i][j]
+            dx_full := if padding == 0 then dx_pad else dx_pad.slice_2d(padding, -padding, padding, -padding)
+            self_t.grad += dx_full
+        if kernel is NuvolaTensor and kernel.requires_grad
+            dk := np.zeros_like(k)
+            for i in 0..H_out
+                for j in 0..W_out
+                    dk += x_pad.slice_2d(i * stride, i * stride + KH, j * stride, j * stride + KW) * out.grad[i][j]
+            kernel.grad += dk
+        if bias is NuvolaTensor and bias.requires_grad
+            bias.grad += np.array(List(out.grad.sum()))
+    out
+
+-- Shape ops
+
+fn tensor_reshape(self_t: NuvolaTensor, shape: List(Int)) -> NuvolaTensor
+    out := tensor_wrap(self_t, self_t.data.reshape(shape), List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += out.grad.reshape(self_t.data.shape())
+    out
+
+fn tensor_transpose(self_t: NuvolaTensor, axes: Option(List(Int)) = None) -> NuvolaTensor
+    out := tensor_wrap(self_t, self_t.data.transpose(axes), List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            inv := if axes == None then None else np.argsort(axes)
+            self_t.grad += out.grad.transpose(inv)
+    out
+
+fn tensor_T(self_t: NuvolaTensor) -> NuvolaTensor
+    tensor_transpose(self_t)
+
+fn tensor_flatten(self_t: NuvolaTensor) -> NuvolaTensor
+    tensor_reshape(self_t, List(-1))
+
+fn tensor_unsqueeze(self_t: NuvolaTensor, axis: Int) -> NuvolaTensor
+    tensor_reshape(self_t, np.expand_dims(self_t.data, axis).shape())
+
+fn tensor_squeeze(self_t: NuvolaTensor, axis: Option(Int) = None) -> NuvolaTensor
+    sq := if axis != None then np.squeeze(self_t.data, axis = axis) else np.squeeze(self_t.data)
+    orig_shape := self_t.data.shape()
+    out := tensor_wrap(self_t, sq, List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            self_t.grad += out.grad.reshape(orig_shape)
+    out
+
+fn tensor_where(cond: Any, x: Any, y: Any) -> NuvolaTensor
+    cx := to_numpy(if cond is NuvolaTensor then cond.data else np.array(cond)).as_bool()
+    xd := if x is NuvolaTensor then x.data else np.array(x, dtype = np.float64)
+    yd := if y is NuvolaTensor then y.data else np.array(y, dtype = np.float64)
+    out_data := np.where(cx, to_numpy(xd), to_numpy(yd)).as_float64()
+    parents := List(x, y).filter(fn(p) => p is NuvolaTensor)
+    ref := if x is NuvolaTensor then x else y
+    out := tensor_wrap(ref, out_data, parents)
+    out._backward = fn()
+        if x is NuvolaTensor and x.requires_grad
+            x.grad += np.where(cx, out.grad, 0.0)
+        if y is NuvolaTensor and y.requires_grad
+            y.grad += np.where(cx, 0.0, out.grad)
+    out
+
+-- Indexing
+
+fn tensor_getitem(self_t: NuvolaTensor, idx: Any) -> NuvolaTensor
+    out := tensor_wrap(self_t, self_t.data[idx], List(self_t))
+    out._backward = fn()
+        if self_t.requires_grad
+            np.add_at(self_t.grad, idx, out.grad)
+    out
+
+-- Quantization
+
+fn tensor_quantize_int8(self_t: NuvolaTensor) -> Tuple(NuvolaTensor, Float)
+    scale := np.abs(self_t.data).max() / 127.0 + 1e-12
+    q := np.clip(np.round(self_t.data / scale), -128, 127).as_int8()
+    (tensor_new(q, dtype = "i8"), scale.to_float())
+
+fn tensor_dequantize(self_t: NuvolaTensor, scale: Float, target_dtype: Str = "f32") -> NuvolaTensor
+    dtype_map := Map("f32" -> np.float32, "f64" -> np.float64)
+    dt := dtype_map.get(target_dtype, np.float32)
+    tensor_new(self_t.data.as_dtype(dt) * scale, dtype = target_dtype)
+
+fn tensor_to_f16(t: NuvolaTensor) -> NuvolaTensor
+    tensor_new(to_numpy(t.data).as_float16(), dtype = "f16")
+fn tensor_to_f32(t: NuvolaTensor) -> NuvolaTensor
+    tensor_new(to_numpy(t.data).as_float32(), dtype = "f32")
+fn tensor_to_f64(t: NuvolaTensor) -> NuvolaTensor
+    tensor_new(to_numpy(t.data).as_float64(), dtype = "f64")
+fn tensor_to_i8(t: NuvolaTensor) -> NuvolaTensor
+    tensor_new(to_numpy(t.data).as_int8(), dtype = "i8")
+fn tensor_to_i32(t: NuvolaTensor) -> NuvolaTensor
+    tensor_new(to_numpy(t.data).as_int32(), dtype = "i32")
+
+fn tensor_cuda(self_t: NuvolaTensor) -> NuvolaTensor
+    if not HAS_GPU
+        return self_t
+    NuvolaTensor(
+        data          = cp.array(self_t.data),
+        grad          = np.zeros_like(to_numpy(self_t.data), dtype = np.float64),
+        requires_grad = self_t.requires_grad,
+        label         = self_t.label,
+        device        = "cuda",
+        _backward     = fn() => (),
+        _prev         = Set(),
+        _dtype_name   = self_t._dtype_name
+    )
+
+fn tensor_cpu(self_t: NuvolaTensor) -> NuvolaTensor
+    if self_t.device == "cpu"
+        return self_t
+    tensor_new(to_numpy(self_t.data), dtype = self_t._dtype_name,
+               requires_grad = self_t.requires_grad, label = self_t.label)
+
+-- Autodiff
+
+fn tensor_backward(self_t: NuvolaTensor, grad: Option(Any) = None)
+    if grad != None
+        self_t.grad = if grad is np.ndarray then grad else np.array(grad, dtype = np.float64)
+    else
+        self_t.grad = np.ones_like(self_t.data, dtype = np.float64)
+    -- Topological sort
+    topo = List()
+    visited = Set()
+    fn build(v: NuvolaTensor)
+        vid := id(v)
+        if vid not in visited
+            visited.add(vid)
+            for child in v._prev
+                build(child)
+            topo.push(v)
+    build(self_t)
+    for v in topo.reverse()
+        v._backward()
+
+fn tensor_zero_grad(self_t: NuvolaTensor)
+    self_t.grad = np.zeros_like(self_t.data, dtype = np.float64)
+
+fn tensor_item(self_t: NuvolaTensor) -> Float
+    to_numpy(self_t.data).flat()[0].to_float()
+
+fn tensor_tolist(self_t: NuvolaTensor) -> List
+    to_numpy(self_t.data).tolist()
+
+fn tensor_numpy(self_t: NuvolaTensor) -> Any
+    to_numpy(self_t.data).copy()
+
+fn tensor_repr(self_t: NuvolaTensor) -> Str
+    s := self_t.data.shape().to_list()
+    "Tensor(shape={s}, dtype={self_t._dtype_name})"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NuvolaChannel — queue-backed typed channel
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type NuvolaChannel
+    _q:     Any
+    dtype:  Option(Str) = None
+    closed: Bool = false
+
+fn channel_new(capacity: Int = 0, dtype: Option(Str) = None) -> NuvolaChannel
+    NuvolaChannel(_q = queue.Queue(maxsize = capacity), dtype = dtype, closed = false)
+
+@io fn channel_send(ch: NuvolaChannel, value: Any) -> Any
+    if ch.closed
+        panic("send on closed channel")
+    ch._q.put(value)
+    value
+
+@io fn channel_recv(ch: NuvolaChannel, timeout: Option(Float) = None) -> Any
+    -- queue.get panics on empty/timeout, so catch it
+    match catch(fn() => ch._q.get(timeout = timeout))
+        Ok(val) -> val
+        Err(_)  -> base.NuvolaOption(value = None, is_some = false)
+
+@io fn channel_try_recv(ch: NuvolaChannel) -> base.NuvolaOption
+    -- queue.get_nowait panics on empty, so catch it
+    match catch(fn() => ch._q.get_nowait())
+        Ok(val) -> base.NuvolaOption(value = val, is_some = true)
+        Err(_)  -> base.NuvolaOption(value = None, is_some = false)
+
+fn channel_close(ch: NuvolaChannel)
+    ch.closed = true
+
+fn channel_repr(ch: NuvolaChannel) -> Str
+    "Channel(cap={ch._q.maxsize}, dtype={ch.dtype})"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NuvolaFuture — result of spawn
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type NuvolaFuture
+    _thread:    Any
+    _box:       List(Any)
+
+@io fn future_await(f: NuvolaFuture, timeout: Option(Float) = None) -> Any
+    f._thread.join(timeout)
+    if f._box.len() >= 2 and f._box[1] != None
+        panic(f._box[1].to_str())
+    if f._box.len() > 0 then f._box[0] else None
+
+fn future_is_done(f: NuvolaFuture) -> Bool
+    not f._thread.is_alive()
+
+fn future_repr(f: NuvolaFuture) -> Str
+    "Future(done={future_is_done(f)})"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NuvolaServer — built-in HTTP AI server
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type NuvolaServer
+    _port:   Int
+    _routes: Map(Str, Any)
+    _ev:     Any
+    _srv:    Option(Any) = None
+    _thread: Option(Any) = None
+
+@io fn server_make_response(srv: NuvolaServer, value: Any) -> Str
+    v = value
+    if v is NuvolaTensor
+        v = tensor_tolist(v)
+    elif v is base.NuvolaStruct
+        fields = Map()
+        for (k, fv) in v.fields.entries()
+            fields[k] = if fv is NuvolaTensor then tensor_tolist(fv) else fv
+        v = fields
+    json.encode(v)
+
+@io fn server_start(srv: NuvolaServer) -> NuvolaServer
+    srv._srv = http.create_server("0.0.0.0", srv._port, fn(req)
+        path := req.path
+        handler := srv._routes.get(path)
+        if handler == None
+            return http.response(404, "No route: {path}")
+        body := req.json_body()
+        request := Map("method" -> req.method, "path" -> path,
+                       "body" -> body, "query" -> req.query_params())
+        result := base.call_fn(srv._ev, handler, List(request))
+        http.json_response(200, server_make_response(srv, result))
+    )
+    srv._thread = thread.spawn(fn() => srv._srv.serve_forever())
+    print("  NuvolaServer listening on http://0.0.0.0:{srv._port}")
+    srv
+
+@io fn server_stop(srv: NuvolaServer) -> NuvolaServer
+    if srv._srv != None
+        srv._srv.shutdown()
+        srv._srv = None
+    srv
+
+fn server_repr(srv: NuvolaServer) -> Str
+    state := if srv._thread != None and srv._thread.is_alive() then "running" else "stopped"
+    "NuvolaServer(port={srv._port}, routes={srv._routes.keys()}, state={state})"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Nuclear keywords and parser extensions
+-- ─────────────────────────────────────────────────────────────────────────────
+
+NUCLEAR_KEYWORDS := base.KEYWORDS.union(Set(
+    "comptime", "async", "await", "spawn", "extern", "unsafe",
+    "trait", "impl"
+))
+
+fn nuclear_tokenize(src: Str) -> List(Tuple(Str, Str, Int, Int))
+    tokens := base.tokenize(src)
+    DEMOTE_TO_IDENT := Set("where")
+    result = List()
+    for tok in tokens
+        if tok[0] == "KW" and tok[1] in DEMOTE_TO_IDENT
+            result.push(("IDENT", tok[1], tok[2], if tok.len() > 3 then tok[3] else 0))
+        elif tok[0] == "IDENT" and tok[1] in NUCLEAR_KEYWORDS
+            result.push(("KW", tok[1], tok[2], if tok.len() > 3 then tok[3] else 0))
+        else
+            result.push(tok)
+    result
+
+-- NuclearParser extends Parser with nuclear syntax
+
+type NuclearParser
+    tokens: List(Tuple(Str, Str, Int, Int))
+    pos:    Int = 0
+
+fn nuclear_parser_new(tokens: List(Tuple(Str, Str, Int, Int))) -> NuclearParser
+    NuclearParser(tokens = tokens, pos = 0)
+
+-- Parse params allowing 'self' keyword
+fn nuclear_parse_params(p: NuclearParser) -> List(Any)
+    params = List()
+    while base.peek(p)[1] != ")"
+        if base.peek(p)[0] == "OP" and base.peek(p)[1] == "..."
+            p.pos += 1
+        pname = None
+        if base.peek(p)[0] == "KW" and base.peek(p)[1] == "self"
+            pname = "self"
+            p.pos += 1
+        else
+            t := base.eat(p, "IDENT")
+            pname = t[1]
+        ptype = None
+        pdefault = None
+        if base.peek(p)[0] == "OP" and base.peek(p)[1] == ":"
+            p.pos += 1
+            ptype = base.parse_type_expr(p)
+            if base.peek(p)[1] == "where"
+                p.pos += 1
+                while base.peek(p)[1] not in List(",", ")")
+                    p.pos += 1
+        if base.peek(p)[0] == "OP" and base.peek(p)[1] == "="
+            p.pos += 1
+            pdefault = base.parse_expr(p)
+        params.push((pname, ptype, pdefault))
+        if not base.eat_if(p, "OP", ",")
+            break
+    params
+
+-- Parse call args with keyword support
+fn parse_call_args(p: NuclearParser) -> Tuple(List(Any), Map(Str, Any))
+    args = List()
+    kwargs = Map()
+    while base.peek(p)[1] != ")"
+        base.skip_newlines(p)
+        if base.peek(p)[1] == ")"
+            break
+        if base.peek(p)[0] == "IDENT" and base.peek(p, 1)[0] == "OP" and base.peek(p, 1)[1] == "="
+            kname := base.eat(p, "IDENT")[1]
+            p.pos += 1  -- eat '='
+            kwargs[kname] = base.parse_expr(p)
+        else
+            args.push(base.parse_expr(p))
+        if not base.eat_if(p, "OP", ",")
+            break
+        base.skip_newlines(p)
+    (args, kwargs)
+
+fn nuclear_parse_stmt(p: NuclearParser) -> Option(Any)
+    base.skip_newlines(p)
+    t := base.peek(p)
+
+    -- comptime name := expr
+    if t[0] == "KW" and t[1] == "comptime"
+        return parse_comptime(p)
+
+    -- trait TraitName { ... }
+    if t[0] == "KW" and t[1] == "trait"
+        return parse_trait(p)
+
+    -- impl TraitName for TypeName { ... }
+    if t[0] == "KW" and t[1] == "impl"
+        return parse_impl(p)
+
+    -- async fn name(...)
+    if t[0] == "KW" and t[1] == "async"
+        return parse_async_fn(p)
+
+    -- extern fn ...
+    if t[0] == "KW" and t[1] == "extern"
+        return parse_extern_fn(p)
+
+    -- unsafe { ... }
+    if t[0] == "KW" and t[1] == "unsafe"
+        return parse_unsafe(p)
+
+    -- await expr
+    if t[0] == "KW" and t[1] == "await"
+        p.pos += 1
+        expr := base.parse_expr(p)
+        return Await(expr = expr)
+
+    -- spawn expr
+    if t[0] == "KW" and t[1] == "spawn"
+        p.pos += 1
+        expr := base.parse_expr(p)
+        return Spawn(expr = expr)
+
+    base.parse_stmt(p)
+
+fn nuclear_parse_primary(p: NuclearParser) -> Any
+    t := base.peek(p)
+
+    if t[0] == "KW" and t[1] == "self"
+        p.pos += 1
+        return base.Ident(name = "self")
+
+    if t[0] == "KW" and t[1] == "await"
+        p.pos += 1
+        return Await(expr = base.parse_expr(p))
+
+    if t[0] == "KW" and t[1] == "spawn"
+        p.pos += 1
+        return Spawn(expr = base.parse_expr(p))
+
+    if t[0] == "KW" and t[1] == "unsafe"
+        return parse_unsafe(p)
+
+    base.parse_primary(p)
+
+fn parse_comptime(p: NuclearParser) -> ComptimeDecl
+    base.eat(p, "KW", "comptime")
+    name := base.eat(p, "IDENT")[1]
+    if base.peek(p)[1] in List(":=", "=")
+        p.pos += 1
+    expr := base.parse_expr(p)
+    ComptimeDecl(name = name, expr = expr)
+
+fn parse_trait(p: NuclearParser) -> TraitDecl
+    base.eat(p, "KW", "trait")
+    name := base.eat(p, "IDENT")[1]
+    base.skip_newlines(p)
+    methods = Map()
+    trait_col := base.tok_col(p)
+    loop
+        base.skip_newlines(p)
+        t := base.peek(p)
+        if t[0] == "EOF"
+            break
+        cur_col := if t.len() > 3 then t[3] else 0
+        if cur_col < trait_col
+            break
+        if t[0] == "KW" and t[1] == "fn"
+            decl := base.parse_fn_decl(p)
+            methods[decl.name] = decl
+        else
+            break
+    TraitDecl(name = name, methods = methods)
+
+fn parse_impl(p: NuclearParser) -> ImplDecl
+    base.eat(p, "KW", "impl")
+    trait_name := base.eat(p, "IDENT")[1]
+    type_name = None
+    if base.peek(p)[0] == "KW" and base.peek(p)[1] == "for"
+        p.pos += 1
+        type_name = base.eat(p, "IDENT")[1]
+    base.skip_newlines(p)
+    methods = Map()
+    impl_col := base.tok_col(p)
+    loop
+        base.skip_newlines(p)
+        t := base.peek(p)
+        if t[0] == "EOF"
+            break
+        cur_col := if t.len() > 3 then t[3] else 0
+        if cur_col < impl_col
+            break
+        if t[0] == "KW" and t[1] == "fn"
+            decl := base.parse_fn_decl(p)
+            methods[decl.name] = decl
+        else
+            break
+    ImplDecl(trait_name = trait_name, type_name = type_name, methods = methods)
+
+fn parse_async_fn(p: NuclearParser) -> AsyncFnDecl
+    base.eat(p, "KW", "async")
+    base.eat(p, "KW", "fn")
+    name := base.eat(p, "IDENT")[1]
+    base.eat(p, "OP", "(")
+    params := nuclear_parse_params(p)
+    base.eat(p, "OP", ")")
+    ret_type = None
+    if base.peek(p)[0] == "OP" and base.peek(p)[1] == "->"
+        p.pos += 1
+        ret_type = base.parse_type_expr(p)
+    base.skip_newlines(p)
+    body = None
+    if base.peek(p)[0] == "OP" and base.peek(p)[1] == "=>"
+        p.pos += 1
+        body = base.Block(stmts = List(base.Return(expr = Some(base.parse_expr(p)))))
+    else
+        body = base.parse_indented_block(p)
+    AsyncFnDecl(name = name, params = params, body = body, ret_type = ret_type)
+
+fn parse_extern_fn(p: NuclearParser) -> ExternFn
+    base.eat(p, "KW", "extern")
+    lib = None
+    if base.peek(p)[0] == "STRING"
+        lib = base.eat(p, "STRING")[1]
+    base.eat(p, "KW", "fn")
+    name := base.eat(p, "IDENT")[1]
+    base.eat(p, "OP", "(")
+    params := nuclear_parse_params(p)
+    base.eat(p, "OP", ")")
+    ret_type = None
+    if base.peek(p)[0] == "OP" and base.peek(p)[1] == "->"
+        p.pos += 1
+        ret_type = base.parse_type_expr(p)
+    ExternFn(name = name, params = params, ret_type = ret_type, lib = lib)
+
+fn parse_unsafe(p: NuclearParser) -> UnsafeBlock
+    base.eat(p, "KW", "unsafe")
+    base.skip_newlines(p)
+    body := base.parse_indented_block(p)
+    UnsafeBlock(body = body)
+
+fn nuclear_parse_program(p: NuclearParser) -> base.Block
+    stmts = List()
+    while base.peek(p)[0] != "EOF"
+        base.skip_newlines(p)
+        if base.peek(p)[0] == "EOF"
+            break
+        s := nuclear_parse_stmt(p)
+        if s != None
+            stmts.push(s)
+    base.Block(stmts = stmts)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NuclearEvaluator — extends Evaluator with trait registry, tensors, etc.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+type NuclearEvaluator
+    global_env:    base.Env
+    type_defs:     Map(Str, Any) = Map()
+    _trait_impls:  Map(Str, Map(Str, Any)) = Map()
+    _trait_decls:  Map(Str, TraitDecl) = Map()
+    _comptime:     Map(Str, Any) = Map()
+    _tasks:        Map(Int, NuvolaFuture) = Map()
+    _task_counter: Int = 0
+    _unsafe_depth: Int = 0
+
+fn nuclear_evaluator_new() -> NuclearEvaluator
+    env := base.Env()
+    ev := NuclearEvaluator(global_env = env)
+    -- Setup base builtins first
+    base.setup_builtins_on(ev)
+    -- Then register nuclear builtins
+    register_nuclear_builtins(ev)
+    ev
+
+@io fn register_nuclear_builtins(ev: NuclearEvaluator)
+    e := ev.global_env
+
+    -- dtype constants
+    base.env_define(e, "f64", "f64")
+    base.env_define(e, "f32", "f32")
+    base.env_define(e, "f16", "f16")
+    base.env_define(e, "i64", "i64")
+    base.env_define(e, "i32", "i32")
+    base.env_define(e, "i16", "i16")
+    base.env_define(e, "i8",  "i8")
+    base.env_define(e, "u8",  "u8")
+    base.env_define(e, "bool_dtype", "bool")
+
+    -- tensor constructors
+    base.env_define(e, "tensor",   fn(data, dtype = None, requires_grad = false) =>
+        if data is NuvolaTensor then data else tensor_new(data, dtype = dtype, requires_grad = requires_grad))
+    base.env_define(e, "zeros",    fn(...shape, dtype = None) =>
+        tensor_new(np.zeros(shape, dtype = dtype), dtype = dtype))
+    base.env_define(e, "ones",     fn(...shape, dtype = None) =>
+        tensor_new(np.ones(shape, dtype = dtype), dtype = dtype))
+    base.env_define(e, "randn",    fn(...shape, dtype = None) =>
+        tensor_new(np.random.randn(shape), dtype = dtype ?? "f64", requires_grad = true))
+    base.env_define(e, "rand",     fn(...shape, dtype = None) =>
+        tensor_new(np.random.rand(shape), dtype = dtype ?? "f64"))
+    base.env_define(e, "eye",      fn(n, dtype = None) =>
+        tensor_new(np.eye(n.to_int()), dtype = dtype ?? "f64"))
+    base.env_define(e, "arange",   fn(start, stop = None, step = 1, dtype = None) =>
+        if stop == None then tensor_new(np.arange(0, start, step), dtype = dtype)
+        else tensor_new(np.arange(start, stop, step), dtype = dtype))
+    base.env_define(e, "linspace", fn(start, stop, n, dtype = None) =>
+        tensor_new(np.linspace(start, stop, n.to_int()), dtype = dtype ?? "f64"))
+    base.env_define(e, "full",     fn(shape, fill, dtype = None) =>
+        tensor_new(np.full(shape, fill), dtype = dtype ?? "f64"))
+
+    -- tensor ops
+    base.env_define(e, "matmul",   fn(a, b) => tensor_matmul(a, b))
+    base.env_define(e, "dot",      fn(a, b) =>
+        if a is NuvolaTensor and a.data.ndim() > 1 then tensor_matmul(a, b)
+        else tensor_new(np.dot(a.data, b.data).to_float()))
+    base.env_define(e, "einsum",   fn(subscripts, ...operands) =>
+        tensor_new(np.einsum(subscripts, operands.map(fn(op) => if op is NuvolaTensor then op.data else np.array(op)))))
+    base.env_define(e, "stack",    fn(tensors, axis = 0) =>
+        tensor_new(np.stack(tensors.map(fn(t) => if t is NuvolaTensor then t.data else np.array(t)), axis = axis.to_int())))
+    base.env_define(e, "cat",      fn(tensors, axis = 0) =>
+        tensor_new(np.concatenate(tensors.map(fn(t) => if t is NuvolaTensor then t.data else np.array(t)), axis = axis.to_int())))
+    base.env_define(e, "broadcast", fn(a, b) =>
+        if a is NuvolaTensor and b is NuvolaTensor then tensor_new(np.broadcast_to(a.data, b.data.shape())) else a)
+
+    -- tensor-aware math overrides
+    base.env_define(e, "sqrt",  fn(x) => if x is NuvolaTensor then tensor_sqrt(x) else math.sqrt(x))
+    base.env_define(e, "log",   fn(x, b = None) => if x is NuvolaTensor then tensor_log(x) elif b == None then math.log(x) else math.log(x, b))
+    base.env_define(e, "exp",   fn(x) => if x is NuvolaTensor then tensor_exp(x) else math.exp(x))
+    base.env_define(e, "abs",   fn(x) => if x is NuvolaTensor then tensor_new(np.abs(to_numpy(x.data))) else math.abs(x))
+    base.env_define(e, "sin",   fn(x) => if x is NuvolaTensor then tensor_new(np.sin(to_numpy(x.data))) else math.sin(x))
+    base.env_define(e, "cos",   fn(x) => if x is NuvolaTensor then tensor_new(np.cos(to_numpy(x.data))) else math.cos(x))
+    base.env_define(e, "tan",   fn(x) => if x is NuvolaTensor then tensor_new(np.tan(to_numpy(x.data))) else math.tan(x))
+    base.env_define(e, "asin",  fn(x) => if x is NuvolaTensor then tensor_new(np.arcsin(to_numpy(x.data))) else math.asin(x))
+    base.env_define(e, "acos",  fn(x) => if x is NuvolaTensor then tensor_new(np.arccos(to_numpy(x.data))) else math.acos(x))
+    base.env_define(e, "atan",  fn(x) => if x is NuvolaTensor then tensor_new(np.arctan(to_numpy(x.data))) else math.atan(x))
+    base.env_define(e, "atan2", fn(y, x) => if y is NuvolaTensor then tensor_new(np.arctan2(to_numpy(y.data), to_numpy(x.data))) else math.atan2(y, x))
+    base.env_define(e, "floor", fn(x) => if x is NuvolaTensor then tensor_new(np.floor(x.data)) else math.floor(x))
+    base.env_define(e, "ceil",  fn(x) => if x is NuvolaTensor then tensor_new(np.ceil(x.data)) else math.ceil(x))
+    base.env_define(e, "clamp", fn(x, lo, hi) => tensor_new(np.clip(if x is NuvolaTensor then to_numpy(x.data) else x, lo, hi)))
+    base.env_define(e, "sign",  fn(x) => if x is NuvolaTensor then tensor_new(np.sign(to_numpy(x.data))) else math.copysign(1, x))
+    base.env_define(e, "pow",   fn(x, y) => if x is NuvolaTensor then tensor_pow(x, y) else x ** y)
+    base.env_define(e, "hypot", fn(a, b) => math.hypot(if a is NuvolaTensor then a.item() else a, if b is NuvolaTensor then b.item() else b))
+    base.env_define(e, "pi",    math.PI)
+    base.env_define(e, "e_",    math.E)
+
+    -- activations
+    base.env_define(e, "relu",    fn(t) => if t is NuvolaTensor then tensor_relu(t) else math.max(0, t))
+    base.env_define(e, "sigmoid", fn(t) => if t is NuvolaTensor then tensor_sigmoid(t) else 1.0 / (1.0 + math.exp(-t)))
+    base.env_define(e, "softmax", fn(t, axis = -1) => if t is NuvolaTensor then tensor_softmax(t, axis) else t)
+    base.env_define(e, "gelu",    fn(t) => if t is NuvolaTensor then tensor_gelu(t) else t)
+    base.env_define(e, "tanh",    fn(t) => if t is NuvolaTensor then tensor_tanh(t) else math.tanh(t))
+
+    -- loss functions
+    base.env_define(e, "mse_loss",       fn(pred, target) => builtin_mse_loss(ev, pred, target))
+    base.env_define(e, "cross_entropy",  fn(logits, targets) => builtin_cross_entropy(ev, logits, targets))
+    base.env_define(e, "bce_loss",       fn(pred, target) => builtin_bce_loss(ev, pred, target))
+    base.env_define(e, "huber_loss",     fn(pred, target, delta = 1.0) => builtin_huber_loss(ev, pred, target, delta))
+
+    -- quantization
+    base.env_define(e, "quantize",   fn(t, dtype = "i8") => builtin_quantize(t, dtype))
+    base.env_define(e, "dequantize", fn(qt, target_dtype = "f32") => builtin_dequantize(qt, target_dtype))
+
+    -- normalization
+    base.env_define(e, "layer_norm", fn(x, gamma = None, beta = None, eps = 1e-5) =>
+        builtin_layer_norm(x, gamma, beta, eps))
+    base.env_define(e, "batch_norm", fn(x, gamma = None, beta = None, eps = 1e-5) =>
+        builtin_batch_norm(x, gamma, beta, eps))
+
+    -- channels / concurrency
+    base.env_define(e, "chan",       fn(cap = 0, dtype = None) => channel_new(cap.to_int(), dtype))
+    base.env_define(e, "spawn",     fn(f, ...args) => builtin_spawn(ev, f, args))
+    base.env_define(e, "await_",    fn(future, timeout = None) => builtin_await(ev, future, timeout))
+    base.env_define(e, "sleep_ms",  fn(ms) => time.sleep(ms / 1000.0))
+
+    -- optimizers
+    base.env_define(e, "adam",    fn(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8) =>
+        builtin_adam(lr, beta1, beta2, eps))
+    base.env_define(e, "sgd_opt", fn(lr = 0.01, momentum = 0.0) =>
+        builtin_sgd_opt(lr, momentum))
+    base.env_define(e, "adagrad", fn(lr = 0.01, eps = 1e-8) =>
+        builtin_adagrad(lr, eps))
+    base.env_define(e, "rmsprop", fn(lr = 0.001, alpha = 0.99, eps = 1e-8) =>
+        builtin_rmsprop(lr, alpha, eps))
+
+    -- gradient helpers
+    base.env_define(e, "no_grad",        fn(f, ...args) => builtin_no_grad(ev, f, args))
+    base.env_define(e, "grad_of",        fn(tensor) =>
+        if tensor is NuvolaTensor then tensor_new(tensor.grad.copy()) else tensor_new(List(0.0)))
+    base.env_define(e, "backward",       fn(t) => tensor_backward(t))
+    base.env_define(e, "zero_grad",      fn(ts) =>
+        (if ts is List then ts else List(ts)).map(fn(t) => if t is NuvolaTensor then tensor_zero_grad(t)))
+    base.env_define(e, "clip_grad_norm", fn(params, max_norm = 1.0) =>
+        builtin_clip_grad_norm(params, max_norm))
+
+    -- lr schedules
+    base.env_define(e, "cosine_lr",        fn(step, total_steps, lr_min = 0.0, lr_max = 0.001) =>
+        builtin_cosine_lr(step, total_steps, lr_min, lr_max))
+    base.env_define(e, "warmup_cosine_lr", fn(step, warmup_steps, total_steps, lr_max = 0.001, lr_min = 0.0) =>
+        builtin_warmup_cosine_lr(step, warmup_steps, total_steps, lr_max, lr_min))
+
+    -- convolutions / masking
+    base.env_define(e, "conv1d",   fn(inp, weight, stride = 1, padding = 0) =>
+        tensor_conv1d(if inp is NuvolaTensor then inp else tensor_new(inp), weight, stride.to_int(), padding.to_int()))
+    base.env_define(e, "conv2d",   fn(inp, weight, bias = None, stride = 1, padding = 0) =>
+        tensor_conv2d(if inp is NuvolaTensor then inp else tensor_new(inp), weight, stride.to_int(), padding.to_int(), bias))
+    base.env_define(e, "dropout",  fn(x, p = 0.5, training = true) =>
+        tensor_dropout(if x is NuvolaTensor then x else tensor_new(x), p.to_float(), training))
+    base.env_define(e, "where",    fn(cond, x, y) => tensor_where(cond, x, y))
+
+    -- memory / hardware
+    base.env_define(e, "has_gpu",   HAS_GPU)
+    base.env_define(e, "has_numpy", HAS_NUMPY)
+    base.env_define(e, "has_scipy", HAS_SCIPY)
+    base.env_define(e, "has_sympy", HAS_SYMPY)
+
+    -- fork-join parallelism
+    base.env_define(e, "par_map", fn(f, lst) => PAR_EXECUTOR.map(f, lst).to_list())
+    base.env_define(e, "par_reduce", fn(f, lst, init = None) =>
+        if init != None then lst.fold(init, f) else lst.reduce(f))
+
+    -- tensor inspection
+    base.env_define(e, "shape",    fn(t) => if t is NuvolaTensor then tensor_shape(t) else List())
+    base.env_define(e, "ndim",     fn(t) => if t is NuvolaTensor then tensor_ndim(t) else 0)
+    base.env_define(e, "dtype_of", fn(t) => if t is NuvolaTensor then tensor_dtype(t) else "unknown")
+    base.env_define(e, "item",     fn(t) => if t is NuvolaTensor then tensor_item(t) else t)
+    base.env_define(e, "tolist",   fn(t) => if t is NuvolaTensor then tensor_tolist(t) else t)
+    base.env_define(e, "numpy_",   fn(t) => if t is NuvolaTensor then tensor_numpy(t) else t)
+
+    -- HTTP server
+    base.env_define(e, "serve", fn(port, routes) =>
+        NuvolaServer(_port = port.to_int(), _routes = routes, _ev = ev))
+
+    -- JSON
+    base.env_define(e, "json_encode", fn(x) =>
+        json.encode(if x is NuvolaTensor then tensor_tolist(x) else x))
+    base.env_define(e, "json_decode", fn(s) => json.decode(s.to_str()))
+    base.env_define(e, "json_pretty", fn(x) =>
+        json.encode(if x is NuvolaTensor then tensor_tolist(x) else x, indent = 2))
+
+    -- shell / system interop
+    base.env_define(e, "shell", fn(cmd)
+        r := process.run(cmd.to_str(), capture = true)
+        base.NuvolaStruct(type_name = "ShellResult",
+                          fields = Map("stdout" -> r.stdout, "stderr" -> r.stderr, "code" -> r.return_code))
+    )
+
+    -- trait helpers
+    base.env_define(e, "impl_for",   fn(trait_name, type_name, method_name, f) =>
+        builtin_impl_for(ev, trait_name, type_name, method_name, f))
+    base.env_define(e, "call_trait", fn(obj, method_name, ...args) =>
+        builtin_call_trait(ev, obj, method_name, args))
+
+    -- HTTP client
+    base.env_define(e, "http_get", fn(url) =>
+        match http.get(url.to_str(), timeout = 60)
+            Ok(resp) -> base.NuvolaStruct(type_name = "HttpResponse",
+                            fields = Map("status" -> resp.status, "body" -> resp.text(), "ok" -> true))
+            Err(err) -> base.NuvolaStruct(type_name = "HttpResponse",
+                            fields = Map("status" -> 0, "body" -> err.to_str(), "ok" -> false))
+    )
+    base.env_define(e, "http_post", fn(url, body = None, headers = None)
+        match http.post(url.to_str(), json = body, headers = headers, timeout = 300)
+            Ok(resp) ->
+                parsed := match json.decode(resp.text())
+                    Ok(v)  -> v
+                    Err(_) -> resp.text()
+                base.NuvolaStruct(type_name = "HttpResponse",
+                    fields = Map("status" -> resp.status, "body" -> parsed, "ok" -> true))
+            Err(err) -> base.NuvolaStruct(type_name = "HttpResponse",
+                            fields = Map("status" -> 0, "body" -> err.to_str(), "ok" -> false))
+    )
+
+    -- AI chat / embed / reset
+    AI_URL := "http://127.0.0.1:11400"
+
+    base.env_define(e, "ai_chat", fn(message, session_id = "default", model = None)
+        payload := Map("message" -> message.to_str(), "session_id" -> session_id.to_str(), "stream" -> false)
+        if model != None
+            payload["model"] = model.to_str()
+        match http.post("{AI_URL}/chat", json = payload, timeout = 300)
+            Ok(resp) ->
+                result := json.decode(resp.text())
+                result.get("reply", "")
+            Err(err) -> "[ai_chat error: {err}]"
+    )
+
+    base.env_define(e, "ai_embed", fn(text)
+        payload := Map("text" -> if text is List then text else text.to_str())
+        match http.post("{AI_URL}/embed", json = payload, timeout = 30)
+            Ok(resp) ->
+                result := json.decode(resp.text())
+                embs := result.get("embeddings", List(List()))
+                if embs.len() > 0 then tensor_new(embs[0]) else tensor_new(List(0.0))
+            Err(_) -> tensor_new(List(0.0))
+    )
+
+    base.env_define(e, "ai_reset", fn(session_id = "default")
+        match http.post("{AI_URL}/reset/{session_id}", json = Map(), timeout = 10)
+            Ok(_)  -> true
+            Err(_) -> false
+    )
+
+    base.env_define(e, "ai_moa", fn(message, session_id = "default", auto_route = true)
+        payload := Map("message" -> message.to_str(), "session_id" -> session_id.to_str(),
+                       "auto_route" -> auto_route)
+        match http.post("{AI_URL}/moa", json = payload, timeout = 600)
+            Ok(resp) -> json.decode(resp.text()).get("reply", "")
+            Err(err) -> "[ai_moa error: {err}]"
+    )
+
+    base.env_define(e, "ai_rag", fn(question, top_k = 3, session_id = "rag")
+        payload := Map("question" -> question.to_str(), "top_k" -> top_k.to_int(),
+                       "session_id" -> session_id.to_str(), "answer" -> true)
+        match http.post("{AI_URL}/rag/query", json = payload, timeout = 300)
+            Ok(resp) -> json.decode(resp.text()).get("answer", "")
+            Err(err) -> "[ai_rag error: {err}]"
+    )
+
+    base.env_define(e, "ai_rag_add", fn(text, source = "manual")
+        payload := Map("text" -> text.to_str(), "source" -> source.to_str())
+        match http.post("{AI_URL}/rag/add", json = payload, timeout = 120)
+            Ok(resp) -> json.decode(resp.text()).get("added", 0)
+            Err(err) -> "[ai_rag_add error: {err}]"
+    )
+
+    base.env_define(e, "ai_rag_search", fn(question, top_k = 3)
+        payload := Map("question" -> question.to_str(), "top_k" -> top_k.to_int(), "answer" -> false)
+        match http.post("{AI_URL}/rag/query", json = payload, timeout = 30)
+            Ok(resp) -> json.decode(resp.text()).get("chunks", List())
+            Err(err) -> "[ai_rag_search error: {err}]"
+    )
+
+    base.env_define(e, "ai_image", fn(prompt, enhance = false, model = "sdxl",
+                                      width = 1024, height = 1024, seed = None, steps = None)
+        payload := Map("prompt" -> prompt.to_str(), "enhance" -> enhance,
+                       "model" -> model.to_str(), "width" -> width.to_int(), "height" -> height.to_int())
+        if seed != None
+            payload["seed"] = seed.to_int()
+        if steps != None
+            payload["steps"] = steps.to_int()
+        match http.post("{AI_URL}/image/generate", json = payload, timeout = 300)
+            Ok(resp) -> json.decode(resp.text()).get("path", "[ai_image error: no path]")
+            Err(err) -> "[ai_image error: {err}]"
+    )
+
+    -- fused linear ops
+    base.env_define(e, "linear", fn(x, W, b)
+        if no_grad_depth > 0
+            xd := to_numpy(if x is NuvolaTensor then x.data else np.array(x, dtype = np.float64))
+            Wd := to_numpy(if W is NuvolaTensor then W.data else np.array(W, dtype = np.float64))
+            bd := to_numpy(if b is NuvolaTensor then b.data else np.array(b, dtype = np.float64))
+            return tensor_new(xd @ Wd + bd)
+        tensor_add(tensor_matmul(if x is NuvolaTensor then x else tensor_new(x), W), b)
+    )
+
+    base.env_define(e, "linear_relu", fn(x, W, b)
+        if no_grad_depth > 0
+            xd := to_numpy(if x is NuvolaTensor then x.data else np.array(x, dtype = np.float64))
+            Wd := to_numpy(if W is NuvolaTensor then W.data else np.array(W, dtype = np.float64))
+            bd := to_numpy(if b is NuvolaTensor then b.data else np.array(b, dtype = np.float64))
+            return tensor_new(np.maximum(0.0, xd @ Wd + bd))
+        tensor_relu(tensor_add(tensor_matmul(if x is NuvolaTensor then x else tensor_new(x), W), b))
+    )
+
+    base.env_define(e, "linear_gelu", fn(x, W, b)
+        if no_grad_depth > 0
+            xd := to_numpy(if x is NuvolaTensor then x.data else np.array(x, dtype = np.float64))
+            Wd := to_numpy(if W is NuvolaTensor then W.data else np.array(W, dtype = np.float64))
+            bd := to_numpy(if b is NuvolaTensor then b.data else np.array(b, dtype = np.float64))
+            z := xd @ Wd + bd
+            cdf := 0.5 * (1.0 + np.tanh(0.7978845608 * (z + 0.044715 * z ** 3)))
+            return tensor_new(z * cdf)
+        tensor_gelu(tensor_add(tensor_matmul(if x is NuvolaTensor then x else tensor_new(x), W), b))
+    )
+
+    -- memoize
+    base.env_define(e, "memoize", fn(f)
+        cache = Map()
+        fn(...args)
+            key_parts = List()
+            for a in args
+                if a is NuvolaTensor
+                    d := to_numpy(a.data)
+                    sz := d.size()
+                    samples := if sz <= 8 then d.flat().map(fn(v) => v.to_float().round(6))
+                               else List(0, sz // 8, sz // 4, 3 * sz // 8, sz // 2, 5 * sz // 8, 3 * sz // 4, sz - 1)
+                                   .map(fn(i) => d.flat()[i].to_float().round(6))
+                    key_parts.push((d.shape(), samples))
+                elif a is Int or a is Float or a is Bool or a is Str
+                    key_parts.push(a)
+                else
+                    key_parts.push(id(a))
+            key := key_parts.to_tuple()
+            if key in cache
+                return cache[key]
+            no_grad_depth += 1
+            result := base.call_fn(ev, f, args.to_list())
+            no_grad_depth = math.max(0, no_grad_depth - 1)
+            cache[key] = result
+            if cache.len() > 4096
+                for k in cache.keys().slice(0, 2048)
+                    cache.remove(k)
+            result
+    )
+
+    -- warm_inference
+    base.env_define(e, "warm_inference", fn(f, sample_inputs)
+        count = 0
+        no_grad_depth += 1
+        for inp in sample_inputs
+            args := if inp is List then inp else List(inp)
+            -- call_fn panics on error, so catch it
+            match catch(fn() => base.call_fn(ev, f, args))
+                Ok(_) -> count += 1
+                Err(_) -> ()
+        no_grad_depth = math.max(0, no_grad_depth - 1)
+        count
+    )
+
+-- Loss functions
+
+fn builtin_mse_loss(ev: NuclearEvaluator, pred: Any, target: Any) -> NuvolaTensor
+    p := if pred is NuvolaTensor then pred else tensor_new(pred)
+    t := if target is NuvolaTensor then target else tensor_new(target)
+    diff := tensor_sub(p, t)
+    tensor_mean(tensor_mul(diff, diff))
+
+fn builtin_cross_entropy(ev: NuclearEvaluator, logits: Any, targets: Any) -> NuvolaTensor
+    lg := if logits is NuvolaTensor then logits else tensor_new(logits)
+    probs := tensor_softmax(lg, axis = -1)
+    log_probs := tensor_log(probs)
+    tgt := if targets is NuvolaTensor then targets.data.as_int() elif targets is List then np.array(targets).as_int() else np.array(List(targets.to_int()))
+    batch := if log_probs.data.ndim() > 1 then log_probs.data.shape()[0] else 1
+    loss_val = None
+    if log_probs.data.ndim() == 1
+        loss_val = -log_probs.data[tgt[0]]
+    else
+        loss_val = -List.range(batch).map(fn(i) => log_probs.data[i][tgt[i]]).mean()
+    out := tensor_new(loss_val, requires_grad = lg.requires_grad)
+    out._prev = Set(lg)
+    out._backward = fn()
+        if lg.requires_grad
+            g := probs.data.copy()
+            if probs.data.ndim() > 1
+                for i in 0..batch
+                    g[i][tgt[i]] -= 1.0
+                g = g / batch
+            else
+                g[tgt[0]] -= 1.0
+            lg.grad += g * out.grad
+    out
+
+fn builtin_bce_loss(ev: NuclearEvaluator, pred: Any, target: Any) -> NuvolaTensor
+    p := if pred is NuvolaTensor then pred else tensor_new(pred)
+    t := if target is NuvolaTensor then target else tensor_new(target)
+    one := tensor_new(1.0)
+    loss := tensor_neg(tensor_add(tensor_mul(t, tensor_log(p)),
+                                  tensor_mul(tensor_sub(one, t), tensor_log(tensor_sub(one, p)))))
+    tensor_mean(loss)
+
+fn builtin_huber_loss(ev: NuclearEvaluator, pred: Any, target: Any, delta: Float = 1.0) -> NuvolaTensor
+    p := if pred is NuvolaTensor then pred else tensor_new(pred)
+    t := if target is NuvolaTensor then target else tensor_new(target)
+    diff := tensor_sub(p, t)
+    diff_np := to_numpy(diff.data)
+    abs_d := np.abs(diff_np)
+    loss_np := np.where(abs_d <= delta, 0.5 * diff_np ** 2, delta * (abs_d - 0.5 * delta))
+    tensor_new(loss_np.mean())
+
+-- Quantization builtins
+
+fn builtin_quantize(t: Any, dtype: Str = "i8") -> base.NuvolaStruct
+    tt := if t is NuvolaTensor then t else tensor_new(t)
+    (q, scale) := tensor_quantize_int8(tt)
+    base.NuvolaStruct(type_name = "QuantTensor",
+                      fields = Map("tensor" -> q, "scale" -> scale, "dtype" -> dtype))
+
+fn builtin_dequantize(qt: Any, target_dtype: Str = "f32") -> Any
+    if qt is base.NuvolaStruct
+        t := qt.fields["tensor"]
+        scale := qt.fields["scale"]
+        return tensor_dequantize(t, scale, target_dtype)
+    qt
+
+-- Normalization builtins
+
+fn builtin_layer_norm(x: Any, gamma: Any = None, beta: Any = None, eps: Float = 1e-5) -> NuvolaTensor
+    xt := if x is NuvolaTensor then x else tensor_new(x)
+    mean := tensor_mean(xt, axis = -1)
+    x_centered := if xt.data.ndim() > 1 then tensor_sub(xt, tensor_unsqueeze(mean, -1))
+                  else tensor_sub(xt, mean)
+    var_data := np.var(xt.data, axis = -1, keepdims = if xt.data.ndim() > 1 then true else false)
+    std := tensor_new(np.sqrt(var_data + eps))
+    out := tensor_div(x_centered, std)
+    if gamma != None
+        gamma_t := if gamma is NuvolaTensor then gamma else tensor_new(gamma)
+        out = tensor_mul(out, gamma_t)
+    if beta != None
+        beta_t := if beta is NuvolaTensor then beta else tensor_new(beta)
+        out = tensor_add(out, beta_t)
+    out
+
+fn builtin_batch_norm(x: Any, gamma: Any = None, beta: Any = None, eps: Float = 1e-5) -> NuvolaTensor
+    xt := if x is NuvolaTensor then x else tensor_new(x)
+    mean_data := xt.data.mean(axis = 0)
+    var_data := xt.data.var(axis = 0)
+    x_norm := tensor_new((xt.data - mean_data) / np.sqrt(var_data + eps))
+    if gamma != None
+        x_norm = tensor_mul(x_norm, if gamma is NuvolaTensor then gamma else tensor_new(gamma))
+    if beta != None
+        x_norm = tensor_add(x_norm, if beta is NuvolaTensor then beta else tensor_new(beta))
+    x_norm
+
+-- Concurrency builtins
+
+@io fn builtin_spawn(ev: NuclearEvaluator, f: Any, args: List(Any) = List()) -> NuvolaFuture
+    box = List(None, None)
+    fn worker()
+        -- call_fn panics on error, so catch it to store in box[1]
+        match catch(fn() => base.call_fn(ev, f, args))
+            Ok(result) -> box[0] = result
+            Err(ex)    -> box[1] = ex
+    t := thread.spawn(worker, daemon = true)
+    NuvolaFuture(_thread = t, _box = box)
+
+@io fn builtin_await(ev: NuclearEvaluator, future: Any, timeout: Option(Float) = None) -> Any
+    if future is NuvolaFuture
+        return future_await(future, timeout)
+    future
+
+-- Optimizers
+
+fn builtin_adam(lr: Float = 0.001, beta1: Float = 0.9, beta2: Float = 0.999, eps: Float = 1e-8) -> base.NuvolaStruct
+    state = Map()
+    fn step(params)
+        ps := if params is List then params else List(params)
+        for p in ps
+            if not (p is NuvolaTensor) or p.grad == None
+                continue
+            pid := id(p)
+            if pid not in state
+                state[pid] = (np.zeros_like(p.data, dtype = np.float64),
+                              np.zeros_like(p.data, dtype = np.float64), 0)
+            (m, v, t) := state[pid]
+            t += 1
+            g := p.grad.as_float64()
+            m = beta1 * m + (1 - beta1) * g
+            v = beta2 * v + (1 - beta2) * g ** 2
+            m_hat := m / (1 - beta1 ** t)
+            v_hat := v / (1 - beta2 ** t)
+            p.data = p.data.as_float64() - lr * m_hat / (np.sqrt(v_hat) + eps)
+            state[pid] = (m, v, t)
+        None
+
+    fn zero_grad_fn(params)
+        for p in (if params is List then params else List(params))
+            if p is NuvolaTensor
+                p.grad = np.zeros_like(p.data, dtype = np.float64)
+        None
+
+    base.NuvolaStruct(type_name = "AdamOptimizer",
+                      fields = Map("step" -> step, "zero_grad" -> zero_grad_fn, "lr" -> lr))
+
+fn builtin_sgd_opt(lr: Float = 0.01, momentum: Float = 0.0) -> base.NuvolaStruct
+    state = Map()
+    fn step(params)
+        for p in (if params is List then params else List(params))
+            if not (p is NuvolaTensor) or p.grad == None
+                continue
+            pid := id(p)
+            g := p.grad.as_float64()
+            if momentum > 0
+                v := state.get(pid, np.zeros_like(g))
+                v = momentum * v + g
+                state[pid] = v
+                p.data = p.data.as_float64() - lr * v
+            else
+                p.data = p.data.as_float64() - lr * g
+        None
+
+    fn zero_grad_fn(params)
+        for p in (if params is List then params else List(params))
+            if p is NuvolaTensor
+                p.grad = np.zeros_like(p.data, dtype = np.float64)
+        None
+
+    base.NuvolaStruct(type_name = "SGDOptimizer",
+                      fields = Map("step" -> step, "zero_grad" -> zero_grad_fn, "lr" -> lr))
+
+fn builtin_adagrad(lr: Float = 0.01, eps: Float = 1e-8) -> base.NuvolaStruct
+    G = Map()
+    fn step(params)
+        for p in (if params is List then params else List(params))
+            if not (p is NuvolaTensor) or p.grad == None
+                continue
+            pid := id(p)
+            g := p.grad.as_float64()
+            G[pid] = G.get(pid, np.zeros_like(g)) + g ** 2
+            p.data = p.data.as_float64() - lr / (np.sqrt(G[pid]) + eps) * g
+        None
+
+    fn zero_grad_fn(params)
+        for p in (if params is List then params else List(params))
+            if p is NuvolaTensor
+                p.grad = np.zeros_like(p.data, dtype = np.float64)
+        None
+
+    base.NuvolaStruct(type_name = "AdaGrad",
+                      fields = Map("step" -> step, "zero_grad" -> zero_grad_fn, "lr" -> lr))
+
+fn builtin_rmsprop(lr: Float = 0.001, alpha: Float = 0.99, eps: Float = 1e-8) -> base.NuvolaStruct
+    V = Map()
+    fn step(params)
+        for p in (if params is List then params else List(params))
+            if not (p is NuvolaTensor) or p.grad == None
+                continue
+            pid := id(p)
+            g := p.grad.as_float64()
+            V[pid] = alpha * V.get(pid, np.zeros_like(g)) + (1 - alpha) * g ** 2
+            p.data = p.data.as_float64() - lr / (np.sqrt(V[pid]) + eps) * g
+        None
+
+    fn zero_grad_fn(params)
+        for p in (if params is List then params else List(params))
+            if p is NuvolaTensor
+                p.grad = np.zeros_like(p.data, dtype = np.float64)
+        None
+
+    base.NuvolaStruct(type_name = "RMSProp",
+                      fields = Map("step" -> step, "zero_grad" -> zero_grad_fn, "lr" -> lr))
+
+fn builtin_clip_grad_norm(params: Any, max_norm: Float = 1.0) -> Float
+    ps := if params is List then params else List(params)
+    total_sq = 0.0
+    for p in ps
+        if p is NuvolaTensor and p.grad != None
+            total_sq += np.sum(p.grad ** 2).to_float()
+    total_norm := math.sqrt(total_sq)
+    if total_norm > max_norm
+        scale := max_norm / (total_norm + 1e-12)
+        for p in ps
+            if p is NuvolaTensor and p.grad != None
+                p.grad *= scale
+    total_norm
+
+fn builtin_cosine_lr(step: Any, total_steps: Any, lr_min: Float = 0.0, lr_max: Float = 0.001) -> Float
+    t := step.to_float() / math.max(total_steps.to_float() - 1, 1)
+    lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.PI * t))
+
+fn builtin_warmup_cosine_lr(step: Any, warmup_steps: Any, total_steps: Any,
+                             lr_max: Float = 0.001, lr_min: Float = 0.0) -> Float
+    s := step.to_float()
+    ws := warmup_steps.to_float()
+    ts := total_steps.to_float()
+    if s < ws
+        return lr_max * s / math.max(ws, 1)
+    t := (s - ws) / math.max(ts - ws - 1, 1)
+    lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.PI * t))
+
+-- Trait builtins
+
+fn builtin_impl_for(ev: NuclearEvaluator, trait_name: Str, type_name: Str,
+                    method_name: Str, f: Any) -> Any
+    if type_name not in ev._trait_impls
+        ev._trait_impls[type_name] = Map()
+    ev._trait_impls[type_name][method_name] = f
+    None
+
+fn builtin_call_trait(ev: NuclearEvaluator, obj: Any, method_name: Str, args: List(Any)) -> Any
+    type_name := if obj is base.NuvolaStruct then obj.type_name
+                 elif obj is base.NuvolaEnum then obj.variant
+                 else type_of(obj)
+    impls := ev._trait_impls.get(type_name, Map())
+    if method_name in impls
+        return base.call_fn(ev, impls[method_name], List(obj) ++ args)
+    panic("No trait impl for '{type_name}.{method_name}'")
+
+fn builtin_no_grad(ev: NuclearEvaluator, f: Any, args: List(Any)) -> Any
+    no_grad_depth += 1
+    result := base.call_fn(ev, f, args)
+    no_grad_depth = math.max(0, no_grad_depth - 1)
+    result
+
+-- Nuclear eval — extended node handling
+
+fn nuclear_eval(ev: NuclearEvaluator, node: Any, env: base.Env) -> Any
+    if node == None
+        return None
+
+    -- Nuclear node types
+    if node is ComptimeDecl
+        if node.name not in ev._comptime
+            ev._comptime[node.name] = nuclear_eval(ev, node.expr, ev.global_env)
+        base.env_define(env, node.name, ev._comptime[node.name])
+        return ev._comptime[node.name]
+
+    if node is TraitDecl
+        ev._trait_decls[node.name] = node
+        return None
+
+    if node is ImplDecl
+        type_name := node.type_name ?? node.trait_name
+        if type_name not in ev._trait_impls
+            ev._trait_impls[type_name] = Map()
+        for (mname, mdecl) in node.methods.entries()
+            fn_val := base.NuvolaFn(params = mdecl.params, body = mdecl.body,
+                                     env = env, name = mname)
+            ev._trait_impls[type_name][mname] = fn_val
+        return None
+
+    if node is AsyncFnDecl
+        params := node.params
+        body := node.body
+        name := node.name
+        async_wrapper := fn(...args)
+            fn_env := base.Env(parent = Some(env))
+            for i in 0..params.len()
+                (pname, _, pdefault) := params[i]
+                if i < args.len()
+                    base.env_define(fn_env, pname, args[i], immutable = false)
+                elif pdefault != None
+                    base.env_define(fn_env, pname, nuclear_eval(ev, pdefault, fn_env), immutable = false)
+            box = List(None, None)
+            fn worker()
+                -- Catch panics so they go into box[1] instead of crashing the thread
+                match catch(fn()
+                    match nuclear_eval(ev, body, fn_env)
+                        base.ReturnSignal(v) -> v
+                        result               -> result
+                )
+                    Ok(val) -> box[0] = val
+                    Err(ex) -> box[1] = ex
+            t := thread.spawn(worker, daemon = true)
+            NuvolaFuture(_thread = t, _box = box)
+        base.env_define(env, name, async_wrapper)
+        return async_wrapper
+
+    if node is ExternFn
+        name := node.name
+        lib_name := node.lib
+        extern_stub := fn(...args)
+            if lib_name != None
+                match ffi.load_lib(lib_name)
+                    Ok(lib) ->
+                        fn_ptr := ffi.get_fn(lib, name, ret_type = ffi.c_double,
+                                             arg_types = args.map(fn(_) => ffi.c_double))
+                        return fn_ptr(args.map(fn(a) => a.to_float()))
+                    Err(_) -> ()
+            panic("extern fn '{name}' not available (lib={lib_name})")
+        base.env_define(env, name, extern_stub)
+        return None
+
+    if node is UnsafeBlock
+        ev._unsafe_depth += 1
+        result := nuclear_eval(ev, node.body, env)
+        ev._unsafe_depth -= 1
+        return result
+
+    if node is Await
+        val := nuclear_eval(ev, node.expr, env)
+        return builtin_await(ev, val)
+
+    if node is Spawn
+        if node.expr is base.Call
+            f := nuclear_eval(ev, node.expr.fn, env)
+            args := node.expr.args.map(fn(a) => nuclear_eval(ev, a, env))
+            return builtin_spawn(ev, f, args)
+        if node.expr is base.TupleLit and node.expr.items.len() > 0
+            f := nuclear_eval(ev, node.expr.items[0], env)
+            args := node.expr.items.slice(1).map(fn(a) => nuclear_eval(ev, a, env))
+            return builtin_spawn(ev, f, args)
+        val := nuclear_eval(ev, node.expr, env)
+        if callable(val) or val is base.NuvolaFn
+            return builtin_spawn(ev, val)
+        return val
+
+    if node is TensorLit
+        data := nuclear_eval(ev, node.data, env)
+        return tensor_new(data, dtype = node.dtype)
+
+    -- Extended Field for tensor/channel/future
+    if node is base.Field
+        obj := nuclear_eval(ev, node.obj, env)
+        field := node.field
+        if obj is NuvolaTensor
+            return tensor_field_access(ev, obj, field)
+        if obj is NuvolaChannel
+            return channel_field_access(obj, field)
+        if obj is NuvolaFuture
+            if field == "is_done"
+                return future_is_done(obj)
+            if field == "await_"
+                return fn(timeout = None) => future_await(obj, timeout)
+        -- Check trait impls
+        type_name := if obj is base.NuvolaStruct then obj.type_name
+                     elif obj is base.NuvolaEnum then obj.variant
+                     else type_of(obj)
+        impls := ev._trait_impls.get(type_name, Map())
+        if field in impls
+            impl_fn := impls[field]
+            return fn(...args) => base.call_fn(ev, impl_fn, List(obj) ++ args.to_list())
+        return base.eval_node(ev, node, env)
+
+    -- Extended BinOp for tensors
+    if node is base.BinOp
+        op := node.op
+        -- Short-circuit operators: must not pre-evaluate both sides,
+        -- and must use nuclear_eval for correct dispatch
+        if op == "and"
+            l := nuclear_eval(ev, node.l, env)
+            return if not base.truthy(ev, l) then l else nuclear_eval(ev, node.r, env)
+        if op == "or"
+            l := nuclear_eval(ev, node.l, env)
+            return if base.truthy(ev, l) then l else nuclear_eval(ev, node.r, env)
+        if op == "??"
+            l := nuclear_eval(ev, node.l, env)
+            if l is base.NuvolaOption
+                return if l.is_some then l.value else nuclear_eval(ev, node.r, env)
+            return if l != None then l else nuclear_eval(ev, node.r, env)
+        -- Non-short-circuit: evaluate with nuclear_eval for tensor support
+        l := nuclear_eval(ev, node.l, env)
+        r := nuclear_eval(ev, node.r, env)
+        if l is NuvolaTensor or r is NuvolaTensor
+            return tensor_binop(op, l, r)
+        -- For non-tensor values, delegate to base (may re-evaluate operands
+        -- with base.eval_node, but results match for non-nuclear values)
+        return base.eval_binop(ev, node, env)
+
+    -- Extended Call for tensor methods + kwargs
+    if node is base.Call
+        fn_node := node.fn
+        kw := Map()
+        if node.kwargs != None
+            for (k, v) in node.kwargs.entries()
+                kw[k] = nuclear_eval(ev, v, env)
+        if fn_node is base.Field
+            obj := nuclear_eval(ev, fn_node.obj, env)
+            method := fn_node.field
+            if obj is NuvolaTensor
+                args := node.args.map(fn(a) => nuclear_eval(ev, a, env))
+                return tensor_method_call(ev, obj, method, args, kw)
+            if obj is NuvolaChannel
+                args := node.args.map(fn(a) => nuclear_eval(ev, a, env))
+                return channel_method_call(obj, method, args)
+            -- trait dispatch
+            type_name := if obj is base.NuvolaStruct then obj.type_name
+                         elif obj is base.NuvolaEnum then obj.variant
+                         else type_of(obj)
+            impls := ev._trait_impls.get(type_name, Map())
+            if method in impls
+                args := node.args.map(fn(a) => nuclear_eval(ev, a, env))
+                return base.call_fn(ev, impls[method], List(obj) ++ args)
+        if kw.len() > 0
+            f := nuclear_eval(ev, fn_node, env)
+            args := node.args.map(fn(a) => nuclear_eval(ev, a, env))
+            return f(args, kw)
+        return base.eval_node(ev, node, env)
+
+    -- Default: delegate to base evaluator
+    base.eval_node(ev, node, env)
+
+-- Tensor field access
+
+fn tensor_field_access(ev: NuclearEvaluator, t: NuvolaTensor, field: Str) -> Any
+    match field
+        "shape"         -> tensor_shape(t)
+        "ndim"          -> tensor_ndim(t)
+        "size"          -> tensor_size(t)
+        "dtype"         -> tensor_dtype(t)
+        "data"          -> tensor_tolist(t)
+        "T"             -> tensor_T(t)
+        "grad"          -> if t.grad != None then tensor_new(t.grad.copy()) else tensor_new(List(0.0))
+        "requires_grad" -> t.requires_grad
+        _               -> get_tensor_method(t, field)
+
+fn get_tensor_method(t: NuvolaTensor, method: Str) -> Any
+    match method
+        "relu"       -> fn() => tensor_relu(t)
+        "sigmoid"    -> fn() => tensor_sigmoid(t)
+        "tanh"       -> fn() => tensor_tanh(t)
+        "gelu"       -> fn() => tensor_gelu(t)
+        "softmax"    -> fn(axis = -1) => tensor_softmax(t, axis.to_int())
+        "log"        -> fn() => tensor_log(t)
+        "exp"        -> fn() => tensor_exp(t)
+        "sqrt"       -> fn() => tensor_sqrt(t)
+        "sum"        -> fn(axis = None) => tensor_sum(t, axis)
+        "mean"       -> fn(axis = None) => tensor_mean(t, axis)
+        "max"        -> fn(axis = None) => tensor_max(t, axis)
+        "min"        -> fn(axis = None) => tensor_min(t, axis)
+        "reshape"    -> fn(...s) => tensor_reshape(t, s)
+        "transpose"  -> fn(...axes) => tensor_transpose(t, if axes.len() > 0 then Some(axes) else None)
+        "flatten"    -> fn() => tensor_flatten(t)
+        "unsqueeze"  -> fn(ax) => tensor_unsqueeze(t, ax.to_int())
+        "squeeze"    -> fn(ax = None) => tensor_squeeze(t, ax)
+        "matmul"     -> fn(other) => tensor_matmul(t, other)
+        "dot"        -> fn(other) => tensor_matmul(t, other)
+        "backward"   -> fn(grad = None) => tensor_backward(t, grad)
+        "zero_grad"  -> fn() => tensor_zero_grad(t)
+        "item"       -> fn() => tensor_item(t)
+        "tolist"     -> fn() => tensor_tolist(t)
+        "numpy"      -> fn() => tensor_numpy(t)
+        "to_f32"     -> fn() => tensor_to_f32(t)
+        "to_f64"     -> fn() => tensor_to_f64(t)
+        "to_f16"     -> fn() => tensor_to_f16(t)
+        "to_i8"      -> fn() => tensor_to_i8(t)
+        "to_i32"     -> fn() => tensor_to_i32(t)
+        "quantize"   -> fn() => tensor_quantize_int8(t)
+        "dequantize" -> fn(scale, dtype = "f32") => tensor_dequantize(t, scale, dtype)
+        "clone"      -> fn() => tensor_new(t.data.copy(), dtype = t._dtype_name, requires_grad = t.requires_grad)
+        "detach"     -> fn() => tensor_new(t.data.copy(), dtype = t._dtype_name, requires_grad = false)
+        "abs"        -> fn() => tensor_new(np.abs(to_numpy(t.data)))
+        "clip"       -> fn(lo, hi) => tensor_new(np.clip(to_numpy(t.data), lo, hi))
+        "norm"       -> fn(p = 2) => tensor_new(np.linalg.norm(to_numpy(t.data).as_float64(), ord = p.to_int()))
+        "dropout"    -> fn(p = 0.5, training = true) => tensor_dropout(t, p.to_float(), training)
+        "conv1d"     -> fn(k, stride = 1, padding = 0) => tensor_conv1d(t, k, stride.to_int(), padding.to_int())
+        "conv2d"     -> fn(k, stride = 1, padding = 0, bias = None) => tensor_conv2d(t, k, stride.to_int(), padding.to_int(), bias)
+        _            -> None
+
+fn tensor_method_call(ev: NuclearEvaluator, t: NuvolaTensor, method: Str,
+                      args: List(Any), kwargs: Map(Str, Any) = Map()) -> Any
+    m := get_tensor_method(t, method)
+    if m != None and callable(m)
+        if kwargs.len() > 0
+            return m(args, kwargs)
+        return m(args)
+    panic("NuvolaTensor has no method '{method}'")
+
+-- Channel field/method access
+
+fn channel_field_access(ch: NuvolaChannel, field: Str) -> Any
+    match field
+        "closed" -> ch.closed
+        "dtype"  -> ch.dtype
+        _        -> get_channel_method(ch, field)
+
+fn get_channel_method(ch: NuvolaChannel, method: Str) -> Any
+    match method
+        "send"     -> fn(v) => channel_send(ch, v)
+        "recv"     -> fn(timeout = None) => channel_recv(ch, timeout)
+        "try_recv" -> fn() => channel_try_recv(ch)
+        "close"    -> fn() => channel_close(ch)
+        _          -> None
+
+fn channel_method_call(ch: NuvolaChannel, method: Str, args: List(Any)) -> Any
+    m := get_channel_method(ch, method)
+    if m != None and callable(m)
+        return m(args)
+    panic("NuvolaChannel has no method '{method}'")
+
+-- Tensor binary ops
+
+fn tensor_binop(op: Str, l: Any, r: Any) -> Any
+    lt := if l is NuvolaTensor then l else tensor_new(l)
+    rt := if r is NuvolaTensor then r else tensor_new(r)
+    match op
+        "+"  -> tensor_add(lt, rt)
+        "-"  -> tensor_sub(lt, rt)
+        "*"  -> tensor_mul(lt, rt)
+        "/"  -> tensor_div(lt, rt)
+        "**" -> tensor_pow(lt, if r is NuvolaTensor then tensor_item(r) else r)
+        "@"  -> tensor_matmul(lt, rt)
+        "==" -> lt == rt
+        "<"  -> tensor_new(lt.data < rt.data)
+        ">"  -> tensor_new(lt.data > rt.data)
+        "<=" -> tensor_new(lt.data <= rt.data)
+        ">=" -> tensor_new(lt.data >= rt.data)
+        _    -> panic("Unsupported tensor op: {op}")
+
+-- Nuclear format/truthy overrides
+
+fn nuclear_format(ev: NuclearEvaluator, v: Any) -> Str
+    if v is NuvolaTensor
+        if v.data.ndim() == 0
+            return v.data.item().to_str()
+        if v.data.size() <= 8
+            return "Tensor{tensor_tolist(v)}"
+        return tensor_repr(v)
+    if v is NuvolaChannel
+        return channel_repr(v)
+    if v is NuvolaFuture
+        return future_repr(v)
+    base.format_val(ev, v)
+
+fn nuclear_truthy(ev: NuclearEvaluator, v: Any) -> Bool
+    if v is NuvolaTensor
+        return np.any(v.data).to_bool()
+    base.truthy(ev, v)
+
+-- Nuclear run — parse + eval with NuclearParser
+
+ast_cache = Map()
+
+@io fn nuclear_run(ev: NuclearEvaluator, source: Str) -> Any
+    key := hash.md5(source)
+    if key not in ast_cache
+        tokens := nuclear_tokenize(source)
+        p := nuclear_parser_new(tokens)
+        ast_cache[key] = nuclear_parse_program(p)
+        if ast_cache.len() > 512
+            keys := ast_cache.keys()
+            for k in keys.slice(0, 256)
+                ast_cache.remove(k)
+    nuclear_eval(ev, ast_cache[key], ev.global_env)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Nuclear test runner
+-- ─────────────────────────────────────────────────────────────────────────────
+
+@io fn run_nuclear_test_file(path: Str, level: Str) -> Tuple(Int, Int)
+    print()
+    print("=" * 70)
+    print("  NUVOLA NUCLEAR TEST SUITE — {level.to_upper()}")
+    print("  File: {path}")
+    print("=" * 70)
+
+    source := fs.read(path)
+    ev := nuclear_evaluator_new()
+    passed = 0
+    failed = 0
+    errors = List()
+
+    test_blocks := regex.split("\n-- TEST: (.+)\n", source)
+
+    if test_blocks.len() == 1
+        -- nuclear_run panics on error, so catch it
+        match catch(fn() => nuclear_run(ev, source))
+            Ok(_) ->
+                print("  [PASS] (single program, no errors)")
+                passed = 1
+            Err(e) ->
+                err_str := e.to_str()
+                if "Assertion" in err_str
+                    print("  [FAIL] {err_str}")
+                else
+                    print("  [ERROR] {err_str}")
+                failed = 1
+    else
+        preamble := test_blocks[0]
+        i = 1
+        while i < test_blocks.len()
+            test_name := test_blocks[i]
+            test_body := if i + 1 < test_blocks.len() then test_blocks[i + 1] else ""
+            full_src := preamble ++ test_body
+            ev2 := nuclear_evaluator_new()
+            match catch(fn() => nuclear_run(ev2, full_src))
+                Ok(_) ->
+                    print("  [PASS] {test_name}")
+                    passed += 1
+                Err(e) ->
+                    msg := e.to_str()
+                    if "Assertion" in msg
+                        print("  [FAIL] {test_name}: {msg}")
+                    else
+                        print("  [ERROR] {test_name}: {msg}")
+                    errors.push((test_name, msg))
+                    failed += 1
+            i += 2
+
+    print()
+    print("  Results: {passed} passed, {failed} failed")
+    if errors.len() > 0
+        print()
+        print("  Failures:")
+        for (name, msg) in errors
+            print("    • {name}: {msg}")
+    print("=" * 70)
+    print()
+    (passed, failed)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Entry point
+-- ─────────────────────────────────────────────────────────────────────────────
+
+@io fn main()
+    base_dir := fs.dirname(fs.abs(__file__))
+
+    -- If a specific file is passed, run it
+    args := os.args()
+    if args.len() > 1
+        path := args[1]
+        run_nuclear_test_file(path, fs.basename(path))
+        os.exit(0)
+
+    total_pass = 0
+    total_fail = 0
+
+    -- Run existing base tests with nuclear evaluator (backward compat)
+    for (fname, level) in List(
+        ("simple.nvl",  "simple"),
+        ("medium.nvl",  "medium"),
+        ("hard.nvl",    "hard"),
+        ("insane.nvl",  "insane")
+    )
+        fpath := fs.join(base_dir, fname)
+        if fs.is_file(fpath)
+            src := fs.read(fpath)
+            ev := nuclear_evaluator_new()
+            blocks := regex.split("\n-- TEST: (.+)\n", src)
+            p = 0
+            fl = 0
+            if blocks.len() == 1
+                match catch(fn() => nuclear_run(ev, src))
+                    Ok(_)  -> p = 1
+                    Err(e) -> print("[ERROR] {e}"); fl = 1
+            else
+                preamble := blocks[0]
+                i = 1
+                while i < blocks.len()
+                    tname := blocks[i]
+                    tbody := if i + 1 < blocks.len() then blocks[i + 1] else ""
+                    ev2 := nuclear_evaluator_new()
+                    match catch(fn() => nuclear_run(ev2, preamble ++ tbody))
+                        Ok(_)  -> p += 1
+                        Err(e) ->
+                            fl += 1
+                            err := e.to_str()
+                            if "Assertion" in err
+                                print("  [FAIL] {tname}: {err}")
+                            else
+                                print("  [ERROR] {tname}: {err}")
+                    i += 2
+            print("  {level.to_upper()}: {p} pass, {fl} fail")
+            total_pass += p
+            total_fail += fl
+
+    -- Run nuclear test files
+    for (fname, level) in List(
+        ("nuclear.nvl", "nuclear"),
+        ("ai_core.nvl", "ai_core")
+    )
+        fpath := fs.join(base_dir, fname)
+        if fs.is_file(fpath)
+            (p, fl) := run_nuclear_test_file(fpath, level)
+            total_pass += p
+            total_fail += fl
+
+    print()
+    print("=" * 70)
+    print("  TOTAL: {total_pass} passed, {total_fail} failed")
+    print("=" * 70)
+    print()
+    os.exit(if total_fail == 0 then 0 else 1)

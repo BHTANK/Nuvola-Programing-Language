@@ -1,0 +1,4126 @@
+-- codegen.nvl — Nuvola self-hosted code generator (M8)
+-- Lexes + parses a .nvl source file, then emits C source using nuvola.h.
+--
+-- Usage:  ./codegen <file.nvl>          (prints C to stdout)
+--         ./codegen <file.nvl> -o out   (compiles to native binary via clang)
+--
+-- Pipeline:  source → lex → parse → codegen → C → clang → binary
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- LEXER (inlined)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn is_alpha(c)
+  (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_"
+
+fn is_digit(c)
+  c >= "0" and c <= "9"
+
+fn is_alnum(c)
+  is_alpha(c) or is_digit(c)
+
+fn is_space(c)
+  c == " " or c == "\t"
+
+fn is_keyword(w)
+  kws := ["fn", "async", "return", "if", "elif", "else", "for", "in",
+          "while", "break", "continue", "match", "true", "false", "nil",
+          "and", "or", "not", "comptime", "extern", "unsafe", "spawn",
+          "await", "import", "as", "trait", "impl", "type", "where", "skip",
+          "try", "catch", "throw"]
+  for k in kws
+    if k == w
+      return true
+  false
+
+fn peek_char(chars, i, n)
+  if i < n
+    return chars[i]
+  ""
+
+fn is_two_char_op(c, p)
+  ops := [":=", "=>", "|>", "->", "==", "!=", "<=", ">=", "**", "..", "//", "+=", "-=", "*=", "/="]
+  for op in ops
+    if op == c + p
+      return true
+  false
+
+fn make_tok(kind, val, line, col)
+  t = {}
+  t.set("kind", kind)
+  t.set("val",  val)
+  t.set("line", line)
+  t.set("col",  col)
+  t
+
+fn lex(src)
+  chars        = src.chars()
+  n            = chars.len
+  i            = 0
+  line         = 1
+  col          = 1
+  tokens       = []
+  indent_stack = [0]
+  bracket_depth = 0
+
+  while i < n
+    c = chars[i]
+    p = peek_char(chars, i + 1, n)
+
+    if c == "\n"
+      if bracket_depth == 0
+        tokens.push(make_tok("nl", "", line, col))
+        j      = i + 1
+        spaces = 0
+        while j < n and (chars[j] == " " or chars[j] == "\t")
+          spaces = spaces + 1
+          j      = j + 1
+        nxt      := peek_char(chars, j, n)
+        is_blank := nxt == "\n" or nxt == "\r" or nxt == ""
+        is_cmt   := nxt == "-" and peek_char(chars, j + 1, n) == "-"
+        if not is_blank and not is_cmt
+          top := indent_stack[indent_stack.len - 1]
+          if spaces > top
+            indent_stack.push(spaces)
+            tokens.push(make_tok("indent", "", line + 1, 1))
+          else
+            while spaces < indent_stack[indent_stack.len - 1]
+              indent_stack.pop()
+              tokens.push(make_tok("dedent", "", line + 1, 1))
+      line = line + 1
+      col  = 1
+      i    = i + 1
+
+    else if c == "\r"
+      i = i + 1
+
+    else if c == "-" and p == "-"
+      while i < n and chars[i] != "\n"
+        i   = i + 1
+        col = col + 1
+
+    else if c == "\""
+      i   = i + 1
+      col = col + 1
+      s   = ""
+      start_col := col
+      while i < n and chars[i] != "\""
+        ch := chars[i]
+        if ch == "\\"
+          i   = i + 1
+          col = col + 1
+          esc := peek_char(chars, i, n)
+          if esc == "n"
+            s = s + "\n"
+          else if esc == "t"
+            s = s + "\t"
+          else if esc == "r"
+            s = s + "\r"
+          else
+            s = s + esc
+        else
+          s = s + ch
+        i   = i + 1
+        col = col + 1
+      tokens.push(make_tok("str", s, line, start_col))
+      i   = i + 1
+      col = col + 1
+
+    else if is_digit(c)
+      num       = ""
+      is_f      = false
+      start_col := col
+      while i < n and (is_digit(chars[i]) or (chars[i] == "." and peek_char(chars, i + 1, n) != "."))
+        if chars[i] == "."
+          is_f = true
+        num = num + chars[i]
+        i   = i + 1
+        col = col + 1
+      -- Scientific notation: 1e-8, 2.5e+3, 1E10
+      if i < n and (chars[i] == "e" or chars[i] == "E")
+        is_f = true
+        num  = num + chars[i]
+        i    = i + 1
+        col  = col + 1
+        if i < n and (chars[i] == "+" or chars[i] == "-")
+          num = num + chars[i]
+          i   = i + 1
+          col = col + 1
+        while i < n and is_digit(chars[i])
+          num = num + chars[i]
+          i   = i + 1
+          col = col + 1
+      if is_f
+        tokens.push(make_tok("float", num, line, start_col))
+      else
+        tokens.push(make_tok("int", num, line, start_col))
+
+    else if is_alpha(c)
+      word      = ""
+      start_col := col
+      while i < n and is_alnum(chars[i])
+        word = word + chars[i]
+        i    = i + 1
+        col  = col + 1
+      if word == "true" or word == "false"
+        tokens.push(make_tok("bool", word, line, start_col))
+      else if word == "nil"
+        tokens.push(make_tok("nil", "nil", line, start_col))
+      else if is_keyword(word)
+        tokens.push(make_tok("kw", word, line, start_col))
+      else
+        tokens.push(make_tok("ident", word, line, start_col))
+
+    else if c == "@"
+      i    = i + 1
+      col  = col + 1
+      name = ""
+      while i < n and is_alnum(chars[i])
+        name = name + chars[i]
+        i    = i + 1
+        col  = col + 1
+      tokens.push(make_tok("annot", "@" + name, line, col))
+
+    else if c == "(" or c == "[" or c == "{"
+      bracket_depth = bracket_depth + 1
+      tokens.push(make_tok("op", c, line, col))
+      i   = i + 1
+      col = col + 1
+
+    else if c == ")" or c == "]" or c == "}"
+      bracket_depth = bracket_depth - 1
+      tokens.push(make_tok("op", c, line, col))
+      i   = i + 1
+      col = col + 1
+
+    else if is_space(c)
+      i   = i + 1
+      col = col + 1
+
+    -- ── ... three-char op ─────────────────────────────────────────────
+    else if c == "." and p == "." and peek_char(chars, i + 2, n) == "."
+      tokens.push(make_tok("op", "...", line, col))
+      i   = i + 3
+      col = col + 3
+
+    -- ── ..= three-char op ─────────────────────────────────────────────
+    else if c == "." and p == "." and peek_char(chars, i + 2, n) == "="
+      tokens.push(make_tok("op", "..=", line, col))
+      i   = i + 3
+      col = col + 3
+
+    else if is_two_char_op(c, p)
+      tokens.push(make_tok("op", c + p, line, col))
+      i   = i + 2
+      col = col + 2
+
+    else
+      tokens.push(make_tok("op", c, line, col))
+      i   = i + 1
+      col = col + 1
+
+  while indent_stack.len > 1
+    indent_stack.pop()
+    tokens.push(make_tok("dedent", "", line, col))
+  tokens.push(make_tok("eof", "", line, col))
+  tokens
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- PARSER STATE
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn make_state(tokens)
+  s = {}
+  s.set("tokens", tokens)
+  s.set("pos", 0)
+  s
+
+fn cur_tok(state)
+  tokens := state.get("tokens")
+  pos    := state.get("pos")
+  if pos < tokens.len
+    return tokens[pos]
+  make_tok("eof", "", 0, 0)
+
+fn cur_kind(state)
+  cur_tok(state).get("kind")
+
+fn cur_val(state)
+  cur_tok(state).get("val")
+
+fn cur_line(state)
+  cur_tok(state).get("line")
+
+fn advance(state)
+  pos := state.get("pos")
+  state.set("pos", pos + 1)
+  state
+
+fn nth_tok(state, offset)
+  tokens := state.get("tokens")
+  pos    := state.get("pos")
+  j      = pos + offset
+  if j < tokens.len
+    return tokens[j]
+  make_tok("eof", "", 0, 0)
+
+fn skip_nl(state)
+  while cur_kind(state) == "nl"
+    advance(state)
+  state
+
+fn skip_ws(state)
+  while cur_kind(state) == "nl" or cur_kind(state) == "indent" or cur_kind(state) == "dedent"
+    advance(state)
+  state
+
+fn eat_kw(state, kw)
+  if cur_kind(state) == "kw" and cur_val(state) == kw
+    advance(state)
+    return true
+  false
+
+fn eat_op(state, op)
+  if cur_kind(state) == "op" and cur_val(state) == op
+    advance(state)
+    return true
+  false
+
+fn node(kind)
+  n = {}
+  n.set("kind", kind)
+  n
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- EXPRESSION PARSER
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn parse_expr(state)
+  parse_or_expr(state)
+
+fn parse_or_expr(state)
+  left := parse_and_expr(state)
+  while cur_kind(state) == "kw" and cur_val(state) == "or"
+    advance(state)
+    right := parse_and_expr(state)
+    n = node("binop")
+    n.set("op", "or")
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_and_expr(state)
+  left := parse_not_expr(state)
+  while cur_kind(state) == "kw" and cur_val(state) == "and"
+    advance(state)
+    right := parse_not_expr(state)
+    n = node("binop")
+    n.set("op", "and")
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_not_expr(state)
+  if cur_kind(state) == "kw" and cur_val(state) == "not"
+    advance(state)
+    operand := parse_cmp_expr(state)
+    n = node("unop")
+    n.set("op", "not")
+    n.set("operand", operand)
+    return n
+  parse_cmp_expr(state)
+
+fn parse_cmp_expr(state)
+  left := parse_range_expr(state)
+  while cur_kind(state) == "op" and in_cmp_ops(cur_val(state))
+    op := cur_val(state)
+    advance(state)
+    right := parse_range_expr(state)
+    n = node("binop")
+    n.set("op", op)
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_range_expr(state)
+  left := parse_add_expr(state)
+  if cur_kind(state) == "op" and (cur_val(state) == ".." or cur_val(state) == "..=")
+    op := cur_val(state)
+    advance(state)
+    right := parse_add_expr(state)
+    n = node("range")
+    n.set("op", op)
+    n.set("start", left)
+    n.set("end", right)
+    return n
+  left
+
+fn in_cmp_ops(op)
+  ops := ["==", "!=", "<", ">", "<=", ">="]
+  for o in ops
+    if o == op
+      return true
+  false
+
+fn parse_add_expr(state)
+  left := parse_mul_expr(state)
+  while cur_kind(state) == "op" and (cur_val(state) == "+" or cur_val(state) == "-")
+    op := cur_val(state)
+    advance(state)
+    right := parse_mul_expr(state)
+    n = node("binop")
+    n.set("op", op)
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_mul_expr(state)
+  left := parse_pow_expr(state)
+  while cur_kind(state) == "op" and (cur_val(state) == "*" or cur_val(state) == "/" or cur_val(state) == "%" or cur_val(state) == "//")
+    op := cur_val(state)
+    advance(state)
+    right := parse_pow_expr(state)
+    n = node("binop")
+    n.set("op", op)
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_pow_expr(state)
+  base := parse_unary_expr(state)
+  if cur_kind(state) == "op" and cur_val(state) == "**"
+    advance(state)
+    exp := parse_pow_expr(state)
+    n = node("binop")
+    n.set("op", "**")
+    n.set("left", base)
+    n.set("right", exp)
+    return n
+  base
+
+fn parse_unary_expr(state)
+  if cur_kind(state) == "op" and cur_val(state) == "-"
+    advance(state)
+    operand := parse_postfix_expr(state)
+    n = node("unop")
+    n.set("op", "neg")
+    n.set("operand", operand)
+    return n
+  parse_postfix_expr(state)
+
+fn parse_postfix_expr(state)
+  base    := parse_primary(state)
+  running = base
+  going   = true
+  while going
+    if cur_kind(state) == "op" and cur_val(state) == "."
+      advance(state)
+      field := cur_val(state)
+      advance(state)
+      if cur_kind(state) == "op" and cur_val(state) == "("
+        advance(state)
+        args := parse_arg_list(state)
+        n = node("method_call")
+        n.set("obj", running)
+        n.set("method", field)
+        n.set("args", args)
+        running = n
+      else
+        n = node("field")
+        n.set("obj", running)
+        n.set("field", field)
+        running = n
+    else if cur_kind(state) == "op" and cur_val(state) == "["
+      advance(state)
+      idx := parse_expr(state)
+      eat_op(state, "]")
+      n = node("index")
+      n.set("obj", running)
+      n.set("idx", idx)
+      running = n
+    else if cur_kind(state) == "op" and cur_val(state) == "|>"
+      advance(state)
+      fn_expr := parse_pipe_fn(state)
+      if cur_kind(state) == "op" and cur_val(state) == "("
+        advance(state)
+        args := parse_arg_list(state)
+        n = node("pipe_call")
+        n.set("val", running)
+        n.set("fn", fn_expr)
+        n.set("args", args)
+        running = n
+      else
+        n = node("pipe")
+        n.set("val", running)
+        n.set("fn", fn_expr)
+        running = n
+    -- ── multiline pipe continuation: nl |> or nl indent |> ──────────
+    else if cur_kind(state) == "nl"
+      t1 := nth_tok(state, 1)
+      t2 := nth_tok(state, 2)
+      if t1.get("kind") == "op" and t1.get("val") == "|>"
+        advance(state)  -- consume nl; loop sees |> next
+      else if t1.get("kind") == "indent" and t2.get("kind") == "op" and t2.get("val") == "|>"
+        advance(state)  -- consume nl
+        advance(state)  -- consume indent
+        -- loop continues; will see |> next
+      else
+        going = false
+    else
+      going = false
+  running
+
+-- Parse the function in a |> expression: only consume the ident, not a following (
+-- so that parse_postfix_expr can decide between pipe vs pipe_call.
+fn parse_pipe_fn(state)
+  k := cur_kind(state)
+  v := cur_val(state)
+  if k == "ident"
+    advance(state)
+    n = node("ident")
+    n.set("name", v)
+    return n
+  -- For fn literals, parenthesized exprs, etc: use parse_primary
+  parse_primary(state)
+
+fn parse_arg_list(state)
+  args = []
+  if cur_kind(state) == "op" and cur_val(state) == ")"
+    advance(state)
+    return args
+  first := parse_expr(state)
+  -- Named kwarg: `name = value` — skip name, use value
+  if first.get("kind") == "ident" and cur_kind(state) == "op" and cur_val(state) == "="
+    advance(state)
+    first = parse_expr(state)
+  args.push(first)
+  while cur_kind(state) == "op" and cur_val(state) == ","
+    advance(state)
+    skip_nl(state)
+    if cur_kind(state) == "op" and cur_val(state) == ")"
+      break
+    arg := parse_expr(state)
+    -- Named kwarg
+    if arg.get("kind") == "ident" and cur_kind(state) == "op" and cur_val(state) == "="
+      advance(state)
+      arg = parse_expr(state)
+    args.push(arg)
+  eat_op(state, ")")
+  args
+
+fn parse_primary(state)
+  k := cur_kind(state)
+  v := cur_val(state)
+
+  if k == "int"
+    advance(state)
+    n = node("int")
+    n.set("val", v)
+    return n
+
+  if k == "float"
+    advance(state)
+    n = node("float")
+    n.set("val", v)
+    return n
+
+  if k == "str"
+    advance(state)
+    n = node("str")
+    n.set("val", v)
+    return n
+
+  if k == "bool"
+    advance(state)
+    n = node("bool")
+    n.set("val", v)
+    return n
+
+  if k == "nil"
+    advance(state)
+    return node("nil")
+
+  if k == "op" and v == "["
+    advance(state)
+    items = []
+    skip_nl(state)
+    while not (cur_kind(state) == "op" and cur_val(state) == "]")
+      items.push(parse_expr(state))
+      skip_nl(state)
+      if cur_kind(state) == "op" and cur_val(state) == ","
+        advance(state)
+        skip_nl(state)
+    eat_op(state, "]")
+    n = node("list")
+    n.set("items", items)
+    return n
+
+  if k == "op" and v == "{"
+    advance(state)
+    pairs = []
+    skip_nl(state)
+    while not (cur_kind(state) == "op" and cur_val(state) == "}")
+      key := parse_expr(state)
+      eat_op(state, ":")
+      val := parse_expr(state)
+      skip_nl(state)
+      if cur_kind(state) == "op" and cur_val(state) == ","
+        advance(state)
+        skip_nl(state)
+      p = []
+      p.push(key)
+      p.push(val)
+      pairs.push(p)
+    eat_op(state, "}")
+    n = node("map")
+    n.set("pairs", pairs)
+    return n
+
+  if k == "op" and v == "("
+    advance(state)
+    inner := parse_expr(state)
+    -- Tuple pattern: (a, b, ...) — collect all elements
+    if cur_kind(state) == "op" and cur_val(state) == ","
+      tuple_names = []
+      if inner.get("kind") == "ident"
+        tuple_names.push(inner.get("name"))
+      while cur_kind(state) == "op" and cur_val(state) == ","
+        advance(state)
+        elem := parse_expr(state)
+        if elem.get("kind") == "ident"
+          tuple_names.push(elem.get("name"))
+      eat_op(state, ")")
+      tn := node("tuple_expr")
+      tn.set("vars", tuple_names)
+      return tn
+    eat_op(state, ")")
+    return inner
+
+  if k == "kw" and v == "fn"
+    advance(state)
+    if cur_kind(state) == "op" and cur_val(state) == "("
+      advance(state)
+      params := parse_param_list(state)
+      if cur_kind(state) == "op" and cur_val(state) == "=>"
+        advance(state)
+        body := parse_expr(state)
+        n = node("lambda")
+        n.set("params", params)
+        n.set("body", body)
+        return n
+      -- Block-body lambda: fn(params)\n  block
+      skip_nl(state)
+      body := parse_block(state)
+      n = node("lambda")
+      n.set("params", params)
+      n.set("body", body)
+      return n
+
+  -- Allow keywords used as function calls: where(cond, a, b), etc.
+  callable_kws := ["where", "type", "skip", "comptime"]
+  if k == "kw" and (v == "where" or v == "type" or v == "comptime" or v == "skip")
+    name := v
+    advance(state)  -- consume keyword
+    if cur_kind(state) == "op" and cur_val(state) == "("
+      advance(state)  -- consume "("
+      args := parse_arg_list(state)
+      n = node("call")
+      n.set("fn", name)
+      n.set("args", args)
+      return n
+    -- Not a call — unknown keyword expression → nil
+    n2 := node("nil")
+    return n2
+
+  if k == "ident"
+    name := v
+    advance(state)
+    if cur_kind(state) == "op" and cur_val(state) == "("
+      advance(state)
+      args := parse_arg_list(state)
+      n = node("call")
+      n.set("fn", name)
+      n.set("args", args)
+      return n
+    -- Type constructor: TypeName { field: val, ..base, ... } → map literal
+    if cur_kind(state) == "op" and cur_val(state) == "{"
+      advance(state)  -- consume '{'
+      pairs = []
+      skip_nl(state)
+      while not (cur_kind(state) == "op" and cur_val(state) == "}")
+        -- Spread: ..base
+        if cur_kind(state) == "op" and cur_val(state) == ".."
+          advance(state)  -- consume '..'
+          base_expr := parse_expr(state)
+          sp = node("spread")
+          p = []
+          p.push(sp)
+          p.push(base_expr)
+          pairs.push(p)
+        else
+          field_name := cur_val(state)
+          advance(state)  -- consume field name
+          eat_op(state, ":")
+          fval := parse_expr(state)
+          p = []
+          sk = node("str")
+          sk.set("val", field_name)
+          p.push(sk)
+          p.push(fval)
+          pairs.push(p)
+        skip_nl(state)
+        if cur_kind(state) == "op" and cur_val(state) == ","
+          advance(state)
+          skip_nl(state)
+      eat_op(state, "}")
+      n = node("map")
+      n.set("pairs", pairs)
+      return n
+    n = node("ident")
+    n.set("name", name)
+    return n
+
+  if k == "kw" and v == "if"
+    return parse_if_expr(state)
+
+  -- spawn(fn, arg) as an expression (e.g. f1 := spawn(fn, arg))
+  if k == "kw" and v == "spawn"
+    advance(state)
+    eat_op(state, "(")
+    args := parse_arg_list(state)
+    n = node("spawn_call")
+    n.set("args", args)
+    return n
+
+  n = node("unknown")
+  n.set("kind_raw", k)
+  n.set("val_raw", v)
+  advance(state)
+  n
+
+fn parse_if_expr(state)
+  eat_kw(state, "if")
+  cond := parse_expr(state)
+  n = node("if_expr")
+  n.set("cond", cond)
+  if cur_kind(state) == "op" and cur_val(state) == "=>"
+    advance(state)
+    body := parse_expr(state)
+    n.set("then", body)
+  else
+    body := parse_block_or_expr(state)
+    n.set("then", body)
+  try_parse_else_chain(state, n)
+  n
+
+fn parse_block_or_expr(state)
+  if cur_kind(state) == "nl"
+    advance(state)
+    if cur_kind(state) == "indent"
+      return parse_block(state)
+  parse_expr(state)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- STATEMENT PARSER
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn parse_param_list(state)
+  params = []
+  if cur_kind(state) == "op" and cur_val(state) == ")"
+    advance(state)
+    return params
+  params.push(cur_val(state))
+  advance(state)
+  -- skip optional type annotation: `: TypeName`
+  if cur_kind(state) == "op" and cur_val(state) == ":"
+    advance(state)  -- skip ':'
+    advance(state)  -- skip type name
+  while cur_kind(state) == "op" and cur_val(state) == ","
+    advance(state)
+    params.push(cur_val(state))
+    advance(state)
+    -- skip optional type annotation: `: TypeName`
+    if cur_kind(state) == "op" and cur_val(state) == ":"
+      advance(state)  -- skip ':'
+      advance(state)  -- skip type name
+  eat_op(state, ")")
+  params
+
+fn parse_block(state)
+  stmts     = []
+  got_indent = false
+  if cur_kind(state) == "indent"
+    advance(state)
+    got_indent = true
+  if got_indent
+    while cur_kind(state) != "dedent" and cur_kind(state) != "eof"
+      if cur_kind(state) == "nl"
+        advance(state)
+        continue
+      s := parse_stmt_tagged(state)
+      stmts.push(s)
+    if cur_kind(state) == "dedent"
+      advance(state)
+  else
+    if cur_kind(state) != "nl" and cur_kind(state) != "dedent" and cur_kind(state) != "eof"
+      s := parse_stmt_tagged(state)
+      stmts.push(s)
+  n = node("block")
+  n.set("stmts", stmts)
+  n
+
+fn try_parse_else_chain(state, n)
+  skip_nl(state)
+  consumed_indent = false
+  if cur_kind(state) == "indent"
+    saved := state.get("pos")
+    advance(state)
+    if cur_kind(state) == "kw" and (cur_val(state) == "else" or cur_val(state) == "elif")
+      consumed_indent = true
+    else
+      state.set("pos", saved)
+  elifs = []
+  going2 = true
+  while going2
+    is_elif = cur_kind(state) == "kw" and cur_val(state) == "elif"
+    is_else_if = cur_kind(state) == "kw" and cur_val(state) == "else" and nth_tok(state, 1).get("kind") == "kw" and nth_tok(state, 1).get("val") == "if"
+    if is_elif
+      advance(state)
+    else if is_else_if
+      advance(state)  -- consume 'else'
+      advance(state)  -- consume 'if'
+    else
+      going2 = false
+    if going2
+      ec := parse_expr(state)
+      eb = node("block")
+      if cur_kind(state) == "op" and cur_val(state) == "=>"
+        advance(state)
+        single := parse_stmt(state)
+        tmp = [single]
+        eb.set("stmts", tmp)
+      else
+        skip_nl(state)
+        eb = parse_block(state)
+      elif_n = node("elif")
+      elif_n.set("cond", ec)
+      elif_n.set("body", eb)
+      elifs.push(elif_n)
+      skip_nl(state)
+  n.set("elifs", elifs)
+  if cur_kind(state) == "kw" and cur_val(state) == "else"
+    advance(state)
+    else_b = node("block")
+    if cur_kind(state) == "op" and cur_val(state) == "=>"
+      advance(state)
+      single := parse_stmt(state)
+      tmp = [single]
+      else_b.set("stmts", tmp)
+    else
+      skip_nl(state)
+      else_b = parse_block(state)
+    n.set("else", else_b)
+  if consumed_indent
+    skip_nl(state)
+    if cur_kind(state) == "dedent"
+      advance(state)
+
+-- ── M14.1: C FFI — extern fn parser ─────────────────────────────────────────
+
+-- Parse a type string: i32, f64, str, *void, *char, usize, bool, void, ...
+fn parse_type_str(state)
+  if cur_kind(state) == "op" and cur_val(state) == "*"
+    advance(state)
+    inner := cur_val(state)
+    advance(state)
+    return "*" + inner
+  if cur_kind(state) == "op" and cur_val(state) == "..."
+    advance(state)
+    return "..."
+  t := cur_val(state)
+  advance(state)
+  t
+
+-- Parse typed parameter list: (name: type, name: type, ..., ...)
+-- Returns list of [name, type_str] pairs; [...] marks variadic.
+fn parse_typed_param_list(state)
+  eat_op(state, "(")
+  params = []
+  if cur_kind(state) == "op" and cur_val(state) == ")"
+    advance(state)
+    return params
+  while true
+    if cur_kind(state) == "op" and cur_val(state) == "..."
+      advance(state)
+      p = ["...", "..."]
+      params.push(p)
+      break
+    pname := cur_val(state)
+    advance(state)
+    ptype = "NvVal"
+    if cur_kind(state) == "op" and cur_val(state) == ":"
+      advance(state)
+      ptype = parse_type_str(state)
+    p = [pname, ptype]
+    params.push(p)
+    if cur_kind(state) == "op" and cur_val(state) == ","
+      advance(state)
+      if cur_kind(state) == "op" and cur_val(state) == "..."
+        advance(state)
+        p2 = ["...", "..."]
+        params.push(p2)
+        break
+    else
+      break
+  eat_op(state, ")")
+  params
+
+-- Parse `extern fn name(typed params) -> RetType`
+fn parse_extern_fn(state)
+  eat_kw(state, "fn")
+  name := cur_val(state)
+  advance(state)
+  params := parse_typed_param_list(state)
+  ret_type = "void"
+  if cur_kind(state) == "op" and cur_val(state) == "->"
+    advance(state)
+    ret_type = parse_type_str(state)
+  skip_nl(state)
+  n = node("extern_fn_decl")
+  n.set("name",     name)
+  n.set("params",   params)
+  n.set("ret_type", ret_type)
+  n
+
+-- ── End M14.1 parser additions ───────────────────────────────────────────────
+
+fn parse_fn_def(state)
+  is_async = false
+  if cur_kind(state) == "kw" and cur_val(state) == "async"
+    is_async = true
+    advance(state)
+  eat_kw(state, "fn")
+  name := cur_val(state)
+  advance(state)
+  eat_op(state, "(")
+  params := parse_param_list(state)
+  -- skip optional return type annotation: `-> TypeName`
+  if cur_kind(state) == "op" and cur_val(state) == "->"
+    advance(state)  -- skip '->'
+    advance(state)  -- skip return type name
+  if cur_kind(state) == "op" and cur_val(state) == "=>"
+    advance(state)
+    body := parse_expr(state)
+    skip_nl(state)
+    n = node("fn_def")
+    n.set("name", name)
+    n.set("params", params)
+    n.set("body", body)
+    n.set("async", is_async)
+    return n
+  skip_nl(state)
+  body := parse_block(state)
+  n = node("fn_def")
+  n.set("name", name)
+  n.set("params", params)
+  n.set("body", body)
+  n.set("async", is_async)
+  n
+
+-- Wrapper that captures the source line and attaches it to every stmt node
+fn parse_stmt_tagged(state)
+  line := cur_line(state)
+  n    := parse_stmt(state)
+  if n != nil
+    n.set("line", line)
+  n
+
+fn parse_stmt(state)
+  k := cur_kind(state)
+  v := cur_val(state)
+
+  -- @cinclude("header.h")  — emit a #include directive in the generated C
+  if k == "annot" and v == "@cinclude"
+    advance(state)
+    eat_op(state, "(")
+    hdr := cur_val(state)
+    advance(state)
+    eat_op(state, ")")
+    skip_nl(state)
+    n = node("cinclude")
+    n.set("header", hdr)
+    return n
+
+  -- import "path.nvl"  OR  import "path.nvl" as ns
+  if k == "kw" and v == "import"
+    advance(state)
+    path_str := cur_val(state)
+    advance(state)
+    -- optional: as <alias>
+    alias = nil
+    if cur_kind(state) == "kw" and cur_val(state) == "as"
+      advance(state)
+      alias = cur_val(state)
+      advance(state)
+    skip_nl(state)
+    n = node("import_stmt")
+    n.set("path", path_str)
+    n.set("alias", alias)
+    return n
+
+  -- extern fn name(params: Types) -> RetType
+  if k == "kw" and v == "extern"
+    advance(state)
+    return parse_extern_fn(state)
+
+  if (k == "kw" and v == "fn") or (k == "kw" and v == "async")
+    -- fn(params) => expr is a lambda expression, not a fn_def
+    t_next := nth_tok(state, 1)
+    is_lambda_stmt = v == "fn" and t_next.get("kind") == "op" and t_next.get("val") == "("
+    if not is_lambda_stmt
+      return parse_fn_def(state)
+    -- Fall through to expression statement parsing for lambda
+
+  if k == "kw" and v == "return"
+    advance(state)
+    if cur_kind(state) == "nl" or cur_kind(state) == "eof"
+      n = node("return")
+      n.set("val", node("nil"))
+      return n
+    val := parse_expr(state)
+    skip_nl(state)
+    n = node("return")
+    n.set("val", val)
+    return n
+
+  if k == "kw" and v == "if"
+    advance(state)
+    cond := parse_expr(state)
+    then_b = node("block")
+    if cur_kind(state) == "op" and cur_val(state) == "=>"
+      advance(state)
+      single := parse_stmt(state)
+      tmp_stmts = [single]
+      then_b.set("stmts", tmp_stmts)
+    else
+      skip_nl(state)
+      then_b = parse_block(state)
+    n = node("if")
+    n.set("cond", cond)
+    n.set("then", then_b)
+    try_parse_else_chain(state, n)
+    return n
+
+  if k == "kw" and v == "for"
+    advance(state)
+    -- Tuple destructuring: for (a, b) in
+    if cur_kind(state) == "op" and cur_val(state) == "("
+      advance(state)  -- consume '('
+      tuple_vars = []
+      while not (cur_kind(state) == "op" and cur_val(state) == ")")
+        tuple_vars.push(cur_val(state))
+        advance(state)
+        if cur_kind(state) == "op" and cur_val(state) == ","
+          advance(state)
+      eat_op(state, ")")
+      eat_kw(state, "in")
+      iter := parse_expr(state)
+      skip_nl(state)
+      body := parse_block(state)
+      n = node("for")
+      n.set("vars", tuple_vars)
+      n.set("iter", iter)
+      n.set("body", body)
+      return n
+    var := cur_val(state)
+    advance(state)
+    eat_kw(state, "in")
+    iter := parse_expr(state)
+    skip_nl(state)
+    body := parse_block(state)
+    n = node("for")
+    n.set("var", var)
+    n.set("iter", iter)
+    n.set("body", body)
+    return n
+
+  if k == "kw" and v == "while"
+    advance(state)
+    cond := parse_expr(state)
+    skip_nl(state)
+    body := parse_block(state)
+    n = node("while")
+    n.set("cond", cond)
+    n.set("body", body)
+    return n
+
+  if k == "kw" and v == "match"
+    advance(state)
+    subject := parse_expr(state)
+    skip_nl(state)
+    if cur_kind(state) == "indent"
+      advance(state)
+    arms = []
+    while cur_kind(state) != "dedent" and cur_kind(state) != "eof"
+      if cur_kind(state) == "nl"
+        advance(state)
+        continue
+      -- Parse pattern: handle `|`-separated alternatives
+      pat = parse_expr(state)
+      if cur_kind(state) == "op" and cur_val(state) == "|"
+        -- OR pattern: collect all alternatives
+        pats = []
+        pats.push(pat)
+        while cur_kind(state) == "op" and cur_val(state) == "|"
+          advance(state)  -- consume '|'
+          pats.push(parse_expr(state))
+        pat = node("or_pat")
+        pat.set("pats", pats)
+      -- Optional guard: `x if x > 0 => body`
+      guard_node = nil
+      if cur_kind(state) == "kw" and cur_val(state) == "if"
+        advance(state)
+        guard_node = parse_expr(state)
+      eat_op(state, "=>")
+      arm_body := parse_expr(state)
+      skip_nl(state)
+      arm = node("arm")
+      arm.set("pat", pat)
+      arm.set("guard", guard_node)
+      arm.set("body", arm_body)
+      arms.push(arm)
+    if cur_kind(state) == "dedent"
+      advance(state)
+    n = node("match")
+    n.set("subject", subject)
+    n.set("arms", arms)
+    return n
+
+  if k == "kw" and v == "break"
+    advance(state)
+    skip_nl(state)
+    return node("break")
+
+  if k == "kw" and v == "continue"
+    advance(state)
+    skip_nl(state)
+    return node("continue")
+
+  -- trait declarations: skip entirely
+  if k == "kw" and v == "trait"
+    advance(state)
+    advance(state)  -- skip name
+    skip_nl(state)
+    if cur_kind(state) == "indent"
+      advance(state)
+      depth_count = 1
+      while depth_count > 0 and cur_kind(state) != "eof"
+        ck := cur_kind(state)
+        if ck == "indent"
+          depth_count = depth_count + 1
+        else if ck == "dedent"
+          depth_count = depth_count - 1
+        advance(state)
+    skip_nl(state)
+    n = node("skip")
+    return n
+
+  -- type declarations: parse and detect enum vs struct
+  if k == "kw" and v == "type"
+    advance(state)
+    type_name := cur_val(state)
+    advance(state)  -- consume type name
+    skip_nl(state)
+    variants = []
+    is_enum = false
+    if cur_kind(state) == "indent"
+      advance(state)
+      while cur_kind(state) != "dedent" and cur_kind(state) != "eof"
+        if cur_kind(state) == "nl"
+          advance(state)
+          continue
+        mem_name := cur_val(state)
+        mem_kind := cur_kind(state)
+        advance(state)
+        -- Uppercase first char and not a colon next → enum variant
+        first_c := mem_name[0]
+        is_upper = first_c >= "A" and first_c <= "Z"
+        if is_upper and not (cur_kind(state) == "op" and cur_val(state) == ":")
+          -- Enum variant: may have (field_types)
+          n_fields = 0
+          if cur_kind(state) == "op" and cur_val(state) == "("
+            advance(state)  -- consume '('
+            while not (cur_kind(state) == "op" and cur_val(state) == ")")
+              advance(state)  -- skip type tokens
+              n_fields = n_fields + 1
+              if cur_kind(state) == "op" and cur_val(state) == ","
+                advance(state)
+            advance(state)  -- consume ')'
+          vr = {}
+          vr.set("name", mem_name)
+          vr.set("n_fields", n_fields)
+          variants.push(vr)
+          is_enum = true
+        else
+          -- Struct field — skip to end of line
+          while cur_kind(state) != "nl" and cur_kind(state) != "dedent" and cur_kind(state) != "eof"
+            advance(state)
+        skip_nl(state)
+      if cur_kind(state) == "dedent"
+        advance(state)
+    skip_nl(state)
+    n = node("type_decl")
+    n.set("name", type_name)
+    n.set("is_enum", is_enum)
+    n.set("variants", variants)
+    return n
+
+  -- impl Name for Name — parse method fns and generate impl_for registrations
+  if k == "kw" and v == "impl"
+    advance(state)
+    type_name := cur_val(state)
+    advance(state)  -- skip type name
+    -- skip optional "for TypeName"
+    if cur_kind(state) == "kw" and cur_val(state) == "for"
+      advance(state)
+      advance(state)  -- skip second type name
+    skip_nl(state)
+    methods = []
+    if cur_kind(state) == "indent"
+      advance(state)
+      while cur_kind(state) != "dedent" and cur_kind(state) != "eof"
+        if cur_kind(state) == "nl"
+          advance(state)
+          continue
+        s := parse_stmt(state)
+        methods.push(s)
+      if cur_kind(state) == "dedent"
+        advance(state)
+    skip_nl(state)
+    n = node("impl_block")
+    n.set("type_name", type_name)
+    n.set("methods", methods)
+    return n
+
+  -- unsafe block: transparent — just emit the body
+  if k == "kw" and v == "unsafe"
+    advance(state)
+    skip_nl(state)
+    body := parse_block(state)
+    n = node("unsafe_block")
+    n.set("body", body)
+    return n
+
+  -- throw expr — raise an exception
+  if k == "kw" and v == "throw"
+    advance(state)
+    val := parse_expr(state)
+    skip_nl(state)
+    n = node("throw_stmt")
+    n.set("val", val)
+    return n
+
+  -- try BLOCK catch name BLOCK
+  if k == "kw" and v == "try"
+    advance(state)
+    skip_nl(state)
+    try_body := parse_block(state)
+    catch_var = "e"
+    catch_body = node("block")
+    catch_body.set("stmts", [])
+    if cur_kind(state) == "kw" and cur_val(state) == "catch"
+      advance(state)
+      -- optional catch variable name
+      if cur_kind(state) == "ident"
+        catch_var = cur_val(state)
+        advance(state)
+      skip_nl(state)
+      catch_body = parse_block(state)
+    n = node("try_catch")
+    n.set("try_body", try_body)
+    n.set("catch_var", catch_var)
+    n.set("catch_body", catch_body)
+    return n
+
+  -- spawn(fn, arg) — keyword used as function call
+  if k == "kw" and v == "spawn"
+    advance(state)
+    eat_op(state, "(")
+    args := parse_arg_list(state)
+    n = node("spawn_call")
+    n.set("args", args)
+    return n
+
+  if k == "kw" and v == "comptime"
+    advance(state)
+    name := cur_val(state)
+    advance(state)
+    eat_op(state, ":=")
+    val := parse_expr(state)
+    skip_nl(state)
+    n = node("comptime")
+    n.set("name", name)
+    n.set("val", val)
+    return n
+
+  expr := parse_expr(state)
+
+  if cur_kind(state) == "op" and cur_val(state) == ":="
+    advance(state)
+    rhs := parse_expr(state)
+    skip_nl(state)
+    -- Tuple destructuring: (a, b) := expr
+    if expr.get("kind") == "tuple_expr"
+      n = node("multi_let")
+      n.set("vars", expr.get("vars"))
+      n.set("val", rhs)
+      return n
+    n = node("let")
+    n.set("name", ast_name(expr))
+    n.set("val", rhs)
+    return n
+
+  if cur_kind(state) == "op" and cur_val(state) == "="
+    advance(state)
+    rhs := parse_expr(state)
+    skip_nl(state)
+    n = node("assign")
+    n.set("target", expr)
+    n.set("val", rhs)
+    return n
+
+  if cur_kind(state) == "op" and is_compound_assign(cur_val(state))
+    op := cur_val(state)
+    advance(state)
+    rhs := parse_expr(state)
+    skip_nl(state)
+    n = node("compound_assign")
+    n.set("target", expr)
+    n.set("op", op)
+    n.set("val", rhs)
+    return n
+
+  skip_nl(state)
+  n = node("expr_stmt")
+  n.set("expr", expr)
+  n
+
+fn is_compound_assign(op)
+  ops := ["+=", "-=", "*=", "/="]
+  for o in ops
+    if o == op
+      return true
+  false
+
+fn ast_name(expr)
+  if expr.get("kind") == "ident"
+    return expr.get("name")
+  "?"
+
+fn parse_program(state)
+  stmts = []
+  skip_ws(state)
+  while cur_kind(state) != "eof"
+    if cur_kind(state) == "nl" or cur_kind(state) == "indent" or cur_kind(state) == "dedent"
+      advance(state)
+      continue
+    s := parse_stmt_tagged(state)
+    stmts.push(s)
+    skip_ws(state)
+  stmts
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- CODEGEN UTILITIES
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn escape_c(s)
+  result = ""
+  chars  := s.chars()
+  i = 0
+  while i < chars.len
+    c := chars[i]
+    if c == "\""
+      result = result + "\\\""
+    else if c == "\\"
+      result = result + "\\\\"
+    else if c == "\n"
+      result = result + "\\n"
+    else if c == "\t"
+      result = result + "\\t"
+    else if c == "\r"
+      result = result + "\\r"
+    else
+      result = result + c
+    i = i + 1
+  result
+
+-- Split a string on {expr} interpolations.
+-- Returns a list of maps: {kind:"lit", val:str} or {kind:"expr", src:str, fmt:str|nil}
+fn split_interp(s)
+  parts  = []
+  chars  := s.chars()
+  n      := chars.len
+  i      = 0
+  lit    = ""
+  while i < n
+    c := chars[i]
+    -- {{ → literal {  (escape sequence, not interpolation)
+    if c == "{" and i + 1 < n and chars[i + 1] == "{"
+      lit = lit + "{"
+      i   = i + 2
+      continue
+    -- }} → literal }
+    if c == "}" and i + 1 < n and chars[i + 1] == "}"
+      lit = lit + "}"
+      i   = i + 2
+      continue
+    if c == "{"
+      j     = i + 1
+      src   = ""
+      fmt   = nil
+      depth = 1
+      closed = false
+      while j < n
+        ch := chars[j]
+        if ch == "{"
+          depth = depth + 1
+          src   = src + ch
+        else if ch == "}"
+          depth = depth - 1
+          if depth == 0
+            closed = true
+            j = j + 1
+            break
+          src = src + ch
+        else if ch == ":" and depth == 1
+          fmt = ""
+          j   = j + 1
+          while j < n and chars[j] != "}"
+            fmt = fmt + chars[j]
+            j   = j + 1
+          if j < n
+            j = j + 1
+          closed = true
+          break
+        else
+          src = src + ch
+        j = j + 1
+      if closed and src != ""
+        if lit != ""
+          p = {}
+          p.set("kind", "lit")
+          p.set("val", lit)
+          parts.push(p)
+          lit = ""
+        p = {}
+        p.set("kind", "expr")
+        p.set("src", src)
+        if fmt != nil
+          p.set("fmt", fmt)
+        parts.push(p)
+        i = j
+      else
+        lit = lit + c
+        i   = i + 1
+    else
+      lit = lit + c
+      i   = i + 1
+  if lit != ""
+    p = {}
+    p.set("kind", "lit")
+    p.set("val", lit)
+    parts.push(p)
+  parts
+
+-- Wrap a C expression as NvVal if it is a raw function pointer (not already NvVal).
+-- Enum constructors are stored in scope as "nv_fn_Type_Variant" (C fn pointers);
+-- they must be wrapped in nv_fn((NvFn)...) when used as a map value.
+fn cg_wrap_as_val(cv)
+  if cv.len >= 6
+    prefix := cv[0] + cv[1] + cv[2] + cv[3] + cv[4] + cv[5]
+    if prefix == "nv_fn_"
+      return "nv_fn((NvFn)" + cv + ")"
+  cv
+
+fn join_strs(strs, sep)
+  result = ""
+  i = 0
+  while i < strs.len
+    if i > 0
+      result = result + sep
+    result = result + strs[i]
+    i = i + 1
+  result
+
+fn ind(depth)
+  s = ""
+  i = 0
+  while i < depth
+    s = s + "    "
+    i = i + 1
+  s
+
+fn is_builtin_fn(name)
+  builtins := ["print", "eprint", "str", "assert", "len", "int", "float", "abs",
+               "sqrt", "map", "filter", "sum", "min", "max", "range",
+               "sorted", "reversed", "read_file", "write_file", "args",
+               "chr", "ord", "type", "path_dirname", "path_join",
+               "gpu_init", "gpu_free_mib", "gpu_rows", "gpu_cols",
+               "gpu_upload", "gpu_download", "gpu_free",
+               "gpu_matmul", "gpu_matmul_T", "gpu_silu", "gpu_hadamard",
+               "gpu_add", "gpu_scale", "gpu_softmax", "gpu_causal_mask",
+               "gpu_rms_norm", "gpu_rope", "gpu_rope_ex", "gpu_slice_cols",
+               "gpu_concat_rows", "gpu_concat_cols", "gpu_last_row",
+               "gpu_get_row", "gpu_logits", "gpu_embed",
+               "gpu_upload_f16", "gpu_load_weights_bin", "gpu_mat_dtype"]
+  for b in builtins
+    if b == name
+      return true
+  false
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- CODEGEN STATE
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn cg_new()
+  cg = {}
+  cg.set("buf_decls",        [])   -- #include + forward decls
+  cg.set("buf_fns",          [])   -- lambda + user fn bodies
+  cg.set("buf_main",         [])   -- main() body
+  cg.set("counter",          0)    -- unique name counter
+  cg.set("scopes",           [{}]) -- scope stack: name → c_name
+  cg.set("fn_defs",          [])   -- list of fn_def AST nodes (top-level)
+  cg.set("pending_lambdas",  [])   -- lambdas queued for body emission
+  cg.set("lambda_counter",   0)    -- lambda ID counter
+  cg.set("extern_fns",       {})   -- name → {params, ret_type, variadic} for C FFI
+  cg.set("cincludes",        [])   -- list of C header strings from @cinclude
+  cg.set("src_file",         "")   -- source filename for #line directives
+  cg.set("arity_map",        {})   -- name → param_count for arity checking
+  cg.set("namespaces",       {})   -- alias → [{name, kind, val_expr}] for NS imports
+  cg.set("enum_types",       {})   -- type_name → [{name, n_fields}] for enum variants
+  cg
+
+fn cg_fresh(cg)
+  n := cg.get("counter")
+  cg.set("counter", n + 1)
+  "_v" + str(n)
+
+fn cg_scope_push(cg)
+  scopes := cg.get("scopes")
+  scopes.push({})
+
+fn cg_scope_pop(cg)
+  scopes := cg.get("scopes")
+  scopes.pop()
+
+-- Register a module-level variable as a C global with stable name g_NAME.
+-- Emits "NvVal g_NAME = nv_nil();" into buf_decls so functions can see it.
+fn cg_define_global(cg, name)
+  safe = ""
+  i = 0
+  while i < name.len
+    ch := name[i]
+    ok := (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or (ch >= "0" and ch <= "9") or ch == "_"
+    if ok
+      safe = safe + ch
+    else
+      safe = safe + "_"
+    i = i + 1
+  g_name := "g_" + safe
+  scopes := cg.get("scopes")
+  scopes[0].set(name, g_name)
+  emit_d(cg, "NvVal " + g_name + ";")
+  g_name
+
+-- Pre-scan top-level non-fn stmts and register all module-level names as C globals.
+-- Call AFTER #include emit but BEFORE function body emission.
+fn cg_scan_globals(cg, stmts)
+  for s in stmts
+    k := s.get("kind")
+    if k == "multi_let"
+      vars := s.get("vars")
+      for vname in vars
+        if cg_lookup(cg, vname) == nil
+          cg_define_global(cg, vname)
+    else
+      name = nil
+      if k == "let"
+        name = s.get("name")
+      else if k == "comptime"
+        name = s.get("name")
+      else if k == "assign"
+        target := s.get("target")
+        if target != nil
+          if target.get("kind") == "ident"
+            nm := target.get("name")
+            if cg_lookup(cg, nm) == nil
+              name = nm
+      if name != nil
+        if cg_lookup(cg, name) == nil
+          cg_define_global(cg, name)
+
+fn cg_define(cg, name)
+  c_name := cg_fresh(cg)
+  scopes := cg.get("scopes")
+  top    := scopes[scopes.len - 1]
+  top.set(name, c_name)
+  c_name
+
+fn cg_lookup(cg, name)
+  scopes := cg.get("scopes")
+  i = scopes.len - 1
+  while i >= 0
+    s     := scopes[i]
+    found := s.get(name)
+    if found != nil
+      return found
+    i = i - 1
+  nil
+
+-- Like cg_lookup but only searches inner scopes (index >= 1), not globals (index 0).
+-- Used to check if a name has been declared locally in the current function.
+fn cg_lookup_local(cg, name)
+  scopes := cg.get("scopes")
+  i = scopes.len - 1
+  while i >= 1
+    s     := scopes[i]
+    found := s.get(name)
+    if found != nil
+      return found
+    i = i - 1
+  nil
+
+fn emit_d(cg, line)
+  cg.get("buf_decls").push(line)
+
+fn emit_f(cg, line)
+  cg.get("buf_fns").push(line)
+
+fn emit_m(cg, line)
+  cg.get("buf_main").push(line)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- LAMBDA MANAGEMENT
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Collect all current scope variables as a list of [nuvola_name, c_name] pairs.
+-- This is used for closure capture.
+fn collect_scope_bindings(cg)
+  scopes   := cg.get("scopes")
+  bindings = []
+  i = 0
+  while i < scopes.len
+    s := scopes[i]
+    for entry in s.entries()
+      nm := entry[0]
+      cv := entry[1]
+      if nm != "__boundary__"
+        pair = []
+        pair.push(nm)
+        pair.push(cv)
+        bindings.push(pair)
+    i = i + 1
+  bindings
+
+-- Register a lambda, assign it an ID (if not already assigned), queue its body.
+-- Returns the C function name for this lambda.
+fn cg_lambda_ref(cg, lam)
+  existing := lam.get("lambda_id")
+  if existing != nil
+    return "nv_fn__lam_" + str(existing)
+  -- Assign new ID
+  id := cg.get("lambda_counter")
+  cg.set("lambda_counter", id + 1)
+  lam.set("lambda_id", id)
+  -- Snapshot current scope bindings for closure capture
+  lam.set("captured", collect_scope_bindings(cg))
+  -- Emit forward declaration
+  params := lam.get("params")
+  sig    = "NvVal nv_fn__lam_" + str(id) + "("
+  i = 0
+  while i < params.len
+    if i > 0
+      sig = sig + ", "
+    sig = sig + "NvVal _p" + str(i)
+    i = i + 1
+  if params.len > 0
+    sig = sig + ", "
+  else
+    -- All NvFn must take (NvVal, NvVal); zero-param lambdas need a dummy first arg
+    sig = sig + "NvVal _unused, "
+  sig = sig + "NvVal __env);"
+  emit_d(cg, sig)
+  -- Queue for body emission
+  cg.get("pending_lambdas").push(lam)
+  "nv_fn__lam_" + str(id)
+
+-- Emit the body of a single lambda to buf_fns
+fn cg_lambda_emit_body(cg, lam)
+  id       := lam.get("lambda_id")
+  params   := lam.get("params")
+  body     := lam.get("body")
+  captured := lam.get("captured")
+  -- Use custom C name if present (for nested fn_defs)
+  custom_cname := lam.get("lambda_cname")
+  fn_cname = if custom_cname != nil => custom_cname else "nv_fn__lam_" + str(id)
+  -- Signature
+  sig = "NvVal " + fn_cname + "("
+  i = 0
+  while i < params.len
+    if i > 0
+      sig = sig + ", "
+    sig = sig + "NvVal _p" + str(i)
+    i = i + 1
+  if params.len > 0
+    sig = sig + ", "
+  else
+    -- All NvFn must take (NvVal, NvVal); zero-param lambdas need a dummy first arg
+    sig = sig + "NvVal _unused, "
+  sig = sig + "NvVal __env) {"
+  emit_f(cg, sig)
+  emit_f(cg, "    NV_ENTER(\"<lambda>\");")
+  -- Reset scope to a clean state (lambda bodies must not see caller scopes)
+  saved_scopes := cg.get("scopes")
+  fresh_scopes = []
+  fresh_frame  = {}
+  fresh_scopes.push(fresh_frame)
+  cg.set("scopes", fresh_scopes)
+  -- Load captured variables from __env using fresh C names
+  has_env = false
+  if captured != nil and captured.len > 0
+    has_env = true
+    for pair in captured
+      nm  := pair[0]
+      fv  := cg_fresh(cg)
+      emit_f(cg, "    NvVal " + fv + " = nv_map_get_opt(__env, nv_str(\"" + nm + "\"));")
+      scopes := cg.get("scopes")
+      top    := scopes[scopes.len - 1]
+      top.set(nm, fv)
+  if not has_env
+    emit_f(cg, "    (void)__env;")
+  -- Define params in scope (after captured, params may shadow)
+  i = 0
+  while i < params.len
+    scopes := cg.get("scopes")
+    top    := scopes[scopes.len - 1]
+    top.set(params[i], "_p" + str(i))
+    i = i + 1
+  -- Push a fresh body scope so that local variables created inside the body
+  -- (including first-assignment vars that shadow captured globals) are visible
+  -- to cg_lookup_local in nested for/while scopes.
+  cg_scope_push(cg)
+  -- Emit body
+  bk := body.get("kind")
+  if bk == "block"
+    cg_block_fn(cg, body, 1)
+  else
+    bv := cg_expr(cg, body)
+    emit_f(cg, "    return " + bv + ";")
+  emit_f(cg, "    return nv_nil();")
+  emit_f(cg, "}")
+  emit_f(cg, "")
+  -- Pop the body scope and restore saved scopes
+  cg_scope_pop(cg)
+  cg.set("scopes", saved_scopes)
+
+-- Emit all pending lambda bodies (may add more to the queue)
+fn process_pending_lambdas(cg)
+  pending := cg.get("pending_lambdas")
+  idx = 0
+  while idx < pending.len
+    cg_lambda_emit_body(cg, pending[idx])
+    idx = idx + 1
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- EXPRESSION CODEGEN  (returns a C expression string)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn cg_expr(cg, expr)
+  k := expr.get("kind")
+
+  if k == "int"
+    return "nv_int(" + expr.get("val") + ")"
+
+  if k == "float"
+    return "nv_float(" + expr.get("val") + ")"
+
+  if k == "bool"
+    if expr.get("val") == "true"
+      return "nv_bool(1)"
+    return "nv_bool(0)"
+
+  if k == "nil"
+    return "nv_nil()"
+
+  if k == "tuple_expr"
+    -- Tuple used as value: (a, b) → nv_list_of(2, a, b)
+    vars := expr.get("vars")
+    elems = []
+    for vname in vars
+      c := cg_lookup(cg, vname)
+      if c != nil
+        elems.push(c)
+      else
+        elems.push("nv_fn((NvFn)nv_fn_" + vname + ")")
+    return "nv_list_of(" + str(elems.len) + ", " + join_strs(elems, ", ") + ")"
+
+  if k == "str"
+    return cg_str_expr(cg, expr.get("val"))
+
+  if k == "ident"
+    name := expr.get("name")
+    c := cg_lookup(cg, name)
+    if c != nil
+      return c
+    -- Known fn: wrap as function value
+    fn_defs := cg.get("fn_defs")
+    for fd in fn_defs
+      if fd.get("name") == name
+        return "nv_fn((NvFn)nv_fn_" + name + ")"
+    -- Builtin names used as values
+    -- None as bare ident: nil when not imported from result.nvl
+    if name == "None" => return "nv_nil()"
+    if name == "sum"
+      return "nv_fn((NvFn)nv_sum)"
+    if name == "sorted"
+      return "nv_fn((NvFn)nv_sorted)"
+    if name == "print"
+      return "nv_fn((NvFn)nv_print)"
+    if name == "eprint"
+      return "nv_fn((NvFn)nv_eprint)"
+    if name == "http_serve"
+      return "nv_fn((NvFn)nv_http_serve)"
+    if name == "http_get"
+      return "nv_fn((NvFn)nv_http_get)"
+    if name == "http_post"
+      return "nv_fn((NvFn)nv_http_post)"
+    if name == "http_response"
+      return "nv_fn((NvFn)nv_http_response)"
+    -- Fallback: treat as a runtime builtin fn reference (e.g. mse_loss, cross_entropy)
+    return "nv_fn((NvFn)nv_fn_" + name + ")"
+
+  if k == "binop"
+    l  := cg_expr(cg, expr.get("left"))
+    r  := cg_expr(cg, expr.get("right"))
+    op := expr.get("op")
+    if op == "+" => return "nv_add(" + l + ", " + r + ")"
+    if op == "-" => return "nv_sub(" + l + ", " + r + ")"
+    if op == "*" => return "nv_mul(" + l + ", " + r + ")"
+    if op == "/" => return "nv_div(" + l + ", " + r + ")"
+    if op == "//" => return "nv_idiv(" + l + ", " + r + ")"
+    if op == "%" => return "nv_mod(" + l + ", " + r + ")"
+    if op == "**" => return "nv_pow(" + l + ", " + r + ")"
+    if op == "==" => return "nv_eq(" + l + ", " + r + ")"
+    if op == "!=" => return "nv_ne(" + l + ", " + r + ")"
+    if op == "<" => return "nv_lt(" + l + ", " + r + ")"
+    if op == ">" => return "nv_gt(" + l + ", " + r + ")"
+    if op == "<=" => return "nv_le(" + l + ", " + r + ")"
+    if op == ">=" => return "nv_ge(" + l + ", " + r + ")"
+    if op == "and" => return "nv_bool(nv_truthy(" + l + ") && nv_truthy(" + r + "))"
+    if op == "or" => return "nv_bool(nv_truthy(" + l + ") || nv_truthy(" + r + "))"
+    return "nv_nil() /* op:" + op + " */"
+
+  if k == "unop"
+    op      := expr.get("op")
+    operand := cg_expr(cg, expr.get("operand"))
+    if op == "neg" => return "nv_neg(" + operand + ")"
+    if op == "not" => return "nv_not(" + operand + ")"
+    return "nv_nil()"
+
+  if k == "call"
+    return cg_call(cg, expr)
+
+  if k == "method_call"
+    return cg_method_call(cg, expr)
+
+  if k == "field"
+    obj_ast2 := expr.get("obj")
+    field    := expr.get("field")
+    -- Namespace / enum type field access
+    if obj_ast2.get("kind") == "ident"
+      ns_name2    := obj_ast2.get("name")
+      -- Enum variant: Shape.Red → zero-arg constructor call
+      enum_types2 := cg.get("enum_types")
+      tvars2      := enum_types2.get(ns_name2)
+      if tvars2 != nil
+        for vr2 in tvars2
+          if vr2.get("name") == field
+            fn_c2 := "nv_fn_" + ns_name2 + "_" + field
+            if vr2.get("n_fields") == 0
+              return fn_c2 + "(nv_nil(), nv_nil())"
+            else
+              return "nv_fn((NvFn)" + fn_c2 + ")"
+      -- Namespace field access: ns.CONSTANT
+      namespaces2 := cg.get("namespaces")
+      ns_entries2 := namespaces2.get(ns_name2)
+      if ns_entries2 != nil
+        ns_var2 := cg_lookup(cg, ns_name2)
+        return "nv_map_get_opt(" + ns_var2 + ", nv_str(\"" + field + "\"))"
+    obj   := cg_expr(cg, obj_ast2)
+    if field == "len"
+      return "nv_len(" + obj + ")"
+    if field == "is_some"
+      return "nv_bool((" + obj + ").tag != NV_NIL)"
+    if field == "is_none"
+      return "nv_bool((" + obj + ").tag == NV_NIL)"
+    if field == "value" or field == "unwrap"
+      return obj
+    -- Tensor fields
+    if field == "T"
+      return "nv_tensor_transpose(" + obj + ")"
+    -- Generic field access via map lookup
+    return "nv_map_get_opt(" + obj + ", nv_str(\"" + field + "\"))"
+
+  if k == "index"
+    obj := cg_expr(cg, expr.get("obj"))
+    idx := cg_expr(cg, expr.get("idx"))
+    return "nv_index(" + obj + ", " + idx + ")"
+
+  if k == "list"
+    items := expr.get("items")
+    if items.len == 0
+      return "nv_list_new()"
+    args = str(items.len)
+    i = 0
+    while i < items.len
+      args = args + ", " + cg_expr(cg, items[i])
+      i = i + 1
+    return "nv_list_of(" + args + ")"
+
+  if k == "map"
+    pairs := expr.get("pairs")
+    if pairs.len == 0
+      return "nv_map_new()"
+    -- Use statement expression to build the map
+    tv := cg_fresh(cg)
+    s  = "({ NvVal " + tv + " = nv_map_new();"
+    i = 0
+    while i < pairs.len
+      pair := pairs[i]
+      if pair[0].get("kind") == "spread"
+        -- Spread entry: nv_map_merge(tv, base)
+        base_c := cg_expr(cg, pair[1])
+        s = s + " nv_map_merge(" + tv + ", " + base_c + ");"
+      else
+        pk := cg_expr(cg, pair[0])
+        pv := cg_expr(cg, pair[1])
+        s = s + " nv_map_set_mut(" + tv + ", " + pk + ", " + pv + ");"
+      i = i + 1
+    s = s + " " + tv + "; })"
+    return s
+
+  if k == "range"
+    start    := cg_expr(cg, expr.get("start"))
+    end_expr := cg_expr(cg, expr.get("end"))
+    op       := expr.get("op")
+    if op == "..="
+      return "nv_range(" + start + ", " + end_expr + ", 1)"
+    return "nv_range(" + start + ", " + end_expr + ", 0)"
+
+  if k == "if_expr"
+    return cg_if_expr(cg, expr)
+
+  if k == "lambda"
+    lam_name := cg_lambda_ref(cg, expr)
+    captured := expr.get("captured")
+    -- Build env map for closure capture (incremental to avoid huge variadic calls)
+    if captured != nil and captured.len > 0
+      ev := cg_fresh(cg)
+      parts = ["({ NvVal " + ev + " = nv_map_new();"]
+      for pair in captured
+        nm := pair[0]
+        cv := cg_wrap_as_val(pair[1])
+        parts.push(" nv_map_set_mut(" + ev + ", nv_str(\"" + nm + "\"), " + cv + ");")
+      parts.push(" nv_closure((NvFn)" + lam_name + ", " + ev + "); })")
+      return join_strs(parts, "")
+    return "nv_fn((NvFn)" + lam_name + ")"
+
+  if k == "pipe"
+    return cg_pipe(cg, expr)
+
+  if k == "pipe_call"
+    return cg_pipe_call(cg, expr)
+
+  -- spawn_call as expression: launches pthread, returns nil
+  if k == "spawn_call"
+    args := expr.get("args")
+    if args.len >= 2
+      fn_s  := cg_expr(cg, args[0])
+      arg_s := cg_expr(cg, args[1])
+      return "nv_spawn(" + fn_s + ", " + arg_s + ")"
+    return "nv_nil()"
+
+  -- Fallback
+  "nv_nil() /* unknown:" + k + " */"
+
+-- Emit a string literal, handling {expr} interpolation
+fn cg_str_expr(cg, s)
+  parts := split_interp(s)
+  if parts.len == 0
+    return "nv_str(\"\")"
+  if parts.len == 1 and parts[0].get("kind") == "lit"
+    return "nv_str(\"" + escape_c(parts[0].get("val")) + "\")"
+  -- Multiple parts: compile each, then concat
+  arg_strs = []
+  for part in parts
+    pk := part.get("kind")
+    if pk == "lit"
+      arg_strs.push("nv_str(\"" + escape_c(part.get("val")) + "\")")
+    else
+      -- Re-lex and parse the sub-expression, then emit
+      src         := part.get("src")
+      fmt         := part.get("fmt")
+      sub_tokens  := lex(src)
+      sub_state   := make_state(sub_tokens)
+      sub_expr    := parse_expr(sub_state)
+      sub_c       := cg_expr(cg, sub_expr)
+      if fmt != nil
+        arg_strs.push("nv_to_str_fmt(" + sub_c + ", \"" + escape_c(fmt) + "\")")
+      else
+        arg_strs.push("nv_to_str(" + sub_c + ")")
+  if arg_strs.len == 1
+    return arg_strs[0]
+  return "nv_str_concat_n(" + str(arg_strs.len) + ", " + join_strs(arg_strs, ", ") + ")"
+
+-- if-expression as a GCC statement expression
+fn cg_if_expr(cg, expr)
+  tv    := cg_fresh(cg)
+  cond  := cg_expr(cg, expr.get("cond"))
+  then  := cg_expr_val(cg, expr.get("then"))
+  elifs := expr.get("elifs")
+  else_b := expr.get("else")
+  s  = "({ NvVal " + tv + " = nv_nil();"
+  s  = s + " if (nv_truthy(" + cond + ")) { " + tv + " = " + then + "; }"
+  if elifs != nil
+    i = 0
+    while i < elifs.len
+      ef := elifs[i]
+      ec := cg_expr(cg, ef.get("cond"))
+      eb := cg_expr_val(cg, ef.get("body"))
+      s  = s + " else if (nv_truthy(" + ec + ")) { " + tv + " = " + eb + "; }"
+      i  = i + 1
+  if else_b != nil
+    ev := cg_expr_val(cg, else_b)
+    s  = s + " else { " + tv + " = " + ev + "; }"
+  s = s + " " + tv + "; })"
+  s
+
+-- Extract a single expression value from a block or raw expression
+fn cg_expr_val(cg, node)
+  k := node.get("kind")
+  if k == "block"
+    stmts := node.get("stmts")
+    if stmts.len == 0
+      return "nv_nil()"
+    last := stmts[stmts.len - 1]
+    lk   := last.get("kind")
+    if lk == "expr_stmt"
+      return cg_expr(cg, last.get("expr"))
+    if lk == "return"
+      return cg_expr(cg, last.get("val"))
+    -- Block with multiple stmts: use statement expression
+    return "nv_nil() /* complex block val */"
+  cg_expr(cg, node)
+
+-- ── M14.1: C FFI — type unbox/rebox + extern call codegen ───────────────────
+
+-- Unbox a NvVal C expression to a raw C type based on declared type string.
+fn nv_unbox_type(c_expr, type_str)
+  if type_str == "i32"   => return "(int)nv_as_i64(" + c_expr + ")"
+  if type_str == "i64"   => return "(int64_t)nv_as_i64(" + c_expr + ")"
+  if type_str == "usize" => return "(size_t)nv_as_i64(" + c_expr + ")"
+  if type_str == "f64"   => return "(double)nv_as_f64(" + c_expr + ")"
+  if type_str == "f32"   => return "(float)nv_as_f32(" + c_expr + ")"
+  if type_str == "str"   => return "(char*)nv_to_cstr(" + c_expr + ")"
+  if type_str == "*void" => return "(void*)nv_to_ptr(" + c_expr + ")"
+  if type_str == "*char" => return "(char*)nv_to_cstr(" + c_expr + ")"
+  if type_str == "bool"  => return "nv_is_truthy(" + c_expr + ")"
+  c_expr   -- NvVal passthrough for unknown types
+
+-- Box a raw C call expression back into an NvVal based on return type.
+-- For void return: wraps call in comma-expr to get nv_nil().
+fn nv_rebox_type(c_call, type_str)
+  if type_str == "void"  => return "(" + c_call + ", nv_nil())"
+  if type_str == "i32"   => return "nv_int((int64_t)(" + c_call + "))"
+  if type_str == "i64"   => return "nv_int((int64_t)(" + c_call + "))"
+  if type_str == "usize" => return "nv_int((int64_t)(" + c_call + "))"
+  if type_str == "f64"   => return "nv_float((double)(" + c_call + "))"
+  if type_str == "f32"   => return "nv_float((double)(" + c_call + "))"
+  if type_str == "str"   => return "nv_str((char*)(" + c_call + "))"
+  if type_str == "*void" => return "nv_ptr((void*)(" + c_call + "))"
+  if type_str == "*char" => return "nv_str((char*)(" + c_call + "))"
+  if type_str == "bool"  => return "nv_bool((int)(" + c_call + "))"
+  "nv_nil()"  -- fallback
+
+-- Infer C cast for variadic arg based on AST node kind (for printf-style calls).
+fn nv_va_unbox(c_expr, ast_node)
+  k := ast_node.get("kind")
+  if k == "str"   => return "(char*)nv_to_cstr(" + c_expr + ")"
+  if k == "float" => return "(double)nv_as_f64(" + c_expr + ")"
+  -- int literals, variables, expressions → long long (handles %d, %ld, %lld)
+  "(long long)nv_as_i64(" + c_expr + ")"
+
+-- Emit a direct C call to an extern fn with type unboxing/boxing.
+fn cg_extern_call(cg, fn_name, args, arg_cs, einfo)
+  params   := einfo.get("params")
+  ret_type := einfo.get("ret_type")
+  c_args   = []
+  i = 0
+  while i < arg_cs.len
+    ac := arg_cs[i]
+    if i < params.len
+      ptype := params[i][1]
+      if ptype == "..." or ptype == "NvVal"
+        c_args.push(nv_va_unbox(ac, args[i]))
+      else
+        c_args.push(nv_unbox_type(ac, ptype))
+    else
+      -- extra variadic args: infer from AST literal kind
+      c_args.push(nv_va_unbox(ac, args[i]))
+    i = i + 1
+  call_c := fn_name + "(" + join_strs(c_args, ", ") + ")"
+  nv_rebox_type(call_c, ret_type)
+
+-- ── End M14.1 codegen additions ──────────────────────────────────────────────
+
+-- Builtin and user function calls
+fn cg_call(cg, expr)
+  fn_name := expr.get("fn")
+  args    := expr.get("args")
+
+  -- assemble arg C strings
+  arg_cs = []
+  for a in args
+    arg_cs.push(cg_expr(cg, a))
+
+  -- Extern fn (C FFI): check FIRST so user-declared extern fns override builtins
+  extern_fns := cg.get("extern_fns")
+  einfo := extern_fns.get(fn_name)
+  if einfo != nil
+    return cg_extern_call(cg, fn_name, args, arg_cs, einfo)
+
+  if fn_name == "print"
+    if arg_cs.len > 0
+      return "nv_print(" + arg_cs[0] + ")"
+    return "nv_print(nv_str(\"\"))"
+
+  if fn_name == "eprint"
+    if arg_cs.len > 0
+      return "nv_eprint(" + arg_cs[0] + ")"
+    return "nv_eprint(nv_str(\"\"))"
+
+  if fn_name == "path_dirname"
+    if arg_cs.len > 0
+      return "nv_path_dirname(" + arg_cs[0] + ")"
+    return "nv_str(\".\")"
+
+  if fn_name == "path_join"
+    if arg_cs.len >= 2
+      return "nv_path_join(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return "nv_nil()"
+
+  if fn_name == "type"
+    if arg_cs.len > 0
+      return "nv_type_of(" + arg_cs[0] + ")"
+    return "nv_str(\"nil\")"
+
+  if fn_name == "str"
+    if arg_cs.len > 0
+      return "nv_to_str(" + arg_cs[0] + ")"
+    return "nv_str(\"\")"
+
+  if fn_name == "int"
+    if arg_cs.len > 0
+      return "nv_to_int(" + arg_cs[0] + ")"
+    return "nv_int(0)"
+
+  if fn_name == "float"
+    if arg_cs.len > 0
+      return "nv_to_float(" + arg_cs[0] + ")"
+    return "nv_float(0.0)"
+
+  if fn_name == "assert"
+    if arg_cs.len >= 2
+      return "nv_assert_(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+    if arg_cs.len == 1
+      return "nv_assert_(" + arg_cs[0] + ", nv_str(\"assertion failed\"))"
+    return "nv_assert_(nv_bool(0), nv_str(\"empty assert\"))"
+
+  if fn_name == "len"
+    if arg_cs.len > 0
+      return "nv_len(" + arg_cs[0] + ")"
+    return "nv_int(0)"
+
+  if fn_name == "abs"
+    if arg_cs.len > 0
+      return "nv_abs_fn(" + arg_cs[0] + ")"
+
+  if fn_name == "sqrt"
+    if arg_cs.len > 0
+      return "nv_sqrt_fn(" + arg_cs[0] + ")"
+
+  if fn_name == "min"
+    if arg_cs.len == 2
+      return "(nv_truthy(nv_lt(" + arg_cs[0] + ", " + arg_cs[1] + ")) ? " + arg_cs[0] + " : " + arg_cs[1] + ")"
+    if arg_cs.len == 1
+      return "nv_min_fn(" + arg_cs[0] + ")"
+
+  if fn_name == "max"
+    if arg_cs.len == 2
+      return "(nv_truthy(nv_gt(" + arg_cs[0] + ", " + arg_cs[1] + ")) ? " + arg_cs[0] + " : " + arg_cs[1] + ")"
+    if arg_cs.len == 1
+      return "nv_max_fn(" + arg_cs[0] + ")"
+
+  if fn_name == "sum"
+    if arg_cs.len > 0
+      return "nv_sum(" + arg_cs[0] + ")"
+    return "nv_int(0)"
+
+  if fn_name == "map"
+    -- map(fn, list)
+    if arg_cs.len >= 2
+      return "nv_map_fn(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+
+  if fn_name == "filter"
+    -- filter(fn, list)
+    if arg_cs.len >= 2
+      return "nv_filter(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+
+  if fn_name == "sorted"
+    if arg_cs.len > 0
+      return "nv_sorted(" + arg_cs[0] + ")"
+
+  if fn_name == "reversed"
+    if arg_cs.len > 0
+      return "nv_reversed(" + arg_cs[0] + ")"
+
+  if fn_name == "range"
+    if arg_cs.len == 1
+      return "nv_range(nv_int(0), " + arg_cs[0] + ", 0)"
+    if arg_cs.len >= 2
+      return "nv_range(" + arg_cs[0] + ", " + arg_cs[1] + ", 0)"
+
+  if fn_name == "read_file"
+    if arg_cs.len > 0
+      return "nv_read_file(" + arg_cs[0] + ")"
+
+  if fn_name == "write_file"
+    if arg_cs.len >= 2
+      return "nv_write_file(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+
+  if fn_name == "args"
+    return "nv_args()"
+
+  -- Some/None/Ok/Err are stdlib functions (result.nvl) — fall through to fn_names dispatch
+  -- tensor(list) or tensor(list, requires_grad=true) — always 3 C params
+  if fn_name == "tensor"
+    req := "nv_bool(0)"
+    if arg_cs.len >= 2
+      req = arg_cs[1]
+    if arg_cs.len >= 1
+      return "nv_fn_tensor(" + arg_cs[0] + ", " + req + ", nv_nil())"
+    return "nv_fn_tensor(nv_nil(), nv_bool(0), nv_nil())"
+
+  -- huber_loss(pred, target) or huber_loss(pred, target, delta) — always 4 C params
+  if fn_name == "huber_loss"
+    delta := "nv_float(1.0)"
+    if arg_cs.len >= 3
+      delta = arg_cs[2]
+    if arg_cs.len >= 2
+      return "nv_fn_huber_loss(" + arg_cs[0] + ", " + arg_cs[1] + ", " + delta + ", nv_nil())"
+    return "nv_fn_huber_loss(nv_nil(), nv_nil(), nv_float(1.0), nv_nil())"
+
+  -- zero_grad(params) — reset gradients
+  if fn_name == "zero_grad"
+    if arg_cs.len == 1
+      return "nv_tensor_zero_grad(" + arg_cs[0] + ")"
+    return "nv_tensor_zero_grad(nv_nil())"
+
+  -- log(x) — natural log (scalar float); tensors use .log() method
+  if fn_name == "log"
+    if arg_cs.len == 1
+      return "nv_log_fn(" + arg_cs[0] + ")"
+    return "nv_log_fn(nv_nil())"
+
+  -- channel() — create a new pthread-backed channel
+  if fn_name == "channel"
+    return "nv_chan_new()"
+
+  -- await_(future) — block on a spawned thread's result
+  if fn_name == "await_"
+    if arg_cs.len == 1
+      return "nv_await_(" + arg_cs[0] + ")"
+    return "nv_await_(nv_nil())"
+
+  -- sleep + HTTP (M14.5)
+  if fn_name == "sleep_ms"
+    if arg_cs.len == 1
+      return "nv_sleep_ms(" + arg_cs[0] + ")"
+    return "nv_sleep_ms(nv_int(0))"
+
+  if fn_name == "http_get"
+    if arg_cs.len >= 1
+      return "nv_http_get(" + arg_cs[0] + ")"
+    return "nv_nil()"
+
+  if fn_name == "http_post"
+    if arg_cs.len >= 2
+      return "nv_http_post(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return "nv_nil()"
+
+  if fn_name == "http_serve"
+    if arg_cs.len >= 2
+      return "nv_http_serve(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return "nv_nil()"
+
+  if fn_name == "http_response"
+    if arg_cs.len >= 2
+      return "nv_http_response(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return "nv_nil()"
+
+  -- Math builtins (M14+)
+  if fn_name == "sin"
+    if arg_cs.len >= 1
+      return "nv_sin_fn(" + arg_cs[0] + ")"
+  if fn_name == "cos"
+    if arg_cs.len >= 1
+      return "nv_cos_fn(" + arg_cs[0] + ")"
+  if fn_name == "tan"
+    if arg_cs.len >= 1
+      return "nv_tan_fn(" + arg_cs[0] + ")"
+  if fn_name == "exp"
+    if arg_cs.len >= 1
+      return "nv_exp_fn(" + arg_cs[0] + ")"
+  if fn_name == "log2"
+    if arg_cs.len >= 1
+      return "nv_log2_fn(" + arg_cs[0] + ")"
+  if fn_name == "log10"
+    if arg_cs.len >= 1
+      return "nv_log10_fn(" + arg_cs[0] + ")"
+  if fn_name == "pow"
+    if arg_cs.len >= 2
+      return "nv_pow_fn(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+    if arg_cs.len >= 1
+      return "nv_pow_fn(" + arg_cs[0] + ", nv_float(1.0))"
+  if fn_name == "hypot"
+    if arg_cs.len >= 2
+      return "nv_hypot_fn(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "atan2"
+    if arg_cs.len >= 2
+      return "nv_atan2_fn(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "floor"
+    if arg_cs.len >= 1
+      return "nv_floor_fn(" + arg_cs[0] + ")"
+  if fn_name == "ceil"
+    if arg_cs.len >= 1
+      return "nv_ceil_fn(" + arg_cs[0] + ")"
+  if fn_name == "round"
+    if arg_cs.len >= 1
+      return "nv_round_fn(" + arg_cs[0] + ")"
+
+  -- System builtins (M14+)
+  if fn_name == "time_ms"
+    return "nv_time_ms()"
+  if fn_name == "exit"
+    if arg_cs.len >= 1
+      return "nv_exit_fn(" + arg_cs[0] + ")"
+    return "nv_exit_fn(nv_int(0))"
+  if fn_name == "env_get"
+    if arg_cs.len >= 1
+      return "nv_env_get(" + arg_cs[0] + ")"
+    return "nv_nil()"
+  if fn_name == "cli_args"
+    return "nv_cli_args()"
+
+  -- OS builtins
+  if fn_name == "nv_os_getcwd" => return "nv_os_getcwd()"
+  if fn_name == "nv_os_exists"
+    if arg_cs.len >= 1 => return "nv_os_exists(" + arg_cs[0] + ")"
+  if fn_name == "nv_os_is_file"
+    if arg_cs.len >= 1 => return "nv_os_is_file(" + arg_cs[0] + ")"
+  if fn_name == "nv_os_is_dir"
+    if arg_cs.len >= 1 => return "nv_os_is_dir(" + arg_cs[0] + ")"
+  if fn_name == "nv_os_listdir"
+    if arg_cs.len >= 1 => return "nv_os_listdir(" + arg_cs[0] + ")"
+  if fn_name == "nv_os_mkdir"
+    if arg_cs.len >= 1 => return "nv_os_mkdir(" + arg_cs[0] + ")"
+  if fn_name == "nv_os_remove"
+    if arg_cs.len >= 1 => return "nv_os_remove(" + arg_cs[0] + ")"
+  if fn_name == "nv_os_rename"
+    if arg_cs.len >= 2 => return "nv_os_rename(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "nv_os_getenv"
+    if arg_cs.len >= 1 => return "nv_os_getenv(" + arg_cs[0] + ")"
+  if fn_name == "nv_os_setenv"
+    if arg_cs.len >= 2 => return "nv_os_setenv(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "nv_os_system"
+    if arg_cs.len >= 1 => return "nv_os_system(" + arg_cs[0] + ")"
+  if fn_name == "nv_os_file_size"
+    if arg_cs.len >= 1 => return "nv_os_file_size(" + arg_cs[0] + ")"
+
+  -- Benchmark / shell builtins
+  if fn_name == "nv_clock_ns" => return "nv_clock_ns(nv_nil(), nv_nil())"
+  if fn_name == "nv_shell"
+    if arg_cs.len >= 1 => return "nv_shell(" + arg_cs[0] + ", nv_nil())"
+    return "nv_shell(nv_nil(), nv_nil())"
+
+  -- Regex builtins
+  if fn_name == "regex_match"
+    if arg_cs.len >= 2 => return "nv_regex_match(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "regex_find"
+    if arg_cs.len >= 2 => return "nv_regex_find(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "regex_find_all"
+    if arg_cs.len >= 2 => return "nv_regex_find_all(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "regex_replace"
+    if arg_cs.len >= 3 => return "nv_regex_replace(" + arg_cs[0] + ", " + arg_cs[1] + ", " + arg_cs[2] + ")"
+  if fn_name == "regex_split"
+    if arg_cs.len >= 2 => return "nv_regex_split(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+
+  -- Crypto builtins
+  if fn_name == "sha256"
+    if arg_cs.len >= 1 => return "nv_sha256(" + arg_cs[0] + ")"
+  if fn_name == "sha256_bytes"
+    if arg_cs.len >= 1 => return "nv_sha256_bytes(" + arg_cs[0] + ")"
+  if fn_name == "hmac_sha256"
+    if arg_cs.len >= 2 => return "nv_hmac_sha256(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+
+  -- Base64
+  if fn_name == "base64_encode"
+    if arg_cs.len >= 1 => return "nv_base64_encode(" + arg_cs[0] + ")"
+  if fn_name == "base64_decode"
+    if arg_cs.len >= 1 => return "nv_base64_decode(" + arg_cs[0] + ")"
+
+  -- UTF-8
+  if fn_name == "utf8_len"
+    if arg_cs.len >= 1 => return "nv_utf8_len(" + arg_cs[0] + ")"
+  if fn_name == "utf8_at"
+    if arg_cs.len >= 2 => return "nv_utf8_at(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "utf8_chars"
+    if arg_cs.len >= 1 => return "nv_utf8_chars(" + arg_cs[0] + ")"
+
+  -- Subprocess capture
+  if fn_name == "popen_read"
+    if arg_cs.len >= 1 => return "nv_popen_read(" + arg_cs[0] + ")"
+
+  -- GPU / CUDA builtins (NvModel inference — requires nuvola_cuda_nv.h)
+  -- GPU mat handles are NvVal NV_INT storing pointer-as-int64.
+  if fn_name == "gpu_init"     => return "nv_gpu_init()"
+  if fn_name == "gpu_free_mib" => return "nv_gpu_free_mib()"
+  if fn_name == "gpu_rows"
+    if arg_cs.len >= 1 => return "nv_gpu_rows(" + arg_cs[0] + ")"
+  if fn_name == "gpu_cols"
+    if arg_cs.len >= 1 => return "nv_gpu_cols(" + arg_cs[0] + ")"
+  if fn_name == "gpu_upload"
+    if arg_cs.len >= 3 => return "nv_gpu_upload(" + arg_cs[0] + ", " + arg_cs[1] + ", " + arg_cs[2] + ")"
+  if fn_name == "gpu_download"
+    if arg_cs.len >= 1 => return "nv_gpu_download(" + arg_cs[0] + ")"
+  if fn_name == "gpu_free"
+    if arg_cs.len >= 1 => return "nv_gpu_free(" + arg_cs[0] + ")"
+  if fn_name == "gpu_matmul"
+    if arg_cs.len >= 2 => return "nv_gpu_matmul(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "gpu_matmul_T"
+    if arg_cs.len >= 2 => return "nv_gpu_matmul_T(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "gpu_silu"
+    if arg_cs.len >= 1 => return "nv_gpu_silu(" + arg_cs[0] + ")"
+  if fn_name == "gpu_hadamard"
+    if arg_cs.len >= 2 => return "nv_gpu_hadamard(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "gpu_add"
+    if arg_cs.len >= 2 => return "nv_gpu_add(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "gpu_scale"
+    if arg_cs.len >= 2 => return "nv_gpu_scale(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "gpu_softmax"
+    if arg_cs.len >= 1 => return "nv_gpu_softmax(" + arg_cs[0] + ")"
+  if fn_name == "gpu_causal_mask"
+    if arg_cs.len >= 1 => return "nv_gpu_causal_mask(" + arg_cs[0] + ")"
+  if fn_name == "gpu_rms_norm"
+    if arg_cs.len >= 3 => return "nv_gpu_rms_norm(" + arg_cs[0] + ", " + arg_cs[1] + ", " + arg_cs[2] + ")"
+  if fn_name == "gpu_rope"
+    if arg_cs.len >= 3 => return "nv_gpu_rope(" + arg_cs[0] + ", " + arg_cs[1] + ", " + arg_cs[2] + ")"
+  if fn_name == "gpu_rope_ex"
+    if arg_cs.len >= 4 => return "nv_gpu_rope_ex(" + arg_cs[0] + ", " + arg_cs[1] + ", " + arg_cs[2] + ", " + arg_cs[3] + ")"
+  if fn_name == "gpu_upload_f16"
+    if arg_cs.len >= 3 => return "nv_gpu_upload_f16(" + arg_cs[0] + ", " + arg_cs[1] + ", " + arg_cs[2] + ")"
+  if fn_name == "gpu_load_weights_bin"
+    if arg_cs.len >= 1 => return "nv_gpu_load_weights_bin(" + arg_cs[0] + ")"
+  if fn_name == "gpu_mat_dtype"
+    if arg_cs.len >= 1 => return "nv_gpu_mat_dtype(" + arg_cs[0] + ")"
+  if fn_name == "gpu_slice_cols"
+    if arg_cs.len >= 3 => return "nv_gpu_slice_cols(" + arg_cs[0] + ", " + arg_cs[1] + ", " + arg_cs[2] + ")"
+  if fn_name == "gpu_concat_rows"
+    if arg_cs.len >= 2 => return "nv_gpu_concat_rows(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "gpu_concat_cols"
+    if arg_cs.len >= 1 => return "nv_gpu_concat_cols(" + arg_cs[0] + ")"
+  if fn_name == "gpu_last_row"
+    if arg_cs.len >= 1 => return "nv_gpu_last_row(" + arg_cs[0] + ")"
+  if fn_name == "gpu_get_row"
+    if arg_cs.len >= 2 => return "nv_gpu_get_row(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "gpu_logits"
+    if arg_cs.len >= 1 => return "nv_gpu_logits(" + arg_cs[0] + ")"
+  if fn_name == "gpu_embed"
+    if arg_cs.len >= 2 => return "nv_gpu_embed(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+
+  -- String format with {0} {1} placeholders
+  if fn_name == "format_str"
+    if arg_cs.len >= 2 => return "nv_format_str(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+    if arg_cs.len >= 1 => return "nv_format_str(" + arg_cs[0] + ", nv_list())"
+
+  -- Time builtins
+  if fn_name == "nv_time_now_ms"  => return "nv_time_now_ms()"
+  if fn_name == "nv_time_now_us"  => return "nv_time_now_us()"
+  if fn_name == "nv_time_now_sec" => return "nv_time_now_sec()"
+  if fn_name == "nv_sleep_sec"
+    if arg_cs.len >= 1 => return "nv_sleep_sec(" + arg_cs[0] + ")"
+  if fn_name == "nv_time_format"
+    if arg_cs.len >= 1 => return "nv_time_format(" + arg_cs[0] + ")"
+  if fn_name == "nv_time_format_iso"
+    if arg_cs.len >= 1 => return "nv_time_format_iso(" + arg_cs[0] + ")"
+
+  -- JSON builtins (M14+)
+  if fn_name == "json_parse"
+    if arg_cs.len >= 1
+      return "nv_json_parse(" + arg_cs[0] + ")"
+    return "nv_nil()"
+  if fn_name == "json_stringify"
+    if arg_cs.len >= 1
+      return "nv_json_stringify(" + arg_cs[0] + ")"
+    return "nv_str(\"null\")"
+
+  -- String standalone builtins (M14+)
+  if fn_name == "str_repeat"
+    if arg_cs.len >= 2
+      return "nv_str_repeat(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "str_index_of"
+    if arg_cs.len >= 2
+      return "nv_str_index_of(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "str_slice"
+    if arg_cs.len >= 3
+      return "nv_str_slice(" + arg_cs[0] + ", " + arg_cs[1] + ", " + arg_cs[2] + ")"
+
+  -- List standalone builtins (M14+)
+  if fn_name == "zip"
+    if arg_cs.len >= 2
+      return "nv_list_zip(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+  if fn_name == "flatten"
+    if arg_cs.len >= 1
+      return "nv_list_flatten(" + arg_cs[0] + ")"
+  if fn_name == "unique"
+    if arg_cs.len >= 1
+      return "nv_list_unique(" + arg_cs[0] + ")"
+  if fn_name == "enumerate"
+    if arg_cs.len >= 1
+      return "nv_list_enumerate(" + arg_cs[0] + ")"
+  if fn_name == "first"
+    if arg_cs.len >= 1
+      return "nv_list_first(" + arg_cs[0] + ")"
+  if fn_name == "last"
+    if arg_cs.len >= 1
+      return "nv_list_last(" + arg_cs[0] + ")"
+
+  -- throw (M14+)
+  if fn_name == "throw"
+    ob := "{"
+    cb := "}"
+    if arg_cs.len >= 1
+      return "(" + ob + "nv_throw(" + arg_cs[0] + "); nv_nil();" + cb + ")"
+    return "(" + ob + "nv_throw(nv_str(\"error\")); nv_nil();" + cb + ")"
+
+  -- file I/O (M14.4)
+  if fn_name == "file_write"
+    if arg_cs.len >= 2
+      return "nv_file_write(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return "nv_bool(0)"
+
+  if fn_name == "file_read"
+    if arg_cs.len >= 1
+      return "nv_file_read(" + arg_cs[0] + ")"
+    return "nv_nil()"
+
+  if fn_name == "file_exists"
+    if arg_cs.len >= 1
+      return "nv_file_exists(" + arg_cs[0] + ")"
+    return "nv_bool(0)"
+
+  if fn_name == "file_append"
+    if arg_cs.len >= 2
+      return "nv_file_append(" + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return "nv_bool(0)"
+
+  -- Check if fn_name is a local variable (e.g., a function parameter)
+  c_var := cg_lookup(cg, fn_name)
+  if c_var != nil
+    -- Enum constructors and other raw fn pointers stored in scope must be wrapped as NvVal
+    cv_wrapped := cg_wrap_as_val(c_var)
+    if arg_cs.len == 0
+      return "nv_call_1(" + cv_wrapped + ", nv_nil())"
+    if arg_cs.len == 1
+      return "nv_call_1(" + cv_wrapped + ", " + arg_cs[0] + ")"
+    if arg_cs.len == 2
+      -- Enum constructors with 2+ fields use list-packed calling convention (arity==1 in map)
+      -- Regular 2-param lambdas use separate-arg calling convention (arity==2 or nil)
+      cv_arity := cg.get("arity_map").get(fn_name)
+      if cv_arity == 1
+        return "nv_call_1(" + cv_wrapped + ", nv_list_of(2, " + arg_cs[0] + ", " + arg_cs[1] + "))"
+      return "nv_call_2(" + cv_wrapped + ", " + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return "nv_call_1(" + cv_wrapped + ", nv_list_of(" + str(arg_cs.len) + ", " + join_strs(arg_cs, ", ") + "))"
+
+  -- User-defined function (with arity check)
+  arity_map := cg.get("arity_map")
+  expected  := arity_map.get(fn_name)
+  if expected != nil and expected != arg_cs.len
+    src_file := cg.get("src_file")
+    loc = ""
+    if src_file != ""
+      loc = src_file + ": "
+    eprint(loc + "error: '" + fn_name + "' expects " + str(expected) + " argument(s), got " + str(arg_cs.len))
+    exit(1)
+  fn_defs := cg.get("fn_defs")
+  for fd in fn_defs
+    if fd.get("name") == fn_name
+      if arg_cs.len == 0
+        return "nv_fn_" + fn_name + "(nv_nil())"
+      return "nv_fn_" + fn_name + "(" + join_strs(arg_cs, ", ") + ", nv_nil())"
+
+  -- Some/None fallback: if not imported from result.nvl, behave as pass-through builtins
+  if fn_name == "Some"
+    if arg_cs.len > 0
+      return arg_cs[0]
+    return "nv_nil()"
+  if fn_name == "None"
+    return "nv_nil()"
+
+  -- ML builtins: dispatch to runtime impl to avoid nv_fn_dropout name clash
+  if fn_name == "dropout"
+    x_d := "nv_nil()"
+    p_d := "nv_float(0.5)"
+    t_d := "nv_bool(1)"
+    if arg_cs.len >= 1 => x_d = arg_cs[0]
+    if arg_cs.len >= 2 => p_d = arg_cs[1]
+    if arg_cs.len >= 3 => t_d = arg_cs[2]
+    return "_nv_dropout_impl(" + x_d + ", " + p_d + ", " + t_d + ", nv_nil())"
+
+  -- Tensor constructors: zeros/ones/rand/randn may be called with 1 arg (row-vector)
+  -- or 2 args (rows, cols). Runtime always expects (rows, cols, env).
+  -- zeros(n) → [1, n] row-vector (good for ML bias vectors)
+  if fn_name == "zeros" or fn_name == "ones"
+    if arg_cs.len == 1
+      return "nv_fn_" + fn_name + "(nv_int(1), " + arg_cs[0] + ", nv_nil())"
+    if arg_cs.len == 2
+      return "nv_fn_" + fn_name + "(" + arg_cs[0] + ", " + arg_cs[1] + ", nv_nil())"
+    return "nv_fn_" + fn_name + "(nv_int(1), nv_int(1), nv_nil())"
+  if fn_name == "rand" or fn_name == "randn"
+    if arg_cs.len == 1
+      return "nv_fn_" + fn_name + "(" + arg_cs[0] + ", nv_int(1), nv_nil())"
+    if arg_cs.len == 2
+      return "nv_fn_" + fn_name + "(" + arg_cs[0] + ", " + arg_cs[1] + ", nv_nil())"
+    return "nv_fn_" + fn_name + "(nv_int(1), nv_int(1), nv_nil())"
+
+  -- Unknown: treat as user fn (forward declared or external)
+  if arg_cs.len == 0
+    return "nv_fn_" + fn_name + "(nv_nil())"
+  return "nv_fn_" + fn_name + "(" + join_strs(arg_cs, ", ") + ", nv_nil())"
+
+-- Method calls  obj.method(args...)
+fn cg_method_call(cg, expr)
+  obj_ast := expr.get("obj")
+  method  := expr.get("method")
+  args    := expr.get("args")
+  arg_cs  = []
+  for a in args
+    arg_cs.push(cg_expr(cg, a))
+
+  -- Namespace dispatch: if obj is an ident that's a known namespace, resolve member
+  if obj_ast.get("kind") == "ident"
+    ns_name    := obj_ast.get("name")
+    namespaces := cg.get("namespaces")
+    ns_entries := namespaces.get(ns_name)
+    if ns_entries != nil
+      -- Resolve ns.method(args) — look up in namespace entries
+      ns_var := cg_lookup(cg, ns_name)
+      for entry in ns_entries
+        if entry.get("name") == method
+          if entry.get("kind") == "fn"
+            -- Direct function call (more efficient than map lookup + nv_call)
+            if arg_cs.len == 0
+              return "nv_fn_" + method + "(nv_nil())"
+            return "nv_fn_" + method + "(" + join_strs(arg_cs, ", ") + ", nv_nil())"
+          else
+            -- Constant field access: nv_map_get_opt(ns, "key")
+            return "nv_map_get_opt(" + ns_var + ", nv_str(\"" + method + "\"))"
+      -- Member not found in namespace entries — dynamic map lookup
+      fn_val := "nv_map_get_opt(" + ns_var + ", nv_str(\"" + method + "\"))"
+      if arg_cs.len == 0
+        return "nv_call_1(" + fn_val + ", nv_nil())"
+      if arg_cs.len == 1
+        return "nv_call_1(" + fn_val + ", " + arg_cs[0] + ")"
+      return "nv_call_1(" + fn_val + ", nv_list_of(" + str(arg_cs.len) + ", " + join_strs(arg_cs, ", ") + "))"
+
+  obj := cg_expr(cg, obj_ast)
+
+  if method == "push"
+    if arg_cs.len > 0
+      return "nv_list_push(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_list_push(" + obj + ", nv_nil())"
+
+  if method == "pop"
+    return "nv_list_pop(" + obj + ")"
+
+  if method == "len"
+    return "nv_len(" + obj + ")"
+
+  -- channel methods
+  if method == "send"
+    if arg_cs.len > 0
+      return "nv_chan_send(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_chan_send(" + obj + ", nv_nil())"
+
+  if method == "recv"
+    return "nv_chan_recv(" + obj + ")"
+
+  if method == "try_recv"
+    return "nv_chan_try_recv(" + obj + ")"
+
+  -- string methods (M14.4)
+  if method == "trim"
+    return "nv_str_trim(" + obj + ")"
+
+  if method == "lower"
+    return "nv_str_lower(" + obj + ")"
+
+  if method == "upper"
+    return "nv_str_upper(" + obj + ")"
+
+  if method == "split"
+    if arg_cs.len > 0
+      return "nv_str_split(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_str_split(" + obj + ", nv_str(\" \"))"
+
+  if method == "contains"
+    if arg_cs.len > 0
+      return "nv_contains(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_bool(0)"
+
+  if method == "starts_with"
+    if arg_cs.len > 0
+      return "nv_str_starts_with(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_bool(0)"
+
+  if method == "ends_with"
+    if arg_cs.len > 0
+      return "nv_str_ends_with(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_bool(0)"
+
+  if method == "replace"
+    if arg_cs.len >= 2
+      return "nv_str_replace(" + obj + ", " + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return obj
+
+  if method == "parse_int" or method == "parse_i64"
+    return "nv_str_parse_int(" + obj + ")"
+
+  if method == "chars"
+    return "nv_str_chars(" + obj + ")"
+
+  if method == "split"
+    if arg_cs.len > 0
+      return "nv_str_split(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_str_split(" + obj + ", nv_str(\"\"))"
+
+  if method == "join"
+    if arg_cs.len > 0
+      return "nv_str_join(" + arg_cs[0] + ", " + obj + ")"
+    return "nv_str_join(nv_str(\"\"), " + obj + ")"
+
+  if method == "trim"
+    return "nv_str_trim(" + obj + ")"
+
+  if method == "to_upper"
+    return "nv_str_upper(" + obj + ")"
+
+  if method == "to_lower"
+    return "nv_str_lower(" + obj + ")"
+
+  if method == "contains"
+    if arg_cs.len > 0
+      return "nv_contains(" + obj + ", " + arg_cs[0] + ")"
+
+  if method == "starts_with"
+    if arg_cs.len > 0
+      return "nv_str_starts_with(" + obj + ", " + arg_cs[0] + ")"
+
+  if method == "ends_with"
+    if arg_cs.len > 0
+      return "nv_str_ends_with(" + obj + ", " + arg_cs[0] + ")"
+
+  if method == "replace"
+    if arg_cs.len >= 2
+      return "nv_str_replace(" + obj + ", " + arg_cs[0] + ", " + arg_cs[1] + ")"
+
+  if method == "get"
+    if arg_cs.len > 0
+      return "nv_map_get_opt(" + obj + ", " + arg_cs[0] + ")"
+
+  if method == "set"
+    if arg_cs.len >= 2
+      return "nv_map_set_mut(" + obj + ", " + arg_cs[0] + ", " + arg_cs[1] + ")"
+
+  if method == "parse_i64"
+    return "nv_str_parse_int(" + obj + ")"
+
+  if method == "parse_int"
+    return "nv_str_parse_int(" + obj + ")"
+
+  if method == "sum"
+    return "nv_tensor_sum(" + obj + ")"
+
+  if method == "sort"
+    return "nv_sorted(" + obj + ")"
+
+  if method == "sorted"
+    return "nv_sorted(" + obj + ")"
+
+  if method == "reverse"
+    return "nv_reversed(" + obj + ")"
+
+  if method == "reversed"
+    return "nv_reversed(" + obj + ")"
+
+  if method == "map"
+    if arg_cs.len > 0
+      return "nv_map_fn(" + arg_cs[0] + ", " + obj + ")"
+
+  if method == "filter"
+    if arg_cs.len > 0
+      return "nv_filter(" + arg_cs[0] + ", " + obj + ")"
+
+  if method == "append"
+    if arg_cs.len > 0
+      return "nv_list_push(" + obj + ", " + arg_cs[0] + ")"
+
+  if method == "take"
+    if arg_cs.len > 0
+      return "nv_list_take(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_list_take(" + obj + ", nv_int(0))"
+
+  if method == "drop"
+    if arg_cs.len > 0
+      return "nv_list_drop(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_list_drop(" + obj + ", nv_int(0))"
+
+  if method == "entries"
+    return "nv_map_entries(" + obj + ")"
+
+  if method == "to_f64" or method == "to_float"
+    return "nv_to_float(" + obj + ")"
+
+  if method == "to_i64" or method == "to_int"
+    return "nv_to_int(" + obj + ")"
+
+  if method == "to_str"
+    return "nv_to_str(" + obj + ")"
+
+  if method == "is_some"
+    return "nv_bool((" + obj + ").tag != NV_NIL)"
+
+  if method == "is_none"
+    return "nv_bool((" + obj + ").tag == NV_NIL)"
+
+  if method == "unwrap"
+    return obj
+
+  if method == "abs"
+    return "nv_abs_fn(" + obj + ")"
+
+  -- Tensor methods
+  if method == "item"
+    return "nv_tensor_item(" + obj + ")"
+  if method == "tolist"
+    return "nv_tensor_tolist(" + obj + ")"
+  if method == "flatten"
+    return "nv_tensor_flatten(" + obj + ")"
+  if method == "reshape"
+    if arg_cs.len > 0
+      return "nv_tensor_reshape(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_tensor_flatten(" + obj + ")"
+  if method == "mean"
+    return "nv_tensor_mean(" + obj + ")"
+  if method == "max"
+    return "nv_tensor_max_fn(" + obj + ")"
+  if method == "relu"
+    return "nv_tensor_relu(" + obj + ")"
+  if method == "sigmoid"
+    return "nv_tensor_sigmoid(" + obj + ")"
+  if method == "softmax"
+    return "nv_tensor_softmax(" + obj + ")"
+  if method == "tanh"
+    return "nv_tensor_tanh_fn(" + obj + ")"
+  if method == "gelu"
+    return "nv_tensor_gelu(" + obj + ")"
+  if method == "exp"
+    return "nv_tensor_exp(" + obj + ")"
+  if method == "log"
+    return "nv_tensor_log(" + obj + ")"
+  if method == "abs"
+    return "nv_tensor_abs(" + obj + ")"
+  if method == "conv1d"
+    pad := "nv_int(0)"
+    if arg_cs.len >= 2
+      pad = arg_cs[1]
+    if arg_cs.len >= 1
+      return "nv_tensor_conv1d(" + obj + ", " + arg_cs[0] + ", " + pad + ")"
+    return "nv_nil()"
+  if method == "conv2d"
+    pad := "nv_int(0)"
+    if arg_cs.len >= 2
+      pad = arg_cs[1]
+    if arg_cs.len >= 1
+      return "nv_tensor_conv2d(" + obj + ", " + arg_cs[0] + ", " + pad + ")"
+    return "nv_nil()"
+  if method == "dropout"
+    p_arg := "nv_float(0.5)"
+    train_arg := "nv_bool(1)"
+    if arg_cs.len >= 1
+      p_arg = arg_cs[0]
+    if arg_cs.len >= 2
+      train_arg = arg_cs[1]
+    return "_nv_dropout_impl(" + obj + ", " + p_arg + ", " + train_arg + ", nv_nil())"
+  if method == "matmul"
+    if arg_cs.len > 0
+      return "nv_tensor_matmul(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_nil()"
+  if method == "backward"
+    return "nv_tensor_backward(" + obj + ")"
+  if method == "quantize"
+    return "nv_tensor_quantize(" + obj + ")"
+  if method == "dequantize"
+    if arg_cs.len >= 2
+      return "nv_tensor_dequantize(" + obj + ", " + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return "nv_nil()"
+  if method == "to_f16"
+    return "nv_tensor_to_f16(" + obj + ")"
+  if method == "clone"
+    return "nv_tensor_clone(" + obj + ")"
+  if method == "detach"
+    return "nv_tensor_detach(" + obj + ")"
+  if method == "norm"
+    if arg_cs.len > 0
+      return "nv_tensor_norm(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_tensor_norm(" + obj + ", nv_int(2))"
+  if method == "clip"
+    if arg_cs.len >= 2
+      return "nv_tensor_clip(" + obj + ", " + arg_cs[0] + ", " + arg_cs[1] + ")"
+    return "nv_nil()"
+  if method == "unsqueeze"
+    if arg_cs.len > 0
+      return "nv_tensor_unsqueeze(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_nil()"
+  if method == "squeeze"
+    if arg_cs.len > 0
+      return "nv_tensor_squeeze(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_tensor_squeeze(" + obj + ", nv_int(0))"
+
+  -- Channel methods
+  if method == "send"
+    if arg_cs.len > 0
+      return "nv_chan_send(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_nil()"
+  if method == "recv"
+    return "nv_chan_recv(" + obj + ")"
+  if method == "try_recv"
+    return "nv_chan_try_recv(" + obj + ")"
+
+  -- Optimizer methods: opt.step(param), opt.zero_grad(param)
+  if method == "step"
+    if arg_cs.len > 0
+      return "nv_optimizer_step(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_nil()"
+  if method == "zero_grad"
+    if arg_cs.len > 0
+      return "nv_tensor_zero_grad(" + arg_cs[0] + ")"
+    return "nv_nil()"
+
+  -- String methods (M14+)
+  if method == "repeat"
+    if arg_cs.len > 0
+      return "nv_str_repeat(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_str_repeat(" + obj + ", nv_int(1))"
+  if method == "index_of"
+    if arg_cs.len > 0
+      return "nv_str_index_of(" + obj + ", " + arg_cs[0] + ")"
+    return "nv_int(-1)"
+  if method == "slice"
+    if arg_cs.len >= 2
+      return "nv_str_slice(" + obj + ", " + arg_cs[0] + ", " + arg_cs[1] + ")"
+    if arg_cs.len >= 1
+      return "nv_str_slice(" + obj + ", " + arg_cs[0] + ", nv_int(999999))"
+    return obj
+
+  -- List methods (M14+)
+  if method == "first"
+    return "nv_list_first(" + obj + ")"
+  if method == "last"
+    return "nv_list_last(" + obj + ")"
+  if method == "zip"
+    if arg_cs.len > 0
+      return "nv_list_zip(" + obj + ", " + arg_cs[0] + ")"
+    return obj
+  if method == "flatten"
+    return "nv_list_flatten(" + obj + ")"
+  if method == "unique"
+    return "nv_list_unique(" + obj + ")"
+  if method == "enumerate"
+    return "nv_list_enumerate(" + obj + ")"
+
+  -- JSON methods (M14+)
+  if method == "to_json"
+    return "nv_json_stringify(" + obj + ")"
+  if method == "from_json"
+    return "nv_json_parse(" + obj + ")"
+
+  -- Generic unknown method
+  "nv_nil() /* ." + method + " */"
+
+-- Pipeline: val |> fn
+fn cg_pipe(cg, expr)
+  val_s  := cg_expr(cg, expr.get("val"))
+  fn_node := expr.get("fn")
+  fk      := fn_node.get("kind")
+  if fk == "ident"
+    fname := fn_node.get("name")
+    if fname == "sum" => return "nv_sum(" + val_s + ")"
+    if fname == "sorted" or fname == "sort" => return "nv_sorted(" + val_s + ")"
+    if fname == "reversed" or fname == "reverse" => return "nv_reversed(" + val_s + ")"
+    if fname == "max" => return "nv_max_fn(" + val_s + ")"
+    if fname == "min" => return "nv_min_fn(" + val_s + ")"
+    if fname == "print" => return "nv_print(" + val_s + ")"
+    if fname == "str" => return "nv_to_str(" + val_s + ")"
+    -- User fn: val becomes first arg
+    fn_defs := cg.get("fn_defs")
+    for fd in fn_defs
+      if fd.get("name") == fname
+        return "nv_fn_" + fname + "(" + val_s + ", nv_nil())"
+    -- Unknown: call_1
+    fn_c := cg_expr(cg, fn_node)
+    return "nv_call_1(" + fn_c + ", " + val_s + ")"
+  fn_c := cg_expr(cg, fn_node)
+  "nv_call_1(" + fn_c + ", " + val_s + ")"
+
+-- Pipeline: val |> fn(extra_args...)
+fn cg_pipe_call(cg, expr)
+  val_s   := cg_expr(cg, expr.get("val"))
+  fn_node := expr.get("fn")
+  args    := expr.get("args")
+  arg_cs  = []
+  for a in args
+    arg_cs.push(cg_expr(cg, a))
+  fk := fn_node.get("kind")
+  if fk == "ident"
+    fname := fn_node.get("name")
+    -- For map/filter: nv_map_fn(fn, list) / nv_filter(fn, list)
+    -- pipe puts the iterable as the object, fn as extra arg
+    if fname == "map"
+      if arg_cs.len > 0
+        return "nv_map_fn(" + arg_cs[0] + ", " + val_s + ")"
+    if fname == "filter"
+      if arg_cs.len > 0
+        return "nv_filter(" + arg_cs[0] + ", " + val_s + ")"
+    if fname == "sum" => return "nv_sum(" + val_s + ")"
+    if fname == "sorted" or fname == "sort" => return "nv_sorted(" + val_s + ")"
+    if fname == "max" => return "nv_max_fn(" + val_s + ")"
+    if fname == "min" => return "nv_min_fn(" + val_s + ")"
+    if fname == "split"
+      if arg_cs.len > 0
+        return "nv_str_split(" + val_s + ", " + arg_cs[0] + ")"
+      return "nv_str_split(" + val_s + ", nv_str(\"\"))"
+    if fname == "join"
+      if arg_cs.len > 0
+        return "nv_str_join(" + arg_cs[0] + ", " + val_s + ")"
+      return "nv_str_join(nv_str(\"\"), " + val_s + ")"
+    -- User fn: val is first arg
+    all_args = [val_s]
+    for ac in arg_cs
+      all_args.push(ac)
+    fn_defs := cg.get("fn_defs")
+    for fd in fn_defs
+      if fd.get("name") == fname
+        return "nv_fn_" + fname + "(" + join_strs(all_args, ", ") + ", nv_nil())"
+    -- Unknown
+    fn_c := cg_expr(cg, fn_node)
+    if all_args.len == 1
+      return "nv_call_1(" + fn_c + ", " + all_args[0] + ")"
+    return "nv_call_2(" + fn_c + ", " + all_args[0] + ", " + all_args[1] + ")"
+  fn_c := cg_expr(cg, fn_node)
+  if arg_cs.len == 0
+    return "nv_call_1(" + fn_c + ", " + val_s + ")"
+  all_args = [val_s]
+  for ac in arg_cs
+    all_args.push(ac)
+  return "nv_call_1(" + fn_c + ", " + all_args[0] + ") /* multi-pipe */"
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- STATEMENT CODEGEN  (emits lines into `out` buffer)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- cg_block: emit a block node's statements
+fn cg_block(cg, blk, depth, buf)
+  stmts := blk.get("stmts")
+  i = 0
+  while i < stmts.len
+    cg_stmt(cg, stmts[i], depth, buf)
+    i = i + 1
+
+fn cg_stmt(cg, stmt, depth, buf)
+  k    := stmt.get("kind")
+  i    := ind(depth)
+  sline := stmt.get("line")
+  sfile := cg.get("src_file")
+  if sline != nil and sfile != "" and k != "block" and k != "fn_def" and k != "import_stmt"
+    cg_out(cg, buf, "#line " + str(sline) + " \"" + sfile + "\"")
+
+  if k == "block"
+    cg_block(cg, stmt, depth, buf)
+    return nil
+
+  if k == "multi_let"
+    -- Tuple destructuring: (a, b, ...) := expr
+    vars  := stmt.get("vars")
+    val_s := cg_expr(cg, stmt.get("val"))
+    tmp   := cg_fresh(cg)
+    cg_out(cg, buf, i + "NvVal " + tmp + " = " + val_s + ";")
+    scopes_ml := cg.get("scopes")
+    vi = 0
+    while vi < vars.len
+      vname := vars[vi]
+      -- Only reuse global at top level; inside functions always create a local
+      if scopes_ml.len == 1
+        existing := cg_lookup(cg, vname)
+        if existing != nil
+          cg_out(cg, buf, i + existing + " = nv_index(" + tmp + ", nv_int(" + str(vi) + "));")
+          vi = vi + 1
+          continue
+      c_name := cg_define(cg, vname)
+      cg_out(cg, buf, i + "NvVal " + c_name + " = nv_index(" + tmp + ", nv_int(" + str(vi) + "));")
+      vi = vi + 1
+    return nil
+
+  if k == "let"
+    name   := stmt.get("name")
+    val_s  := cg_expr(cg, stmt.get("val"))
+    -- Only reuse a pre-scanned global at the top level (scopes.len == 1).
+    -- Inside functions, always create a fresh local to avoid aliasing globals.
+    scopes_now := cg.get("scopes")
+    if scopes_now.len == 1
+      existing := cg_lookup(cg, name)
+      if existing != nil
+        cg_out(cg, buf, i + existing + " = " + val_s + ";")
+        return nil
+    c_name := cg_define(cg, name)
+    cg_out(cg, buf, i + "NvVal " + c_name + " = " + val_s + ";")
+    return nil
+
+  if k == "assign"
+    target := stmt.get("target")
+    val_s  := cg_expr(cg, stmt.get("val"))
+    tk     := target.get("kind")
+    if tk == "ident"
+      name   := target.get("name")
+      -- Inside a function body (buf=="fn"): if the name is ONLY known as a global
+      -- (scope[0]) and has no local declaration yet, create a fresh local to avoid
+      -- race conditions and unintended global mutation from function-local variables.
+      c_name = cg_lookup(cg, name)
+      if c_name != nil
+        cg_out(cg, buf, i + c_name + " = " + val_s + ";")
+      else
+        c_name = cg_define(cg, name)
+        cg_out(cg, buf, i + "NvVal " + c_name + " = " + val_s + ";")
+    else if tk == "index"
+      obj := cg_expr(cg, target.get("obj"))
+      idx := cg_expr(cg, target.get("idx"))
+      cg_out(cg, buf, i + "nv_index_set(" + obj + ", " + idx + ", " + val_s + ");")
+    else if tk == "field"
+      obj   := cg_expr(cg, target.get("obj"))
+      field := target.get("field")
+      cg_out(cg, buf, i + "nv_map_set_mut(" + obj + ", nv_str(\"" + field + "\"), " + val_s + ");")
+    else
+      cg_out(cg, buf, i + "/* unhandled assign target " + tk + " */")
+    return nil
+
+  if k == "compound_assign"
+    target := stmt.get("target")
+    val_s  := cg_expr(cg, stmt.get("val"))
+    op     := stmt.get("op")
+    tk     := target.get("kind")
+    base_op = "nv_add"
+    if op == "+=" => base_op = "nv_add"
+    if op == "-=" => base_op = "nv_sub"
+    if op == "*=" => base_op = "nv_mul"
+    if op == "/=" => base_op = "nv_div"
+    if tk == "ident"
+      name   := target.get("name")
+      c_name := cg_lookup(cg, name)
+      if c_name != nil
+        cg_out(cg, buf, i + c_name + " = " + base_op + "(" + c_name + ", " + val_s + ");")
+      else
+        c_name = cg_define(cg, name)
+        cg_out(cg, buf, i + "NvVal " + c_name + " = " + val_s + ";")
+    return nil
+
+  if k == "return"
+    val_s := cg_expr(cg, stmt.get("val"))
+    cg_out(cg, buf, i + "return " + val_s + ";")
+    return nil
+
+  if k == "expr_stmt"
+    val_s := cg_expr(cg, stmt.get("expr"))
+    cg_out(cg, buf, i + val_s + ";")
+    return nil
+
+  if k == "if"
+    cg_if_stmt(cg, stmt, depth, buf)
+    return nil
+
+  if k == "for"
+    cg_for_stmt(cg, stmt, depth, buf)
+    return nil
+
+  if k == "while"
+    cond_s := cg_expr(cg, stmt.get("cond"))
+    cg_out(cg, buf, i + "while (nv_truthy(" + cond_s + ")) {")
+    cg_scope_push(cg)
+    cg_block(cg, stmt.get("body"), depth + 1, buf)
+    cg_scope_pop(cg)
+    cg_out(cg, buf, i + "}")
+    return nil
+
+  if k == "break"
+    cg_out(cg, buf, i + "break;")
+    return nil
+
+  if k == "continue"
+    cg_out(cg, buf, i + "continue;")
+    return nil
+
+  if k == "match"
+    cg_match_stmt(cg, stmt, depth, buf)
+    return nil
+
+  if k == "fn_def"
+    cg_nested_fn_def(cg, stmt, depth, buf)
+    return nil
+
+  if k == "comptime"
+    name   := stmt.get("name")
+    val_s  := cg_expr(cg, stmt.get("val"))
+    existing := cg_lookup(cg, name)
+    if existing != nil
+      cg_out(cg, buf, i + existing + " = " + val_s + ";")
+    else
+      c_name := cg_define(cg, name)
+      cg_out(cg, buf, i + "NvVal " + c_name + " = " + val_s + ";")
+    return nil
+
+  -- unsafe block: transparent — emit the body
+  if k == "unsafe_block"
+    body := stmt.get("body")
+    stmts2 := body.get("stmts")
+    ii = 0
+    while ii < stmts2.len
+      cg_stmt(cg, stmts2[ii], depth, buf)
+      ii = ii + 1
+    return nil
+
+  -- impl_block: register each method fn via nv_fn_impl_for
+  if k == "impl_block"
+    type_name := stmt.get("type_name")
+    methods   := stmt.get("methods")
+    for m in methods
+      if m.get("kind") == "fn_def"
+        method_name := m.get("name")
+        cg_nested_fn_def(cg, m, depth, buf)
+        fn_c := cg_lookup(cg, method_name)
+        if fn_c == nil
+          fn_c = "nv_fn((NvFn)nv_fn_" + method_name + ")"
+        cg_out(cg, buf, i + "nv_fn_impl_for(nv_str(\"" + type_name + "\"), nv_str(\"" + type_name + "\"), nv_str(\"" + method_name + "\"), " + fn_c + ", nv_nil());")
+    return nil
+
+  -- throw_stmt: raise exception
+  if k == "throw_stmt"
+    val_s := cg_expr(cg, stmt.get("val"))
+    cg_out(cg, buf, i + "nv_throw(" + val_s + ");")
+    return nil
+
+  -- try_catch: setjmp-based try/catch
+  if k == "try_catch"
+    try_body   := stmt.get("try_body")
+    catch_var  := stmt.get("catch_var")
+    catch_body := stmt.get("catch_body")
+    cg_out(cg, buf, i + "NV_TRY_BEGIN")
+    cg_scope_push(cg)
+    cg_block(cg, try_body, depth + 1, buf)
+    cg_scope_pop(cg)
+    -- Push scope, define catch var (macro declares the C variable), emit catch block
+    cg_scope_push(cg)
+    cv := cg_define(cg, catch_var)
+    cg_out(cg, buf, i + "NV_TRY_CATCH(" + cv + ")")
+    cg_block(cg, catch_body, depth + 1, buf)
+    cg_scope_pop(cg)
+    cg_out(cg, buf, i + "NV_TRY_END;")
+    return nil
+
+  -- spawn_call: real pthread via nv_spawn(fn_val, arg)
+  if k == "spawn_call"
+    args := stmt.get("args")
+    if args.len >= 2
+      fn_s  := cg_expr(cg, args[0])
+      arg_s := cg_expr(cg, args[1])
+      cg_out(cg, buf, i + "nv_spawn(" + fn_s + ", " + arg_s + ");")
+    return nil
+
+  cg_out(cg, buf, i + "/* unhandled stmt:" + k + " */")
+
+-- Emit a line to the appropriate buffer
+fn cg_out(cg, buf, line)
+  if buf == "fn"
+    emit_f(cg, line)
+  else if buf == "main"
+    emit_m(cg, line)
+  else
+    emit_f(cg, line)  -- default
+
+-- if statement codegen
+fn cg_if_stmt(cg, stmt, depth, buf)
+  i      := ind(depth)
+  cond_s := cg_expr(cg, stmt.get("cond"))
+  then_b := stmt.get("then")
+  elifs  := stmt.get("elifs")
+  else_b := stmt.get("else")
+  cg_out(cg, buf, i + "if (nv_truthy(" + cond_s + ")) {")
+  cg_scope_push(cg)
+  cg_block(cg, then_b, depth + 1, buf)
+  cg_scope_pop(cg)
+  if elifs != nil
+    j = 0
+    while j < elifs.len
+      ef    := elifs[j]
+      ec    := cg_expr(cg, ef.get("cond"))
+      eb    := ef.get("body")
+      cg_out(cg, buf, i + "} else if (nv_truthy(" + ec + ")) {")
+      cg_scope_push(cg)
+      cg_block(cg, eb, depth + 1, buf)
+      cg_scope_pop(cg)
+      j = j + 1
+  if else_b != nil
+    cg_out(cg, buf, i + "} else {")
+    cg_scope_push(cg)
+    cg_block(cg, else_b, depth + 1, buf)
+    cg_scope_pop(cg)
+  cg_out(cg, buf, i + "}")
+
+-- for loop codegen
+fn cg_for_stmt(cg, stmt, depth, buf)
+  i       := ind(depth)
+  var     := stmt.get("var")
+  tuple_v := stmt.get("vars")
+  iter    := stmt.get("iter")
+  body    := stmt.get("body")
+  ik      := iter.get("kind")
+  cg_scope_push(cg)
+  -- Tuple destructuring: for (a, b) in iter
+  if tuple_v != nil
+    tv     := cg_fresh(cg)
+    nv_len := cg_fresh(cg)
+    jv     := cg_fresh(cg)
+    ev     := cg_fresh(cg)
+    iter_s := cg_expr(cg, iter)
+    cg_out(cg, buf, i + "{ NvVal " + tv + " = " + iter_s + "; NvVal " + nv_len + " = nv_len(" + tv + ");")
+    cg_out(cg, buf, i + "for (int64_t " + jv + " = 0; " + jv + " < " + nv_len + ".i; " + jv + "++) {")
+    cg_out(cg, buf, i + "    NvVal " + ev + " = nv_index(" + tv + ", nv_int(" + jv + "));")
+    vi = 0
+    while vi < tuple_v.len
+      vname := tuple_v[vi]
+      vc    := cg_define(cg, vname)
+      cg_out(cg, buf, i + "    NvVal " + vc + " = nv_index(" + ev + ", nv_int(" + str(vi) + "));")
+      vi = vi + 1
+    cg_block(cg, body, depth + 1, buf)
+    cg_out(cg, buf, i + "} }")
+  else if ik == "range"
+    start_s := cg_expr(cg, iter.get("start"))
+    end_s   := cg_expr(cg, iter.get("end"))
+    op      := iter.get("op")
+    sv      := cg_fresh(cg)
+    ev      := cg_fresh(cg)
+    iv      := cg_define(cg, var)
+    cmp_fn  = "nv_lt"
+    if op == "..="
+      cmp_fn = "nv_le"
+    cg_out(cg, buf, i + "{ NvVal " + sv + " = " + start_s + "; NvVal " + ev + " = " + end_s + ";")
+    cg_out(cg, buf, i + "for (NvVal " + iv + " = " + sv + "; nv_truthy(" + cmp_fn + "(" + iv + ", " + ev + ")); " + iv + " = nv_add(" + iv + ", nv_int(1))) {")
+    cg_block(cg, body, depth + 1, buf)
+    cg_out(cg, buf, i + "} }")
+  else
+    tv := cg_fresh(cg)
+    nv := cg_fresh(cg)
+    jv := cg_fresh(cg)
+    xv := cg_define(cg, var)
+    iter_s := cg_expr(cg, iter)
+    cg_out(cg, buf, i + "{ NvVal " + tv + " = " + iter_s + "; NvVal " + nv + " = nv_len(" + tv + ");")
+    cg_out(cg, buf, i + "for (int64_t " + jv + " = 0; " + jv + " < " + nv + ".i; " + jv + "++) {")
+    cg_out(cg, buf, i + "    NvVal " + xv + " = nv_index(" + tv + ", nv_int(" + jv + "));")
+    cg_block(cg, body, depth + 1, buf)
+    cg_out(cg, buf, i + "} }")
+  cg_scope_pop(cg)
+
+-- match statement codegen
+-- Build condition string for a match pattern (without emitting)
+fn cg_pat_cond(cg, pat, sv)
+  pk := pat.get("kind")
+  is_wildcard = pk == "ident" and pat.get("name") == "_"
+  is_bind     = pk == "ident" and pat.get("name") != "_"
+  is_call_pat = pk == "call"
+  is_or_pat   = pk == "or_pat"
+  is_range_pat = pk == "range"
+  if is_wildcard or is_bind
+    return "1"
+  if is_range_pat
+    rs := cg_expr(cg, pat.get("start"))
+    re := cg_expr(cg, pat.get("end"))
+    op := pat.get("op")
+    cmp_end = "nv_lt"
+    if op == "..="
+      cmp_end = "nv_le"
+    return "nv_truthy(nv_ge(" + sv + ", " + rs + ")) && nv_truthy(" + cmp_end + "(" + sv + ", " + re + "))"
+  if is_call_pat
+    -- Check for direct call pattern: Circle(r) → fn="Circle", no "callee"
+    fn_field := pat.get("fn")
+    if fn_field != nil
+      return "(" + sv + ".tag == NV_MAP && nv_truthy(nv_eq(nv_map_get_opt(" + sv + ", nv_str(\"_tag\")), nv_str(\"" + fn_field + "\"))))"
+    callee := pat.get("callee")
+    if callee == nil
+      callee = pat
+    ck := callee.get("kind")
+    -- Enum variant: Shape.Circle(r) — callee is a field access
+    if ck == "field"
+      tname := callee.get("obj").get("name")
+      vname := callee.get("field")
+      enum_types := cg.get("enum_types")
+      if enum_types.get(tname) != nil
+        return "(" + sv + ".tag == NV_MAP && nv_truthy(nv_eq(nv_map_get_opt(" + sv + ", nv_str(\"_type\")), nv_str(\"" + tname + "\"))) && nv_truthy(nv_eq(nv_map_get_opt(" + sv + ", nv_str(\"_tag\")), nv_str(\"" + vname + "\"))))"
+    -- Bare ctor call: Circle(r) — check _tag
+    if ck == "ident"
+      vname := callee.get("name")
+      return "(" + sv + ".tag == NV_MAP && nv_truthy(nv_eq(nv_map_get_opt(" + sv + ", nv_str(\"_tag\")), nv_str(\"" + vname + "\"))))"
+    return "0"
+  if is_or_pat
+    or_pats := pat.get("pats")
+    cond = ""
+    oi = 0
+    while oi < or_pats.len
+      pv := cg_expr(cg, or_pats[oi])
+      if oi == 0
+        cond = "nv_truthy(nv_eq(" + sv + ", " + pv + "))"
+      else
+        cond = cond + " || nv_truthy(nv_eq(" + sv + ", " + pv + "))"
+      oi = oi + 1
+    return cond
+  -- Literal comparison
+  pv := cg_expr(cg, pat)
+  "nv_truthy(nv_eq(" + sv + ", " + pv + "))"
+
+-- Emit bindings for a match pattern
+fn cg_pat_bindings(cg, pat, sv, depth, buf)
+  i := ind(depth)
+  pk := pat.get("kind")
+  is_bind = pk == "ident" and pat.get("name") != "_"
+  if is_bind
+    bname := pat.get("name")
+    bv    := cg_define(cg, bname)
+    cg_out(cg, buf, i + "NvVal " + bv + " = " + sv + ";")
+    return nil
+  if pk == "call"
+    callee := pat.get("callee")
+    call_args := pat.get("args")
+    if call_args == nil
+      call_args = []
+    -- Direct call pattern Circle(r): fn="Circle", enum fields stored as "0","1",...
+    fn_field := pat.get("fn")
+    if fn_field != nil
+      ai = 0
+      while ai < call_args.len
+        arg_node := call_args[ai]
+        if arg_node.get("kind") == "ident"
+          aname := arg_node.get("name")
+          av    := cg_define(cg, aname)
+          cg_out(cg, buf, i + "NvVal " + av + " = nv_map_get_opt(" + sv + ", nv_str(\"" + str(ai) + "\"));")
+        ai = ai + 1
+      return nil
+    if callee == nil
+      callee = pat
+    ck := callee.get("kind")
+    is_enum_variant = ck == "field"
+    ai = 0
+    while ai < call_args.len
+      arg_node := call_args[ai]
+      if arg_node.get("kind") == "ident"
+        aname := arg_node.get("name")
+        av    := cg_define(cg, aname)
+        if is_enum_variant
+          -- Enum variant fields stored as "0", "1", ...
+          cg_out(cg, buf, i + "NvVal " + av + " = nv_map_get_opt(" + sv + ", nv_str(\"" + str(ai) + "\"));")
+        else
+          cg_out(cg, buf, i + "NvVal " + av + " = nv_index(" + sv + ", nv_int(" + str(ai) + "));")
+      ai = ai + 1
+  nil
+
+fn cg_match_stmt(cg, stmt, depth, buf)
+  i       := ind(depth)
+  subject := cg_expr(cg, stmt.get("subject"))
+  arms    := stmt.get("arms")
+  sv      := cg_fresh(cg)
+  cg_out(cg, buf, i + "{ NvVal " + sv + " = " + subject + ";")
+
+  -- Check if any arm has a guard
+  has_guard = false
+  for arm in arms
+    g := arm.get("guard")
+    if g != nil
+      has_guard = true
+
+  if has_guard
+    -- _done flag approach: each arm is an independent if-block
+    done_v := cg_fresh(cg)
+    cg_out(cg, buf, i + "int " + done_v + " = 0;")
+    j = 0
+    while j < arms.len
+      arm := arms[j]
+      pat := arm.get("pat")
+      bd  := arm.get("body")
+      g   := arm.get("guard")
+      cond := cg_pat_cond(cg, pat, sv)
+      cg_out(cg, buf, i + "if (!" + done_v + " && " + cond + ") {")
+      cg_scope_push(cg)
+      cg_pat_bindings(cg, pat, sv, depth + 1, buf)
+      if g != nil
+        gs := cg_expr(cg, g)
+        cg_out(cg, buf, i + "    if (nv_truthy(" + gs + ")) {")
+        cg_out(cg, buf, i + "        " + done_v + " = 1;")
+        bd_s := cg_expr(cg, bd)
+        cg_out(cg, buf, i + "        return " + bd_s + ";")
+        cg_out(cg, buf, i + "    }")
+      else
+        cg_out(cg, buf, i + "    " + done_v + " = 1;")
+        bd_s := cg_expr(cg, bd)
+        cg_out(cg, buf, i + "    return " + bd_s + ";")
+      cg_scope_pop(cg)
+      cg_out(cg, buf, i + "}")
+      j = j + 1
+  else
+    -- Simple if/else-if chain (no guards)
+    first = true
+    j = 0
+    while j < arms.len
+      arm := arms[j]
+      pat := arm.get("pat")
+      bd  := arm.get("body")
+      cond := cg_pat_cond(cg, pat, sv)
+      is_wildcard = pat.get("kind") == "ident" and pat.get("name") == "_"
+      if first
+        cg_out(cg, buf, i + "if (" + cond + ") {")
+        first = false
+      else if is_wildcard
+        cg_out(cg, buf, i + "} else {")
+      else
+        cg_out(cg, buf, i + "} else if (" + cond + ") {")
+      cg_scope_push(cg)
+      cg_pat_bindings(cg, pat, sv, depth + 1, buf)
+      bd_s := cg_expr(cg, bd)
+      cg_out(cg, buf, i + "    return " + bd_s + ";")
+      cg_scope_pop(cg)
+      j = j + 1
+    if not first
+      cg_out(cg, buf, i + "} }")
+    else
+      cg_out(cg, buf, i + "}")
+
+  if has_guard
+    cg_out(cg, buf, i + "}")
+
+-- Emit a nested fn_def (inside a function body) as a named closure.
+-- Creates a unique C function, captures scope, and stores result in local var.
+fn cg_nested_fn_def(cg, fd, depth, buf)
+  i      := ind(depth)
+  name   := fd.get("name")
+  params := fd.get("params")
+  body   := fd.get("body")
+  -- Unique C function name
+  uid    := cg.get("lambda_counter")
+  cg.set("lambda_counter", uid + 1)
+  cname := "nv_fn_nested_" + name + "_" + str(uid)
+  -- Forward declare
+  sig = "NvVal " + cname + "("
+  j = 0
+  while j < params.len
+    if j > 0
+      sig = sig + ", "
+    sig = sig + "NvVal _p" + str(j)
+    j = j + 1
+  if params.len > 0
+    sig = sig + ", "
+  else
+    sig = sig + "NvVal _unused, "
+  sig = sig + "NvVal __env);"
+  emit_d(cg, sig)
+  -- Capture current scope
+  captured := collect_scope_bindings(cg)
+  -- Store closure in scope
+  fv := cg_fresh(cg)
+  scopes := cg.get("scopes")
+  top    := scopes[scopes.len - 1]
+  top.set(name, fv)
+  -- Emit closure creation with mutable env for self-reference support
+  env_var := cg_fresh(cg)
+  -- Build env map incrementally to avoid huge variadic calls at high opt levels
+  cg_out(cg, buf, i + "NvVal " + env_var + " = nv_map_new();")
+  for pair in captured
+    nm := pair[0]
+    cv := cg_wrap_as_val(pair[1])
+    cg_out(cg, buf, i + "nv_map_set_mut(" + env_var + ", nv_str(\"" + nm + "\"), " + cv + ");")
+  cg_out(cg, buf, i + "NvVal " + fv + " = nv_closure((NvFn)" + cname + ", " + env_var + ");")
+  -- Add self to env for recursion
+  cg_out(cg, buf, i + "nv_map_set_mut(" + env_var + ", nv_str(\"" + name + "\"), " + fv + ");")
+  -- Build augmented captured list that includes self
+  aug_captured = []
+  for pair in captured
+    aug_captured.push(pair)
+  self_pair = []
+  self_pair.push(name)
+  self_pair.push(fv)
+  aug_captured.push(self_pair)
+  -- Queue a lambda-like entry for deferred body emission
+  lam = {}
+  lam.set("kind", "lambda")
+  lam.set("params", params)
+  lam.set("body", body)
+  lam.set("lambda_id", uid)
+  lam.set("lambda_cname", cname)
+  lam.set("captured", aug_captured)
+  cg.get("pending_lambdas").push(lam)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- FUNCTION BODY EMISSION
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Emit a block in a function context: all but last stmt normally,
+-- last expr_stmt becomes `return expr;` (implicit return)
+fn cg_block_fn(cg, blk, depth)
+  stmts := blk.get("stmts")
+  n     := stmts.len
+  i = 0
+  while i < n
+    s  := stmts[i]
+    sk := s.get("kind")
+    if i == n - 1
+      -- Last statement: implicit return for expr_stmt
+      if sk == "expr_stmt"
+        val_s := cg_expr(cg, s.get("expr"))
+        emit_f(cg, ind(depth) + "return " + val_s + ";")
+      else
+        cg_stmt(cg, s, depth, "fn")
+    else
+      cg_stmt(cg, s, depth, "fn")
+    i = i + 1
+
+fn cg_fn_emit_body(cg, fd)
+  name   := fd.get("name")
+  params := fd.get("params")
+  body   := fd.get("body")
+  -- Build signature
+  sig = "NvVal nv_fn_" + name + "("
+  i = 0
+  while i < params.len
+    if i > 0
+      sig = sig + ", "
+    sig = sig + "NvVal _p" + str(i)
+    i = i + 1
+  if params.len > 0
+    sig = sig + ", "
+  sig = sig + "NvVal __env) {"
+  emit_f(cg, sig)
+  emit_f(cg, "    NV_ENTER(\"" + name + "\");")
+  emit_f(cg, "    (void)__env;")
+  -- Push function scope
+  cg_scope_push(cg)
+  -- Define parameter names in scope
+  i = 0
+  while i < params.len
+    scopes := cg.get("scopes")
+    top    := scopes[scopes.len - 1]
+    top.set(params[i], "_p" + str(i))
+    i = i + 1
+  -- Emit body
+  bk := body.get("kind")
+  if bk == "block"
+    cg_block_fn(cg, body, 1)
+  else
+    -- Arrow body: return the expression
+    bv := cg_expr(cg, body)
+    emit_f(cg, "    return " + bv + ";")
+  cg_scope_pop(cg)
+  emit_f(cg, "    return nv_nil();")
+  emit_f(cg, "}")
+  emit_f(cg, "")
+
+-- ── Path helpers (used by import resolution) ──────────────────────────────
+fn _nvl_dirname(path)
+  -- Return the directory part of a file path
+  if path == "" => return "."
+  i = path.len - 1
+  -- Skip trailing slashes
+  while i > 0 and path[i] == "/"
+    i = i - 1
+  -- Walk back to last slash
+  while i >= 0 and path[i] != "/"
+    i = i - 1
+  if i < 0 => return "."
+  if i == 0 => return "/"
+  path.slice(0, i)
+
+fn _nvl_path_join(dir, rel)
+  -- Join a directory with a relative path
+  if rel.len > 0 and rel[0] == "/" => return rel
+  if dir == "." => return rel
+  dir + "/" + rel
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- PROGRAM EMISSION
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn cg_program(stmts, src_file)
+  cg := cg_new()
+  if src_file == nil
+    src_file = ""
+  cg.set("src_file", src_file)
+
+  -- Collect top-level fn_defs, extern_fn_decls, cincludes, imports
+  fn_defs          := cg.get("fn_defs")
+  extern_fns       := cg.get("extern_fns")
+  cincludes        := cg.get("cincludes")
+  imported_globals := []
+  for s in stmts
+    k := s.get("kind")
+    if k == "import_stmt"
+      -- Inline the imported file's fn_defs, extern_fns, and module-level stmts
+      imp_path  := s.get("path")
+      imp_alias := s.get("alias")   -- nil for flat import, string for "as ns"
+      -- Resolve relative paths: try src_dir first, then parent (project root), then NUVOLA_STDLIB
+      resolved_path = nil
+      if imp_path.len > 0 and imp_path[0] != "/"
+        src_dir    := _nvl_dirname(src_file)
+        -- 1. Beside source file
+        candidate1  = _nvl_path_join(src_dir, imp_path)
+        if read_file(candidate1) != nil
+          resolved_path = candidate1
+        -- 2. One level up (e.g. tests/ → project root that has std/)
+        if resolved_path == nil
+          parent_dir  := _nvl_dirname(src_dir)
+          candidate2   = _nvl_path_join(parent_dir, imp_path)
+          if read_file(candidate2) != nil
+            resolved_path = candidate2
+        -- 3. NUVOLA_STDLIB env var
+        if resolved_path == nil
+          stdlib_dir := env_get("NUVOLA_STDLIB")
+          if stdlib_dir != nil and stdlib_dir != ""
+            candidate3 = stdlib_dir + "/" + imp_path
+            if read_file(candidate3) != nil
+              resolved_path = candidate3
+        -- 4. CWD fallback
+        if resolved_path == nil
+          resolved_path = imp_path
+      else
+        resolved_path = imp_path
+      imp_src  := read_file(resolved_path)
+      if imp_src != nil
+        imp_toks  := lex(imp_src)
+        imp_state := make_state(imp_toks)
+        imp_stmts := parse_program(imp_state)
+        -- For aliased imports: collect NS entries for map-building in main()
+        ns_entries = []
+        for is2 in imp_stmts
+          ik := is2.get("kind")
+          if ik == "fn_def"
+            fn_defs.push(is2)
+            if imp_alias != nil
+              entry = {}
+              entry.set("name", is2.get("name"))
+              entry.set("kind", "fn")
+              ns_entries.push(entry)
+          else if ik == "extern_fn_decl"
+            iname    := is2.get("name")
+            iparams  := is2.get("params")
+            irettype := is2.get("ret_type")
+            ivar = false
+            if iparams.len > 0
+              last_p := iparams[iparams.len - 1]
+              if last_p[0] == "..."
+                ivar = true
+            iinfo = {}
+            iinfo.set("params",   iparams)
+            iinfo.set("ret_type", irettype)
+            iinfo.set("variadic", ivar)
+            extern_fns.set(iname, iinfo)
+          else if ik == "cinclude"
+            cincludes.push(is2.get("header"))
+          else
+            -- Module-level constants/variables (let, assign, expr_stmt, etc.)
+            -- Always emit as globals so module's own fn bodies can see them
+            imported_globals.push(is2)
+            if imp_alias != nil
+              -- Also track for NS map so ns.NAME works
+              entry = {}
+              entry.set("name", is2.get("name"))
+              entry.set("kind", "let")
+              entry.set("stmt", is2)
+              ns_entries.push(entry)
+        -- Register namespace if aliased
+        if imp_alias != nil
+          namespaces := cg.get("namespaces")
+          namespaces.set(imp_alias, ns_entries)
+    else if k == "fn_def"
+      fn_defs.push(s)
+    else if k == "extern_fn_decl"
+      -- Register in extern_fns table
+      ename    := s.get("name")
+      eparams  := s.get("params")
+      erettype := s.get("ret_type")
+      -- Check if variadic (last param is [..., ...])
+      evar = false
+      if eparams.len > 0
+        last_p := eparams[eparams.len - 1]
+        if last_p[0] == "..."
+          evar = true
+      einfo = {}
+      einfo.set("params",   eparams)
+      einfo.set("ret_type", erettype)
+      einfo.set("variadic", evar)
+      extern_fns.set(ename, einfo)
+    else if k == "cinclude"
+      cincludes.push(s.get("header"))
+
+  -- Emit #define guards for user fns that shadow runtime builtins
+  -- (must appear before #include "nuvola.h")
+  builtin_names := ["dropout", "layer_norm", "batch_norm"]
+  for fd in fn_defs
+    fname := fd.get("name")
+    for bn in builtin_names
+      if fname == bn
+        emit_d(cg, "#define NV_NO_BUILTIN_" + fname + " 1")
+
+  -- Header
+  emit_d(cg, "#include \"nuvola.h\"")
+  -- User @cinclude headers
+  for hdr in cincludes
+    emit_d(cg, "#include <" + hdr + ">")
+  emit_d(cg, "")
+
+  -- Pre-scan: register module-level variables as C globals so functions can see them
+  cg_scan_globals(cg, imported_globals)
+  cg_scan_globals(cg, stmts)
+  -- Register namespace aliases as globals (each NS alias is a map variable)
+  namespaces := cg.get("namespaces")
+  for pair in namespaces.entries()
+    ns_alias := pair[0]
+    if cg_lookup(cg, ns_alias) == nil
+      cg_define_global(cg, ns_alias)
+  emit_d(cg, "")
+
+  -- Process enum TypeDecl: emit constructor functions and register in scope
+  all_stmts_for_enum := []
+  for s in imported_globals
+    all_stmts_for_enum.push(s)
+  for s in stmts
+    all_stmts_for_enum.push(s)
+  enum_types := cg.get("enum_types")
+  for s in all_stmts_for_enum
+    if s.get("kind") == "type_decl" and s.get("is_enum")
+      tname    := s.get("name")
+      tvars    := s.get("variants")
+      enum_types.set(tname, tvars)
+      for vr in tvars
+        vname   := vr.get("name")
+        nf      := vr.get("n_fields")
+        fn_c    := "nv_fn_" + tname + "_" + vname
+        nv_name := tname + "_" + vname
+        -- Register in scope and arity map
+        scopes := cg.get("scopes")
+        scopes[0].set(nv_name, fn_c)
+        arity_map := cg.get("arity_map")
+        if nf == 0
+          arity_map.set(nv_name, 0)
+        else
+          arity_map.set(nv_name, 1)
+        -- Emit C constructor function
+        if nf == 0
+          emit_f(cg, "static NvVal " + fn_c + "(NvVal _unused, NvVal __env) {")
+          emit_f(cg, "    (void)_unused; (void)__env;")
+          emit_f(cg, "    return nv_map_of(4, nv_str(\"_type\"), nv_str(\"" + tname + "\"), nv_str(\"_tag\"), nv_str(\"" + vname + "\"));")
+          emit_f(cg, "}")
+        else if nf == 1
+          emit_f(cg, "static NvVal " + fn_c + "(NvVal __arg, NvVal __env) {")
+          emit_f(cg, "    (void)__env;")
+          emit_f(cg, "    return nv_map_of(6, nv_str(\"_type\"), nv_str(\"" + tname + "\"), nv_str(\"_tag\"), nv_str(\"" + vname + "\"), nv_str(\"0\"), __arg);")
+          emit_f(cg, "}")
+        else
+          -- Multi-arg: take list, unpack positionally
+          emit_f(cg, "static NvVal " + fn_c + "(NvVal __args, NvVal __env) {")
+          emit_f(cg, "    (void)__env;")
+          emit_f(cg, "    NvVal _m = nv_map_of(4, nv_str(\"_type\"), nv_str(\"" + tname + "\"), nv_str(\"_tag\"), nv_str(\"" + vname + "\"));")
+          fi = 0
+          while fi < nf
+            emit_f(cg, "    nv_map_set_mut(_m, nv_str(\"" + str(fi) + "\"), nv_index(__args, nv_int(" + str(fi) + ")));")
+            fi = fi + 1
+          emit_f(cg, "    return _m;")
+          emit_f(cg, "}")
+  emit_f(cg, "")
+
+  -- Build arity map: fn_name → param count (for compile-time arity checking)
+  arity_map := cg.get("arity_map")
+  for fd in fn_defs
+    arity_map.set(fd.get("name"), fd.get("params").len)
+
+  -- Forward declarations for all top-level fns
+  for fd in fn_defs
+    name   := fd.get("name")
+    params := fd.get("params")
+    sig    = "NvVal nv_fn_" + name + "("
+    i = 0
+    while i < params.len
+      if i > 0
+        sig = sig + ", "
+      sig = sig + "NvVal _p" + str(i)
+      i = i + 1
+    if params.len > 0
+      sig = sig + ", "
+    sig = sig + "NvVal __env);"
+    emit_d(cg, sig)
+  emit_d(cg, "")
+
+  -- Emit each top-level fn body
+  for fd in fn_defs
+    cg_fn_emit_body(cg, fd)
+
+  -- Emit main()
+  emit_m(cg, "int main(int argc, char **argv) {")
+  emit_m(cg, "    NV_GC_INIT();")
+  emit_m(cg, "    _nv_argc = argc; _nv_argv = argv;")
+
+  -- Build namespace map objects (for aliased imports: import "path" as ns)
+  for pair in namespaces.entries()
+    ns_alias   := pair[0]
+    ns_entries := pair[1]
+    ns_var     := cg_lookup(cg, ns_alias)
+    emit_m(cg, "    " + ns_var + " = nv_map_new();")
+    for entry in ns_entries
+      ename := entry.get("name")
+      ekind := entry.get("kind")
+      if ekind == "fn"
+        -- Function: wrap as NvFn value
+        emit_m(cg, "    nv_map_set_mut(" + ns_var + ", nv_str(\"" + ename + "\"), nv_fn((NvFn)nv_fn_" + ename + "));")
+      else if ekind == "let"
+        -- Constant: evaluate and store
+        stmt := entry.get("stmt")
+        if stmt != nil
+          val_expr := stmt.get("val")
+          if val_expr != nil
+            val_c := cg_expr(cg, val_expr)
+            emit_m(cg, "    nv_map_set_mut(" + ns_var + ", nv_str(\"" + ename + "\"), " + val_c + ");")
+
+  -- Emit imported module-level constants/variables first
+  for s in imported_globals
+    cg_stmt(cg, s, 1, "main")
+
+  for s in stmts
+    k := s.get("kind")
+    if k != "fn_def" and k != "extern_fn_decl" and k != "cinclude" and k != "import_stmt"
+      cg_stmt(cg, s, 1, "main")
+
+  -- If a `fn main()` is defined, call it
+  for fd in fn_defs
+    if fd.get("name") == "main"
+      emit_m(cg, "    nv_fn_main(nv_nil());")
+
+  emit_m(cg, "    return 0;")
+  emit_m(cg, "}")
+
+  -- Process pending lambdas AFTER main body (lambdas may nest more lambdas)
+  process_pending_lambdas(cg)
+
+  -- Assemble final output
+  all_lines = []
+  for line in cg.get("buf_decls")
+    all_lines.push(line)
+  for line in cg.get("buf_fns")
+    all_lines.push(line)
+  for line in cg.get("buf_main")
+    all_lines.push(line)
+  all_lines.join("\n")
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ENTRY POINT
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- Locate the runtime/ directory containing nuvola.h.
+-- Checks: beside source file, one level up, beside this binary, then CWD.
+fn locate_runtime(src_path, self_path)
+  candidates = []
+  src_dir := path_dirname(src_path)
+  candidates.push(path_join(src_dir, "runtime"))
+  candidates.push(path_join(path_dirname(src_dir), "runtime"))
+  self_dir := path_dirname(self_path)
+  candidates.push(path_join(self_dir, "runtime"))
+  candidates.push(path_join(path_dirname(self_dir), "runtime"))
+  candidates.push("runtime")
+  for d in candidates
+    if file_exists(path_join(d, "nuvola.h"))
+      return d
+  "runtime"
+
+-- Compile src_path to out_path using the runtime at rt_dir.
+-- Returns true on success, false on failure (prints error).
+fn do_compile(src_path, out_path, rt_dir, c_src)
+  tmp := out_path + ".c"
+  write_file(tmp, c_src)
+  clang_cmd := "clang -O3 -march=native -ffast-math -Wno-unused-variable -Wno-unused-function " + tmp + " -I" + rt_dir + " -lm -lpthread -o " + out_path + " 2>&1"
+  clang_out := popen_read(clang_cmd)
+  nv_shell("rm -f " + tmp)
+  if file_exists(out_path)
+    return true
+  if clang_out != ""
+    print("nuvc: clang error:\n" + clang_out)
+  else
+    print("nuvc: clang failed (binary not produced)")
+  false
+
+argv := args()
+if argv.len < 2
+  print("Usage: nuvc <command> [options] <file.nvl>")
+  print("")
+  print("Commands:")
+  print("  run  <file.nvl> [-- arg...]  compile and run immediately")
+  print("  build <file.nvl> -o <out>   compile to a binary")
+  print("  check <file.nvl>             parse and validate only")
+  print("  emit-c <file.nvl>            print generated C to stdout")
+  print("")
+  print("Legacy: nuvc <file.nvl> [-o binary]")
+else
+  -- Subcommand dispatch
+  sub := argv[1]
+
+  -- `nuvc run file.nvl [-- arg1 arg2 ...]`
+  if sub == "run"
+    if argv.len < 3
+      print("nuvc: run requires a source file")
+    else
+      run_path := argv[2]
+      run_src  := read_file(run_path)
+      if run_src == nil
+        print("nuvc: error: cannot read " + run_path)
+      else
+        tokens := lex(run_src)
+        state  := make_state(tokens)
+        stmts  := parse_program(state)
+        c_src  := cg_program(stmts, run_path)
+        rt_dir := locate_runtime(run_path, argv[0])
+        -- Use a unique tmp name: strip dirs and .nvl suffix
+        run_base := path_dirname(run_path)
+        run_name := run_path
+        if run_path.len > run_base.len + 1
+          run_name = run_path.slice(run_base.len + 1)
+        run_stem := run_name.replace(".nvl", "").replace("/", "_").replace(".", "_")
+        tmp_bin := "/tmp/nuvc_run_" + run_stem
+        ok := do_compile(run_path, tmp_bin, rt_dir, c_src)
+        if ok
+          -- Pass through all args after the source file.
+          -- `--` is treated as separator (skipped); everything else is forwarded.
+          run_args = ""
+          i = 3
+          while i < argv.len
+            a := argv[i]
+            if a != "--"
+              run_args = run_args + " " + a
+            i = i + 1
+          nv_shell(tmp_bin + run_args)
+          nv_shell("rm -f " + tmp_bin)
+
+  -- `nuvc check file.nvl`
+  else if sub == "check"
+    if argv.len < 3
+      print("nuvc: check requires a source file")
+    else
+      chk_path := argv[2]
+      chk_src  := read_file(chk_path)
+      if chk_src == nil
+        print("nuvc: error: cannot read " + chk_path)
+      else
+        tokens := lex(chk_src)
+        state  := make_state(tokens)
+        stmts  := parse_program(state)
+        -- Run codegen to catch codegen-level errors too
+        c_src  := cg_program(stmts, chk_path)
+        print("nuvc: ok " + chk_path)
+
+  -- `nuvc emit-c file.nvl`
+  else if sub == "emit-c"
+    if argv.len < 3
+      print("nuvc: emit-c requires a source file")
+    else
+      ec_path := argv[2]
+      ec_src  := read_file(ec_path)
+      if ec_src == nil
+        print("nuvc: error: cannot read " + ec_path)
+      else
+        tokens := lex(ec_src)
+        state  := make_state(tokens)
+        stmts  := parse_program(state)
+        print(cg_program(stmts, ec_path))
+
+  -- `nuvc build file.nvl -o out`
+  else if sub == "build"
+    if argv.len < 5 or argv[3] != "-o"
+      print("nuvc: build requires: nuvc build <file.nvl> -o <out>")
+    else
+      b_path := argv[2]
+      b_out  := argv[4]
+      b_src  := read_file(b_path)
+      if b_src == nil
+        print("nuvc: error: cannot read " + b_path)
+      else
+        tokens := lex(b_src)
+        state  := make_state(tokens)
+        stmts  := parse_program(state)
+        c_src  := cg_program(stmts, b_path)
+        rt_dir := locate_runtime(b_path, argv[0])
+        ok := do_compile(b_path, b_out, rt_dir, c_src)
+        if ok
+          print("nuvc: compiled " + b_path + " → " + b_out)
+
+  -- Legacy: `nuvc file.nvl [-o binary]`
+  else
+    path := argv[1]
+    src  := read_file(path)
+    if src == nil
+      print("nuvc: error: cannot read " + path)
+    else
+      tokens := lex(src)
+      state  := make_state(tokens)
+      stmts  := parse_program(state)
+      c_src  := cg_program(stmts, path)
+      if argv.len >= 4 and argv[2] == "-o"
+        out    := argv[3]
+        rt_dir := locate_runtime(path, argv[0])
+        ok := do_compile(path, out, rt_dir, c_src)
+        if ok
+          print("nuvc: compiled " + path + " → " + out)
+      else
+        print(c_src)

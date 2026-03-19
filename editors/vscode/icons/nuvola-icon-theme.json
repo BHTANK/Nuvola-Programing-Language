@@ -1,0 +1,13 @@
+{
+  "iconDefinitions": {
+    "nuvola-file": {
+      "iconPath": "./nuvola-icon.svg"
+    }
+  },
+  "languageIds": {
+    "nuvola": "nuvola-file"
+  },
+  "fileExtensions": {
+    "nvl": "nuvola-file"
+  }
+}

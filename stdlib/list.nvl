@@ -1,0 +1,635 @@
+-- stdlib/list.nvl — List (array) utilities for Nuvola
+-- Pure Nuvola functional-style operations on lists.
+
+-- ── Transformation ────────────────────────────────────────────────────────────
+
+fn list_map(lst, f)
+  -- Apply f to each element; return new list.
+  out := []
+  i   := 0
+  while i < lst.len()
+    out.push(f(lst[i]))
+    i = i + 1
+  out
+
+fn list_filter(lst, pred)
+  -- Keep only elements where pred(elem) is true.
+  out := []
+  i   := 0
+  while i < lst.len()
+    if pred(lst[i])
+      out.push(lst[i])
+    i = i + 1
+  out
+
+fn list_reduce(lst, f, init)
+  -- Fold left: acc = f(acc, elem) for each elem.
+  acc := init
+  i   := 0
+  while i < lst.len()
+    acc = f(acc, lst[i])
+    i   = i + 1
+  acc
+
+fn list_flat_map(lst, f)
+  -- Map then flatten one level.
+  list_flatten(list_map(lst, f))
+
+fn list_filter_map(lst, f)
+  -- Apply f; keep non-nil results.
+  out := []
+  i   := 0
+  while i < lst.len()
+    v := f(lst[i])
+    if v != nil
+      out.push(v)
+    i = i + 1
+  out
+
+-- ── Predicates ────────────────────────────────────────────────────────────────
+
+fn list_any(lst, pred)
+  -- True if pred returns true for at least one element.
+  i := 0
+  while i < lst.len()
+    if pred(lst[i])
+      return true
+    i = i + 1
+  false
+
+fn list_all(lst, pred)
+  -- True if pred returns true for every element.
+  i := 0
+  while i < lst.len()
+    if not pred(lst[i])
+      return false
+    i = i + 1
+  true
+
+fn list_none(lst, pred)
+  not list_any(lst, pred)
+
+-- ── Searching ─────────────────────────────────────────────────────────────────
+
+fn list_find(lst, pred)
+  -- Return first element satisfying pred, or nil.
+  i := 0
+  while i < lst.len()
+    if pred(lst[i])
+      return lst[i]
+    i = i + 1
+  nil
+
+fn list_find_index(lst, pred)
+  -- Return index of first element satisfying pred, or -1.
+  i := 0
+  while i < lst.len()
+    if pred(lst[i])
+      return i
+    i = i + 1
+  -1
+
+fn list_index_of(lst, val)
+  -- Return index of first element equal to val, or -1.
+  i := 0
+  while i < lst.len()
+    if lst[i] == val
+      return i
+    i = i + 1
+  -1
+
+fn list_contains(lst, val)
+  list_index_of(lst, val) >= 0
+
+-- ── Slicing ───────────────────────────────────────────────────────────────────
+
+fn list_take(lst, n)
+  -- First n elements.
+  out := []
+  i   := 0
+  lim := n
+  if lim > lst.len()
+    lim = lst.len()
+  while i < lim
+    out.push(lst[i])
+    i = i + 1
+  out
+
+fn list_drop(lst, n)
+  -- All elements after the first n.
+  out := []
+  i   := n
+  while i < lst.len()
+    out.push(lst[i])
+    i = i + 1
+  out
+
+fn list_take_while(lst, pred)
+  -- Take elements from front while pred is true.
+  out := []
+  i   := 0
+  while i < lst.len() and pred(lst[i])
+    out.push(lst[i])
+    i = i + 1
+  out
+
+fn list_drop_while(lst, pred)
+  -- Drop elements from front while pred is true.
+  i := 0
+  while i < lst.len() and pred(lst[i])
+    i = i + 1
+  out := []
+  while i < lst.len()
+    out.push(lst[i])
+    i = i + 1
+  out
+
+fn list_slice(lst, start, end)
+  -- Return lst[start:end] (exclusive end).
+  len   := lst.len()
+  s_idx := start
+  e_idx := end
+  if s_idx < 0
+    s_idx = len + s_idx
+  if e_idx < 0
+    e_idx = len + e_idx
+  if s_idx < 0
+    s_idx = 0
+  if e_idx > len
+    e_idx = len
+  out := []
+  i   := s_idx
+  while i < e_idx
+    out.push(lst[i])
+    i = i + 1
+  out
+
+-- ── Aggregation ───────────────────────────────────────────────────────────────
+
+fn list_sum(lst)
+  -- Sum of numeric elements.
+  acc := 0
+  i   := 0
+  while i < lst.len()
+    acc = acc + lst[i]
+    i   = i + 1
+  acc
+
+fn list_product(lst)
+  acc := 1
+  i   := 0
+  while i < lst.len()
+    acc = acc * lst[i]
+    i   = i + 1
+  acc
+
+fn list_max(lst)
+  -- Maximum of numeric elements. Returns nil for empty list.
+  if lst.len() == 0
+    return nil
+  m := lst[0]
+  i := 1
+  while i < lst.len()
+    if lst[i] > m
+      m = lst[i]
+    i = i + 1
+  m
+
+fn list_min(lst)
+  if lst.len() == 0
+    return nil
+  m := lst[0]
+  i := 1
+  while i < lst.len()
+    if lst[i] < m
+      m = lst[i]
+    i = i + 1
+  m
+
+fn list_max_by(lst, key_fn)
+  -- Maximum by key function.
+  if lst.len() == 0
+    return nil
+  best     := lst[0]
+  best_key := key_fn(lst[0])
+  i := 1
+  while i < lst.len()
+    k := key_fn(lst[i])
+    if k > best_key
+      best     = lst[i]
+      best_key = k
+    i = i + 1
+  best
+
+fn list_min_by(lst, key_fn)
+  if lst.len() == 0
+    return nil
+  best     := lst[0]
+  best_key := key_fn(lst[0])
+  i := 1
+  while i < lst.len()
+    k := key_fn(lst[i])
+    if k < best_key
+      best     = lst[i]
+      best_key = k
+    i = i + 1
+  best
+
+fn list_avg(lst)
+  if lst.len() == 0
+    return 0.0
+  float(list_sum(lst)) / float(lst.len())
+
+-- ── Restructuring ─────────────────────────────────────────────────────────────
+
+fn list_reverse(lst)
+  out := []
+  i   := lst.len() - 1
+  while i >= 0
+    out.push(lst[i])
+    i = i - 1
+  out
+
+fn list_flatten(lst)
+  -- Flatten one level: list of lists → list.
+  out := []
+  i   := 0
+  while i < lst.len()
+    sub := lst[i]
+    j   := 0
+    while j < sub.len()
+      out.push(sub[j])
+      j = j + 1
+    i = i + 1
+  out
+
+fn list_deep_flatten(lst)
+  -- Recursively flatten nested lists.
+  out := []
+  i   := 0
+  while i < lst.len()
+    item := lst[i]
+    if item.is_list()
+      flat := list_deep_flatten(item)
+      j    := 0
+      while j < flat.len()
+        out.push(flat[j])
+        j = j + 1
+    else
+      out.push(item)
+    i = i + 1
+  out
+
+fn list_zip(a, b)
+  -- Zip two lists into list of [a_i, b_i] pairs (length = min).
+  out := []
+  lim := a.len()
+  if b.len() < lim
+    lim = b.len()
+  i := 0
+  while i < lim
+    out.push([a[i], b[i]])
+    i = i + 1
+  out
+
+fn list_zip_with(a, b, f)
+  -- Zip two lists applying f(a_i, b_i).
+  out := []
+  lim := a.len()
+  if b.len() < lim
+    lim = b.len()
+  i := 0
+  while i < lim
+    out.push(f(a[i], b[i]))
+    i = i + 1
+  out
+
+fn list_unzip(pairs)
+  -- Split list of [a, b] pairs into [list_a, list_b].
+  as := []
+  bs := []
+  i  := 0
+  while i < pairs.len()
+    as.push(pairs[i][0])
+    bs.push(pairs[i][1])
+    i = i + 1
+  [as, bs]
+
+fn list_enumerate(lst)
+  -- Return list of [index, value] pairs.
+  out := []
+  i   := 0
+  while i < lst.len()
+    out.push([i, lst[i]])
+    i = i + 1
+  out
+
+fn list_chunk(lst, size)
+  -- Split into chunks of at most size.
+  out := []
+  i   := 0
+  while i < lst.len()
+    chunk := []
+    j     := 0
+    while j < size and i + j < lst.len()
+      chunk.push(lst[i + j])
+      j = j + 1
+    out.push(chunk)
+    i = i + size
+  out
+
+fn list_group_by(lst, key_fn)
+  -- Group into map of key → [elements].
+  groups := {}
+  i      := 0
+  while i < lst.len()
+    k := str(key_fn(lst[i]))
+    if groups.has(k)
+      g := groups.get(k)
+      g.push(lst[i])
+      groups.set(k, g)
+    else
+      groups.set(k, [lst[i]])
+    i = i + 1
+  groups
+
+fn list_partition(lst, pred)
+  -- Split into [passing, failing].
+  yes := []
+  no  := []
+  i   := 0
+  while i < lst.len()
+    if pred(lst[i])
+      yes.push(lst[i])
+    else
+      no.push(lst[i])
+    i = i + 1
+  [yes, no]
+
+fn list_unique(lst)
+  -- Remove duplicates, preserving first occurrence order.
+  seen := {}
+  out  := []
+  i    := 0
+  while i < lst.len()
+    k := str(lst[i])
+    if not seen.has(k)
+      seen.set(k, true)
+      out.push(lst[i])
+    i = i + 1
+  out
+
+fn list_unique_by(lst, key_fn)
+  seen := {}
+  out  := []
+  i    := 0
+  while i < lst.len()
+    k := str(key_fn(lst[i]))
+    if not seen.has(k)
+      seen.set(k, true)
+      out.push(lst[i])
+    i = i + 1
+  out
+
+-- ── Sorting ───────────────────────────────────────────────────────────────────
+
+fn list_sort(lst)
+  -- In-place quicksort, returns sorted copy.
+  out := []
+  i   := 0
+  while i < lst.len()
+    out.push(lst[i])
+    i = i + 1
+  _qsort(out, 0, out.len() - 1)
+  out
+
+fn list_sort_by(lst, key_fn)
+  -- Sort by key function (ascending).
+  out := []
+  i   := 0
+  while i < lst.len()
+    out.push(lst[i])
+    i = i + 1
+  _qsort_by(out, key_fn, 0, out.len() - 1)
+  out
+
+fn list_sort_desc(lst)
+  list_reverse(list_sort(lst))
+
+fn _qsort(arr, lo, hi)
+  if lo >= hi => return nil
+  pivot := arr[hi]
+  i     := lo
+  j     := lo
+  while j < hi
+    if arr[j] <= pivot
+      tmp    := arr[i]
+      arr[i] = arr[j]
+      arr[j] = tmp
+      i = i + 1
+    j = j + 1
+  tmp    := arr[i]
+  arr[i] = arr[hi]
+  arr[hi] = tmp
+  _qsort(arr, lo, i - 1)
+  _qsort(arr, i + 1, hi)
+
+fn _qsort_by(arr, key_fn, lo, hi)
+  if lo >= hi => return nil
+  pivot_key := key_fn(arr[hi])
+  i         := lo
+  j         := lo
+  while j < hi
+    if key_fn(arr[j]) <= pivot_key
+      tmp    := arr[i]
+      arr[i] = arr[j]
+      arr[j] = tmp
+      i = i + 1
+    j = j + 1
+  tmp    := arr[i]
+  arr[i] = arr[hi]
+  arr[hi] = tmp
+  _qsort_by(arr, key_fn, lo, i - 1)
+  _qsort_by(arr, key_fn, i + 1, hi)
+
+-- ── Range generation ──────────────────────────────────────────────────────────
+
+fn list_range(start, end)
+  -- List [start, start+1, ..., end-1].
+  out := []
+  i   := start
+  while i < end
+    out.push(i)
+    i = i + 1
+  out
+
+fn list_range_step(start, end, step)
+  -- List [start, start+step, ...] while < end (or > end if step negative).
+  out := []
+  i   := start
+  if step > 0
+    while i < end
+      out.push(i)
+      i = i + step
+  else
+    while i > end
+      out.push(i)
+      i = i + step
+  out
+
+fn list_repeat(val, n)
+  -- List of n copies of val.
+  out := []
+  i   := 0
+  while i < n
+    out.push(val)
+    i = i + 1
+  out
+
+-- ── Set operations ────────────────────────────────────────────────────────────
+
+fn list_union(a, b)
+  -- Unique elements from both lists.
+  list_unique(list_concat(a, b))
+
+fn list_intersect(a, b)
+  -- Elements in both a and b (by equality).
+  b_set := {}
+  i     := 0
+  while i < b.len()
+    b_set.set(str(b[i]), true)
+    i = i + 1
+  out := []
+  i   = 0
+  while i < a.len()
+    if b_set.has(str(a[i]))
+      out.push(a[i])
+    i = i + 1
+  list_unique(out)
+
+fn list_diff(a, b)
+  -- Elements in a that are not in b.
+  b_set := {}
+  i     := 0
+  while i < b.len()
+    b_set.set(str(b[i]), true)
+    i = i + 1
+  out := []
+  i   = 0
+  while i < a.len()
+    if not b_set.has(str(a[i]))
+      out.push(a[i])
+    i = i + 1
+  out
+
+-- ── Concatenation ─────────────────────────────────────────────────────────────
+
+fn list_concat(a, b)
+  out := []
+  i   := 0
+  while i < a.len()
+    out.push(a[i])
+    i = i + 1
+  i = 0
+  while i < b.len()
+    out.push(b[i])
+    i = i + 1
+  out
+
+fn list_concat_all(lists)
+  -- Concatenate a list of lists.
+  out := []
+  i   := 0
+  while i < lists.len()
+    j := 0
+    while j < lists[i].len()
+      out.push(lists[i][j])
+      j = j + 1
+    i = i + 1
+  out
+
+-- ── Misc ──────────────────────────────────────────────────────────────────────
+
+fn list_copy(lst)
+  out := []
+  i   := 0
+  while i < lst.len()
+    out.push(lst[i])
+    i = i + 1
+  out
+
+fn list_first(lst)
+  if lst.len() == 0 => return nil
+  lst[0]
+
+fn list_last(lst)
+  if lst.len() == 0 => return nil
+  lst[lst.len() - 1]
+
+fn list_rest(lst)
+  if lst.len() <= 1 => return []
+  list_drop(lst, 1)
+
+fn list_init(lst)
+  -- All but last.
+  if lst.len() <= 1 => return []
+  list_take(lst, lst.len() - 1)
+
+fn list_count_if(lst, pred)
+  n := 0
+  i := 0
+  while i < lst.len()
+    if pred(lst[i])
+      n = n + 1
+    i = i + 1
+  n
+
+fn list_intersperse(lst, sep)
+  -- Insert sep between every element.
+  if lst.len() <= 1
+    return list_copy(lst)
+  out := [lst[0]]
+  i   := 1
+  while i < lst.len()
+    out.push(sep)
+    out.push(lst[i])
+    i = i + 1
+  out
+
+fn list_transpose(matrix)
+  -- Transpose a list of equal-length lists.
+  if matrix.len() == 0 => return []
+  cols := matrix[0].len()
+  out  := []
+  c    := 0
+  while c < cols
+    col := []
+    r   := 0
+    while r < matrix.len()
+      col.push(matrix[r][c])
+      r = r + 1
+    out.push(col)
+    c = c + 1
+  out
+
+fn list_frequencies(lst)
+  -- Return map of value → count.
+  freq := {}
+  i    := 0
+  while i < lst.len()
+    k := str(lst[i])
+    if freq.has(k)
+      freq.set(k, freq.get(k) + 1)
+    else
+      freq.set(k, 1)
+    i = i + 1
+  freq
+
+fn list_to_map(lst, key_fn)
+  -- Build map from list using key_fn(elem) as key.
+  m := {}
+  i := 0
+  while i < lst.len()
+    m.set(str(key_fn(lst[i])), lst[i])
+    i = i + 1
+  m

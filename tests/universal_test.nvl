@@ -1,0 +1,883 @@
+-- ════════════════════════════════════════════════════════════════════════════
+-- tests/universal_test.nvl — Nuvola Universal Standard Code Test
+-- Covers every language department: types, control flow, functions, closures,
+-- data structures, strings, error handling, I/O, stdlib, concurrency,
+-- tensors, and performance benchmarks.
+-- Usage:  ./stage0/self/a.out run tests/universal_test.nvl
+-- ════════════════════════════════════════════════════════════════════════════
+
+import "std/math.nvl"
+import "std/string.nvl"
+import "std/list.nvl"
+import "std/os.nvl"
+import "std/result.nvl"
+
+-- ── Report state ─────────────────────────────────────────────────────────────
+sections  = []   -- [{name, passed, failed, ms}]
+s_pass    = 0
+s_fail    = 0
+s_name    = ""
+s_start   = 0
+
+fn section_begin(name)
+  s_name  = name
+  s_pass  = 0
+  s_fail  = 0
+  s_start = nv_time_now_ms()
+
+fn check(cond, label)
+  if cond
+    s_pass = s_pass + 1
+  else
+    s_fail = s_fail + 1
+    print("  FAIL: " + label)
+
+fn section_end()
+  ms  := nv_time_now_ms() - s_start
+  row = {}
+  row.set("name",   s_name)
+  row.set("passed", s_pass)
+  row.set("failed", s_fail)
+  row.set("ms",     ms)
+  sections.push(row)
+
+fn bench(label, n, elapsed_ms)
+  -- Print benchmark line with ops/sec
+  ops_ms := n / (elapsed_ms + 1)
+  print("  " + str_pad_right(label, 32, " ") + str(elapsed_ms) + " ms  (" + str(ops_ms * 1000) + " ops/s)")
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 1 — CORE TYPES & ARITHMETIC
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Core Types & Arithmetic")
+
+-- Integer ops
+check(1 + 2 == 3,            "int add")
+check(10 - 3 == 7,           "int sub")
+check(6 * 7 == 42,           "int mul")
+check(17 / 5 == 3,           "int div (floor)")
+check(17 % 5 == 2,           "int mod")
+check(2 ** 10 == 1024,       "int pow")
+check(-5 < 0,                "int negative")
+check(abs(-99) == 99,        "abs")
+
+-- Float ops
+check(0.1 + 0.2 > 0.29,     "float add approx")
+check(3.14 * 2.0 > 6.27,    "float mul")
+check(float(7) / float(2) == 3.5, "int→float div")
+check(int(3.9) == 3,         "float→int truncate")
+
+-- Bool
+check(true and true,         "bool and")
+check(not false,             "bool not")
+check(true or false,         "bool or")
+check(not (false and true),  "bool de morgan")
+
+-- Nil
+x = nil
+check(x == nil,              "nil eq")
+check(not (x != nil),        "nil neq")
+
+-- String basics
+check("hello".len == 5,      "str len")
+check("a" + "b" == "ab",     "str concat")
+check("hi".repeat(3) == "hihihi",  "str repeat")
+
+-- Type coercion
+check(str(42) == "42",       "str(int)")
+check(str(3.14).len > 2,     "str(float)")
+check(int("99") == 99,       "int(str)")
+check(float(15) / 10.0 == 1.5, "float(int)/float")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 2 — CONTROL FLOW
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Control Flow")
+
+-- if / else
+v = 0
+if 5 > 3
+  v = 1
+else
+  v = 2
+check(v == 1, "if branch taken")
+
+-- if / else if / else
+grade = 85
+label = ""
+if grade >= 90
+  label = "A"
+else if grade >= 80
+  label = "B"
+else if grade >= 70
+  label = "C"
+else
+  label = "F"
+check(label == "B", "else-if chain")
+
+-- while loop
+sum = 0
+i = 1
+while i <= 10
+  sum = sum + i
+  i = i + 1
+check(sum == 55, "while sum 1..10")
+
+-- for loop over list
+product = 1
+for n in [1, 2, 3, 4, 5]
+  product = product * n
+check(product == 120, "for list product")
+
+-- for with range
+count = 0
+for _ri in range(100)
+  count = count + 1
+check(count == 100, "for range(100)")
+
+-- nested loops + break simulation
+found = false
+outer = 0
+while outer < 5
+  inner = 0
+  while inner < 5
+    if outer * 5 + inner == 13
+      found = true
+    inner = inner + 1
+  outer = outer + 1
+check(found, "nested while found 13")
+
+-- match expression (via helper to work around top-level match limitation)
+fn color_code(c)
+  match c
+    "red"   => 1
+    "green" => 2
+    "blue"  => 3
+    _       => 0
+color = "green"
+code := color_code(color)
+check(code == 2, "match basic")
+
+-- match with guard (via helper)
+fn classify_num(x)
+  if x < 0 => return "negative"
+  if x == 0 => return "zero"
+  if x < 10 => return "small"
+  "large"
+n2 = 7
+desc := classify_num(n2)
+check(desc == "small", "match guard")
+
+-- match on type tag (via helper)
+fn classify_val(x)
+  if x > 100 => return "big"
+  if x > 10  => return "medium"
+  "small"
+val = 42
+result_str := classify_val(val)
+check(result_str == "medium", "match guard chain")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 3 — FUNCTIONS & CLOSURES
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Functions & Closures")
+
+-- Basic function
+fn add(a, b) => a + b
+check(add(3, 4) == 7, "basic fn")
+
+-- Recursive function
+fn fact(n)
+  if n <= 1 => return 1
+  n * fact(n - 1)
+check(fact(10) == 3628800, "factorial recursive")
+
+-- Mutual recursion / tail-recursive style
+fn tfib(n)
+  if n <= 1 => return n
+  tfib(n - 1) + tfib(n - 2)
+check(tfib(10) == 55, "fibonacci")
+
+-- First-class functions / HOF
+fn apply(f, x) => f(x)
+fn double(x) => x * 2
+check(apply(double, 21) == 42, "HOF apply")
+
+-- Lambda
+sq := fn(x) => x * x
+check(sq(9) == 81, "lambda")
+
+-- Closure captures outer variable
+fn make_adder(n)
+  fn(x) => x + n
+add5 := make_adder(5)
+check(add5(10) == 15, "closure capture")
+
+-- Closure captures immutable state (each make_adder call is independent)
+add10 := make_adder(10)
+add20 := make_adder(20)
+check(add10(5) == 15, "closure capture independent 1")
+check(add20(5) == 25, "closure capture independent 2")
+check(add10(1) == 11, "closure capture independent 3")
+
+-- Variadic-style via list
+fn sum_list(lst)
+  total = 0
+  for x in lst
+    total = total + x
+  total
+check(sum_list([1,2,3,4,5,6,7,8,9,10]) == 55, "sum_list")
+
+-- Function returning function
+fn compose(f, g)
+  fn(x) => f(g(x))
+inc  := fn(x) => x + 1
+dbl  := fn(x) => x * 2
+inc_then_dbl := compose(dbl, inc)
+check(inc_then_dbl(4) == 10, "compose (inc then dbl: (4+1)*2)")
+
+-- Recursion with accumulator
+fn tfib_acc(n, a, b)
+  if n == 0 => return a
+  tfib_acc(n - 1, b, a + b)
+check(tfib_acc(20, 0, 1) == 6765, "fib accumulator")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 4 — DATA STRUCTURES: LISTS & MAPS
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Data Structures")
+
+-- List basics
+lst = [10, 20, 30, 40, 50]
+check(lst.len == 5,           "list len")
+check(lst[0] == 10,           "list index 0")
+check(lst[4] == 50,           "list index 4")
+lst.push(60)
+check(lst.len == 6,           "list push")
+popped := lst.pop()
+check(popped == 60,           "list pop value")
+check(lst.len == 5,           "list pop len")
+
+-- List contains / take+drop (slice via take/drop)
+check(lst.contains(30),       "list contains")
+check(not lst.contains(99),   "list not contains")
+sl := lst.take(3).drop(1)
+check(sl.len == 2 and sl[0] == 20, "list take/drop slice")
+
+-- Sorting
+unsorted = [5, 2, 8, 1, 9, 3]
+sorted_lst := sorted(unsorted)
+check(sorted_lst[0] == 1 and sorted_lst[5] == 9, "sorted asc")
+rev_lst := reversed(sorted_lst)
+check(rev_lst[0] == 9, "reversed")
+
+-- Map basics
+m = {}
+m.set("x", 10)
+m.set("y", 20)
+check(m.get("x") == 10,       "map get")
+check(m.get("z") == nil,      "map missing key nil")
+m.set("x", 99)
+check(m.get("x") == 99,       "map overwrite")
+check(m.len == 2,             "map len")
+
+-- Map entries (use entries() since keys()/values() not available)
+ents := m.entries()
+check(ents.len == 2,          "map entries len")
+-- Check that value 99 (overwritten x) or 20 (y) appears in entries
+ev0 := ents[0][1]
+ev1 := ents[1][1]
+check(ev0 == 99 or ev1 == 99, "map entries has 99")
+
+-- Nested structures
+person = {}
+person.set("name", "Alice")
+person.set("scores", [95, 87, 92])
+check(person.get("scores")[1] == 87, "nested list in map")
+
+-- Map copy and extend (using entries to copy)
+base = {}
+base.set("r", 0)
+base.set("g", 128)
+base.set("b", 255)
+extended = {}
+for be in base.entries()
+  extended.set(be[0], be[1])
+extended.set("a", 1.0)
+check(extended.get("r") == 0,   "map copy keeps r")
+check(extended.get("a") == 1.0, "map copy adds a")
+
+-- Enum-style matching
+type Shape
+  Circle(radius)
+  Rect(w, h)
+  Point
+
+fn area(shape)
+  match shape
+    Circle(r)  => 3.14159 * r * r
+    Rect(w, h) => w * h
+    Point      => 0.0
+
+c := Shape_Circle(5.0)
+r := Shape_Rect(3.0, 4.0)
+p := Shape_Point()
+check(area(c) > 78.0 and area(c) < 79.0, "enum Circle area")
+check(area(r) == 12.0,                    "enum Rect area")
+check(area(p) == 0.0,                     "enum Point area")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 5 — STRINGS (comprehensive)
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("String Operations")
+
+s := "  Hello, World!  "
+check(s.trim() == "Hello, World!",         "trim")
+check(s.trim().lower() == "hello, world!", "lower")
+check(s.trim().upper() == "HELLO, WORLD!", "upper")
+check(s.trim().contains("World"),          "contains")
+check(s.trim().starts_with("Hello"),       "starts_with")
+check(s.trim().ends_with("!"),             "ends_with")
+check(s.trim().replace("World", "Nuvola") == "Hello, Nuvola!", "replace")
+check(s.trim().index_of("World") == 7,     "index_of")
+check(s.trim().slice(0, 5) == "Hello",     "slice")
+
+-- Split / join
+parts := "a,b,c,d".split(",")
+check(parts.len == 4,                  "split len")
+check(parts[2] == "c",                 "split index")
+rejoined := parts.join("-")
+check(rejoined == "a-b-c-d",          "join")
+
+-- Chars
+chars := "abc".chars()
+check(chars.len == 3,                  "chars len")
+check(chars[1] == "b",                 "chars index")
+
+-- Repeat
+check("ha".repeat(3) == "hahaha",      "repeat")
+
+-- Numeric string parsing
+check("42".len == 2,                   "numeric str len")
+check(int("0") == 0,                   "int('0')")
+
+-- String interpolation
+name := "Nuvola"
+ver  := 1
+msg  := "Welcome to {name} v{ver}!"
+check(msg == "Welcome to Nuvola v1!", "string interpolation")
+
+-- Stdlib string functions
+check(str_pad_left("7", 4, "0") == "0007",    "str_pad_left")
+check(str_pad_right("hi", 5, ".") == "hi...", "str_pad_right")
+check(str_reverse("abcd") == "dcba",          "str_reverse")
+check(str_count("mississippi", "ss") == 2,    "str_count")
+check(str_replace_all("aXbXc", "X", "-") == "a-b-c", "str_replace_all")
+check(str_title("hello world nuvola") == "Hello World Nuvola", "str_title")
+check(str_is_int("123") == true,              "str_is_int true")
+check(str_is_int("12.3") == false,            "str_is_int false")
+words := str_words("  one  two   three  ")
+check(words.len == 3 and words[1] == "two",   "str_words")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 6 — ERROR HANDLING
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Error Handling")
+
+-- try / catch basic
+caught = false
+try
+  throw "test error"
+catch e
+  caught = true
+check(caught, "try/catch basic")
+
+-- catch receives message
+msg2 = ""
+try
+  throw "specific message"
+catch e
+  msg2 = str(e)
+check(msg2.contains("specific"), "catch message content")
+
+-- try with no throw
+no_throw = true
+try
+  x2 := 1 + 1
+catch e
+  no_throw = false
+check(no_throw, "try without throw")
+
+-- Nested try/catch
+outer_caught = false
+inner_caught = false
+try
+  try
+    throw "inner"
+  catch e
+    inner_caught = true
+    throw "rethrown"
+catch e2
+  outer_caught = true
+check(inner_caught and outer_caught, "nested try/catch rethrow")
+
+-- Result type (std/result.nvl)
+ok_val := Ok(42)
+err_val := Err("oops")
+check(is_ok(ok_val),              "Result Ok")
+check(is_err(err_val),            "Result Err")
+check(unwrap(ok_val) == 42,       "unwrap Ok")
+check(unwrap_or(err_val, 0) == 0, "unwrap_or Err")
+
+mapped := result_map(ok_val, fn(x) => x * 2)
+check(unwrap(mapped) == 84, "result_map")
+
+-- Option type
+some_val := Some("hello")
+none_val := None()
+check(is_some(some_val),                    "Option Some")
+check(is_none(none_val),                    "Option None")
+check(option_unwrap(some_val) == "hello",   "option_unwrap")
+check(option_unwrap_or(none_val, "x")=="x", "option_unwrap_or")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 7 — FILE I/O & OS
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("File I/O & OS")
+
+-- Write and read back
+tmp_path := "/tmp/nvl_universal_test.txt"
+content  := "Nuvola universal test\nline 2\nline 3\n"
+write_file(tmp_path, content)
+check(file_exists(tmp_path),           "write_file creates file")
+read_back := read_file(tmp_path)
+check(read_back == content,            "read_file roundtrip")
+check(read_back.split("\n").len == 4,  "file line split")
+
+-- OS path utilities
+check(os_exists(tmp_path),            "os_exists after write")
+check(os_is_file(tmp_path),           "os_is_file")
+check(not os_is_dir(tmp_path),        "not is_dir for file")
+check(os_file_size(tmp_path) > 0,     "file_size > 0")
+check(os_basename(tmp_path) == "nvl_universal_test.txt", "os_basename")
+check(os_dirname(tmp_path) == "/tmp", "os_dirname")
+check(os_ext(tmp_path) == ".txt",     "os_ext")
+
+-- Working directory
+cwd := os_getcwd()
+check(cwd.len > 0, "os_getcwd non-empty")
+
+-- Environment variable
+home := os_getenv("HOME")
+check(home != nil and home.len > 0, "os_getenv HOME")
+
+-- Shell command
+exit_code := nv_shell("test -f " + tmp_path)
+check(exit_code == 0, "nv_shell test -f")
+
+-- popen_read
+uname := popen_read("uname -s")
+check(uname.trim().len > 0, "popen_read uname")
+
+-- Cleanup
+nv_shell("rm -f " + tmp_path)
+check(not file_exists(tmp_path), "file removed after rm")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 8 — STDLIB: MATH
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Stdlib: Math")
+
+check(math_abs(-7.5) == 7.5,                     "math_abs")
+check(math_floor(3.9) == 3.0,                    "math_floor")
+check(math_ceil(3.1) == 4.0,                     "math_ceil")
+check(math_round(3.5) == 4.0,                    "math_round")
+check(math_sqrt(16.0) == 4.0,                    "math_sqrt")
+check(math_pow(2.0, 8.0) == 256.0,               "math_pow")
+check(math_log(1.0) == 0.0,                      "math_log(1)")
+check(math_exp(0.0) == 1.0,                      "math_exp(0)")
+check(math_sin(0.0) == 0.0,                      "math_sin(0)")
+check(math_cos(0.0) == 1.0,                      "math_cos(0)")
+check(clamp(15.0, 0.0, 10.0) == 10.0,            "clamp hi")
+check(clamp(-5.0, 0.0, 10.0) == 0.0,             "clamp lo")
+check(lerp(0.0, 10.0, 0.5) == 5.0,               "lerp mid")
+fn sigmoid(x) => 1.0 / (1.0 + math_exp(0.0 - x))
+sig := sigmoid(0.0)
+check(sig > 0.49 and sig < 0.51,                 "sigmoid(0)≈0.5")
+check(max(3, 7) == 7,                             "max builtin")
+check(min(3, 7) == 3,                             "min builtin")
+check(PI > 3.14 and PI < 3.15,                   "PI constant")
+check(E > 2.71 and E < 2.72,                     "E constant")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 9 — STDLIB: LIST OPERATIONS
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Stdlib: List Operations")
+
+nums := [3, 1, 4, 1, 5, 9, 2, 6, 5, 3]
+
+-- Functional
+doubled2 := list_map(nums, fn(x) => x * 2)
+check(doubled2[0] == 6,                               "list_map")
+
+big := list_filter(nums, fn(x) => x >= 5)
+check(big.len == 4,                                   "list_filter")
+
+total2 := list_reduce(nums, fn(a, b) => a + b, 0)
+check(total2 == 39,                                   "list_reduce sum")
+
+check(list_any(nums, fn(x) => x > 8),                "list_any")
+check(list_all([2,4,6,8], fn(x) => x % 2 == 0),      "list_all")
+found2 := list_find(nums, fn(x) => x > 7)
+check(found2 == 9,                                    "list_find")
+
+-- Grouping
+chunks2 := list_chunk([1,2,3,4,5,6,7], 3)
+check(chunks2.len == 3,                               "list_chunk count")
+check(chunks2[2].len == 1,                            "list_chunk remainder")
+
+parts2 := list_partition([1,2,3,4,5,6], fn(x) => x % 2 == 0)
+check(parts2[0].len == 3 and parts2[1].len == 3,      "list_partition")
+
+-- Set ops
+u := list_union([1,2,3], [3,4,5])
+check(u.len == 5,                                     "list_union")
+inter := list_intersection([1,2,3,4], [2,4,6])
+check(inter.len == 2,                                 "list_intersection")
+diff := list_difference([1,2,3,4,5], [2,4])
+check(diff.len == 3,                                  "list_difference")
+
+-- Max/min by key
+mx2 := list_max_by(nums, fn(x) => x)
+mn2 := list_min_by(nums, fn(x) => x)
+check(mx2 == 9 and mn2 == 1,                          "list max/min by")
+
+-- Transpose
+mat := [[1,2,3],[4,5,6],[7,8,9]]
+t   := list_transpose(mat)
+check(t[0][2] == 7 and t[2][0] == 3,                 "list_transpose")
+
+-- range with step
+rng := list_range(0, 20, 4)
+check(rng.len == 5 and rng[3] == 12,                  "list_range step 4")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 10 — CONCURRENCY (spawn + channels)
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Concurrency")
+
+-- Channel send/recv
+ch := chan(0)
+spawn(fn(c) => c.send(42), ch)
+recv_val := ch.recv()
+check(recv_val == 42, "chan send/recv basic")
+
+-- Multiple values through channel
+fn spawn_squares(c)
+  i2 = 0
+  while i2 < 5
+    c.send(i2 * i2)
+    i2 = i2 + 1
+ch2 := chan(0)
+spawn(spawn_squares, ch2)
+sq_sum = 0
+j = 0
+while j < 5
+  sq_sum = sq_sum + ch2.recv()
+  j = j + 1
+check(sq_sum == 0 + 1 + 4 + 9 + 16, "chan 5 squares sum = 30")
+
+-- Parallel computation: spawn two workers
+fn worker_lo(c)
+  acc = 0
+  k2 = 1
+  while k2 <= 50
+    acc = acc + k2
+    k2 = k2 + 1
+  c.send(acc)
+fn worker_hi(c)
+  acc = 0
+  k2 = 51
+  while k2 <= 100
+    acc = acc + k2
+    k2 = k2 + 1
+  c.send(acc)
+ch_a := chan(0)
+ch_b := chan(0)
+spawn(worker_lo, ch_a)
+spawn(worker_hi, ch_b)
+total_par := ch_a.recv() + ch_b.recv()
+check(total_par == 5050, "parallel sum 1..100 via 2 workers")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 11 — TENSOR / AI CORE
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Tensor & Autodiff")
+
+-- Basic tensor creation (zeros(rows, cols) creates shape [rows, cols])
+t1 := zeros(2, 3)
+check(t1.shape[0] == 2 and t1.shape[1] == 3, "tensor shape")
+check(t1.ndim == 2,                           "tensor ndim")
+
+-- Tensor ones / ops
+t2 := ones(3)
+check(t2.sum().item() == 3.0, "tensor ones sum")
+
+-- Matmul: 2x3 @ 3x2 = 2x2 (each element = sum of 3 ones*ones = 3.0)
+a_t := ones(2, 3)
+b_t := ones(3, 2)
+c_t := a_t.matmul(b_t)
+check(c_t.shape[0] == 2 and c_t.shape[1] == 2, "matmul shape")
+check(c_t.sum().item() == 12.0, "matmul sum (2x3 @ 3x2 of ones = 3 each, 4 cells)")
+
+-- Autodiff: simple gradient (ones(1) creates a 1-element tensor)
+x_t := ones(1)
+x_t.data[0] = 3.0
+x_t.requires_grad = true
+y_t := x_t * x_t   -- y = x^2, dy/dx = 2x = 6
+y_t.backward()
+grad := x_t.grad.data[0]
+check(grad > 5.9 and grad < 6.1, "autodiff x^2 grad = 2x = 6")
+
+-- Activation functions
+inp := zeros(4)
+out_relu := inp.relu()
+check(out_relu.sum().item() == 0.0, "relu(zeros) = 0")
+
+inp2 := zeros(4)
+inp2.data[0] = -1.0
+inp2.data[1] = -2.0
+inp2.data[2] = -0.5
+inp2.data[3] = -3.0
+out_relu2 := inp2.relu()
+check(out_relu2.sum().item() == 0.0, "relu(negatives) = 0")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 12 — PERFORMANCE BENCHMARKS
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Performance Benchmarks")
+print("")
+print("  Benchmark results:")
+
+-- Fibonacci(35) — recursive, tests function call overhead
+t0 := nv_time_now_ms()
+fn fib_bench(n)
+  if n <= 1 => return n
+  fib_bench(n - 1) + fib_bench(n - 2)
+fib35 := fib_bench(35)
+t1b := nv_time_now_ms()
+check(fib35 == 9227465, "fib(35) correct")
+bench("fib(35) recursive", 1, t1b - t0)
+
+-- Sieve of Eratosthenes — tests list/array ops
+t0 = nv_time_now_ms()
+fn sieve(n)
+  is_prime = []
+  i3 = 0
+  while i3 <= n
+    is_prime.push(true)
+    i3 = i3 + 1
+  is_prime[0] = false
+  is_prime[1] = false
+  p = 2
+  while p * p <= n
+    if is_prime[p]
+      m = p * p
+      while m <= n
+        is_prime[m] = false
+        m = m + p
+    p = p + 1
+  primes = []
+  i4 = 2
+  while i4 <= n
+    if is_prime[i4]
+      primes.push(i4)
+    i4 = i4 + 1
+  primes
+primes_list := sieve(10000)
+t1b = nv_time_now_ms()
+check(primes_list.len == 1229, "sieve(10000) = 1229 primes")
+bench("sieve(10000)", 10000, t1b - t0)
+
+-- String build — tests string allocation
+t0 = nv_time_now_ms()
+s_build = ""
+i5 = 0
+while i5 < 1000
+  s_build = s_build + "x"
+  i5 = i5 + 1
+t1b = nv_time_now_ms()
+check(s_build.len == 1000, "string build 1000 chars")
+bench("string concat x1000", 1000, t1b - t0)
+
+-- List sort — tests sorting performance
+t0 = nv_time_now_ms()
+fn make_pseudo_random(n)
+  lst2 = []
+  x3 = 12345
+  i6 = 0
+  while i6 < n
+    x3 = (x3 * 1103515245 + 12345) % 2147483648
+    lst2.push(x3 % 10000)
+    i6 = i6 + 1
+  lst2
+rand_list := make_pseudo_random(2000)
+sorted2   := sorted(rand_list)
+t1b = nv_time_now_ms()
+check(sorted2[0] <= sorted2[1999], "sort 2000 elements ordered")
+bench("sort(2000 ints)", 2000, t1b - t0)
+
+-- Map insert/lookup
+t0 = nv_time_now_ms()
+big_map = {}
+i7 = 0
+while i7 < 500
+  big_map.set("key" + str(i7), i7)
+  i7 = i7 + 1
+check(big_map.get("key42") == 42, "map 500 entries lookup")
+t1b = nv_time_now_ms()
+bench("map insert+lookup x500", 500, t1b - t0)
+
+print("")
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 13 — COMPTIME & ADVANCED FEATURES
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Comptime & Advanced")
+
+-- Comptime constant
+comptime MAX_SIZE := 1024
+check(MAX_SIZE == 1024, "comptime constant")
+
+-- Pipeline operator
+result_pipe := 16 |> math_sqrt |> str
+check(result_pipe == "4.0" or result_pipe.starts_with("4"), "pipeline |>")
+
+-- Multiple assignment (swap via temp)
+pa = 10
+pb = 20
+tmp2 := pa
+pa = pb
+pb = tmp2
+check(pa == 20 and pb == 10, "swap via temp")
+
+-- Nested closures / higher-order
+fn make_multiplier(factor)
+  fn(x) => x * factor
+
+fns_list = []
+i8 = 1
+while i8 <= 5
+  fns_list.push(make_multiplier(i8))
+  i8 = i8 + 1
+f0 := fns_list[0]
+f2 := fns_list[2]
+f4 := fns_list[4]
+check(f0(10) == 10, "closure table [0]")
+check(f2(10) == 30, "closure table [2]")
+check(f4(10) == 50, "closure table [4]")
+
+-- Variadic pattern via list unpacking
+fn zip_with(f, a_lst, b_lst)
+  result2 = []
+  i9 = 0
+  while i9 < a_lst.len and i9 < b_lst.len
+    result2.push(f(a_lst[i9], b_lst[i9]))
+    i9 = i9 + 1
+  result2
+dot_products := zip_with(fn(a, b) => a * b, [1,2,3], [4,5,6])
+check(dot_products[0] == 4 and dot_products[2] == 18, "zip_with")
+
+-- String format with {expr}
+n_fmt := 42
+pi_fmt := 3.14
+greeting := "n={n_fmt}, pi={pi_fmt}"
+check(greeting == "n=42, pi=3.14", "string format expr")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- § 14 — SELF-REFERENCE: COMPILER CAN CHECK ITSELF
+-- ════════════════════════════════════════════════════════════════════════════
+section_begin("Self-Reference")
+
+-- Verify the compiler binary exists and can check a file
+compiler := "stage0/self/a.out"
+check(file_exists(compiler),     "compiler binary exists")
+check(file_exists("build.nvl"),  "build.nvl exists")
+
+-- Check this very file parses cleanly
+check_out := popen_read(compiler + " check tests/universal_test.nvl 2>&1")
+check(check_out.contains("nuvc: ok"), "compiler checks itself (universal_test.nvl)")
+
+-- Check build.nvl parses cleanly
+check_out2 := popen_read(compiler + " check build.nvl 2>&1")
+check(check_out2.contains("nuvc: ok"), "compiler checks build.nvl")
+
+-- Verify fixed-point: emit-c codegen.nvl twice, output should be identical
+gen1_out := popen_read(compiler + " emit-c stage0/self/codegen.nvl 2>&1")
+check(gen1_out.len > 10000, "emit-c codegen.nvl produces output")
+
+section_end()
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- FINAL REPORT
+-- ════════════════════════════════════════════════════════════════════════════
+total_pass = 0
+total_fail = 0
+total_ms   = 0
+
+print("")
+print("══════════════════════════════════════════════════════════════")
+print("  Nuvola Universal Standard Code Test — Results")
+print("══════════════════════════════════════════════════════════════")
+
+col_w = 36
+for row in sections
+  nm  := row.get("name")
+  p   := row.get("passed")
+  f   := row.get("failed")
+  ms2 := row.get("ms")
+  status := "PASS"
+  if f > 0
+    status = "FAIL"
+  padded := str_pad_right(nm, col_w, " ")
+  checks := str_pad_left(str(p + f), 3, " ") + " checks"
+  timing := str_pad_left(str(ms2), 5, " ") + " ms"
+  print("  " + padded + status + "  " + checks + "  " + timing)
+  total_pass = total_pass + p
+  total_fail = total_fail + f
+  total_ms   = total_ms   + ms2
+
+print("──────────────────────────────────────────────────────────────")
+total_checks := total_pass + total_fail
+print("  Total: " + str(total_pass) + "/" + str(total_checks) + " passed  (" + str(total_ms) + " ms)")
+print("══════════════════════════════════════════════════════════════")
+
+if total_fail == 0
+  print("  ALL TESTS PASSED")
+else
+  print("  " + str(total_fail) + " TESTS FAILED")

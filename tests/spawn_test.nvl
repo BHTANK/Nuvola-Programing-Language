@@ -1,0 +1,12 @@
+-- M14.2 spawn + channel test
+-- Verifies: spawn(fn, arg), channel(), ch.send(), ch.recv()
+
+fn worker(ch)
+  ch.send(42)
+
+fn main()
+  ch := channel()
+  spawn(worker, ch)
+  v := ch.recv()
+  assert(v == 42, "channel recv failed")
+  print("spawn + channel OK: {v}")

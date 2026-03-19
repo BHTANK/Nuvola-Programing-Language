@@ -1,0 +1,221 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 05_data_pipeline.nvl — Enterprise-grade ETL data pipeline
+-- Processes terabyte-scale datasets with automatic parallelism and GPU acceleration
+-- ─────────────────────────────────────────────────────────────────────────────
+
+import data.{Parquet, CSV, JSON, Arrow, Schema}
+import db.{Postgres, ClickHouse}
+import geo.{Geocoder, BoundingBox}
+import ml.{Embedding, ClusterKMeans}
+import time.{DateTime, Duration, now}
+
+-- ─── Schema definitions ───────────────────────────────────────────────────────
+
+@comptime RAW_SCHEMA := Schema.infer_from_file("data/sample_raw.parquet")
+
+type RawEvent
+  user_id:    str
+  session_id: str
+  event_type: str
+  timestamp:  i64      -- Unix milliseconds
+  properties: Map(str, str)
+  ip_address: str
+  user_agent: str
+
+type EnrichedEvent
+  user_id:      str
+  session_id:   str
+  event_type:   str
+  timestamp:    DateTime
+  properties:   Map(str, str)
+  country:      str
+  city:         str
+  latitude:     f64
+  longitude:    f64
+  device_type:  str   -- "mobile" | "tablet" | "desktop"
+  browser:      str
+  os:           str
+  is_bot:       bool
+
+type SessionSummary
+  session_id:     str
+  user_id:        str
+  start_time:     DateTime
+  end_time:       DateTime
+  duration_sec:   f64
+  event_count:    i64
+  page_views:     i64
+  first_country:  str
+  device_type:    str
+  converted:      bool
+  revenue:        f64
+
+-- ─── Enrichment functions ─────────────────────────────────────────────────────
+
+geocoder := Geocoder.new(cache_size: 100_000)
+ua_parser := UserAgentParser.load("data/ua_patterns.db")
+bot_detector := BotDetector.load("models/bot_v3.nvmodel")
+
+@pure
+fn parse_user_agent(ua: str) -> { device: str, browser: str, os: str }
+  ua_parser.parse(ua)
+
+fn geo_lookup(ip: str) -> { country: str, city: str, lat: f64, lon: f64 }
+  geocoder.lookup(ip) ?? { country: "Unknown", city: "Unknown", lat: 0.0, lon: 0.0 }
+
+@pure
+fn is_bot(ua: str, ip: str, events_per_second: f32) -> bool
+  bot_detector.predict({ ua, ip, eps: events_per_second }) > 0.5
+
+fn enrich(raw: RawEvent) -> EnrichedEvent
+  geo := geo_lookup(raw.ip_address)
+  ua  := parse_user_agent(raw.user_agent)
+  EnrichedEvent {
+    ..raw,    -- spread: copy all matching fields from raw
+    timestamp:   DateTime.from_unix_ms(raw.timestamp),
+    country:     geo.country,
+    city:        geo.city,
+    latitude:    geo.lat,
+    longitude:   geo.lon,
+    device_type: ua.device,
+    browser:     ua.browser,
+    os:          ua.os,
+    is_bot:      is_bot(raw.user_agent, raw.ip_address, 0.0),
+  }
+
+-- ─── Aggregation ──────────────────────────────────────────────────────────────
+
+fn summarize_session(events: [EnrichedEvent]) -> SessionSummary
+  -- Events are pre-grouped by session_id
+  first := events[0]
+  last  := events[-1]
+
+  page_views := events |> count(where: .event_type == "page_view")
+  revenue    := events
+    |> filter(.event_type == "purchase")
+    |> map(.properties["amount"]?.parse_f64() ?? 0.0)
+    |> sum
+
+  SessionSummary {
+    session_id:   first.session_id,
+    user_id:      first.user_id,
+    start_time:   first.timestamp,
+    end_time:     last.timestamp,
+    duration_sec: (last.timestamp - first.timestamp).total_seconds(),
+    event_count:  events.len.to_i64(),
+    page_views,
+    first_country: first.country,
+    device_type:  first.device_type,
+    converted:    revenue > 0.0,
+    revenue,
+  }
+
+-- ─── The pipeline ─────────────────────────────────────────────────────────────
+
+@io
+fn run_pipeline(date: str)
+  print("Starting pipeline for {date}")
+  start := now()
+
+  -- 1. Read raw data (streaming — never loads entire file into memory)
+  raw := Parquet.stream("s3://data-lake/raw/events/date={date}/*.parquet")
+    |> with_schema(RawEvent)
+
+  print("  Reading from S3 (streaming)...")
+
+  -- 2. Filter and validate
+  valid := raw
+    |> filter(e => e.user_id != "" and e.session_id != "" and e.timestamp > 0)
+    |> filter(e => not e.event_type.starts_with("internal_"))
+
+  -- 3. Enrich (runs in parallel across all CPU cores, IO-cached)
+  print("  Enriching events (geo + UA + bot detection)...")
+  enriched := valid |> par_map(enrich)
+
+  -- 4. Filter bots
+  human := enriched |> filter(not .is_bot)
+
+  -- 5. Group by session and summarize
+  print("  Summarizing sessions...")
+  sessions := human
+    |> group_by(.session_id)
+    |> par_map(summarize_session)   -- each group processed in parallel
+
+  -- 6. Anomaly detection on session durations (GPU accelerated)
+  print("  Running anomaly detection...")
+  @gpu
+  durations := sessions |> map(.duration_sec.to_f32()) |> Tensor.from
+  anomaly_scores := anomaly_model.score(durations)
+  sessions_clean := sessions
+    |> zip(anomaly_scores)
+    |> filter((_, score) => score < 0.95)
+    |> map((s, _) => s)
+
+  -- 7. User segmentation via KMeans (GPU)
+  print("  Clustering users...")
+  features := sessions_clean
+    |> group_by(.user_id)
+    |> map(user_sessions => user_features(user_sessions))
+  clusters := ClusterKMeans.fit(features, k: 8, gpu: true)
+
+  -- 8. Write results to multiple destinations in parallel
+  print("  Writing results...")
+  concurrent
+    -- Clickhouse for analytics queries
+    ch_task := spawn =>
+      ClickHouse.bulk_insert("sessions", sessions_clean, batch_size: 50_000)
+
+    -- Postgres for application reads
+    pg_task := spawn =>
+      Postgres.upsert("user_segments", clusters.assignments, on_conflict: "user_id")
+
+    -- Parquet for data lake
+    pq_task := spawn =>
+      Parquet.write(
+        "s3://data-lake/processed/sessions/date={date}/part-*.parquet",
+        sessions_clean,
+        compression: "zstd",
+        row_group_size: 100_000,
+      )
+
+    -- Summary stats to monitoring
+    mon_task := spawn =>
+      Metrics.emit({
+        pipeline_date:       date,
+        raw_events:          raw.count(),
+        valid_events:        valid.count(),
+        enriched_events:     enriched.count(),
+        human_events:        human.count(),
+        bot_events:          enriched.count() - human.count(),
+        sessions:            sessions_clean.count(),
+        converted_sessions:  sessions_clean |> count(where: .converted),
+        total_revenue:       sessions_clean |> sum(.revenue),
+      })
+
+  elapsed := now() - start
+  raw_count := raw.count()
+  print("Pipeline complete in {elapsed.human()}:")
+  print("  {raw_count:,} raw events → {sessions_clean.count():,} sessions")
+  print("  Throughput: {(raw_count.to_f64() / elapsed.total_seconds()):,.0f} events/sec")
+
+-- ─── Backfill: process multiple dates in parallel ─────────────────────────────
+
+@io
+fn backfill(from_date: str, to_date: str)
+  dates := DateTime.range(from_date, to_date, step: "1d")
+    |> map(.format("YYYY-MM-DD"))
+
+  print("Backfilling {dates.len} days...")
+
+  -- Process dates in parallel, max 4 at a time (limited by S3 read bandwidth)
+  dates |> par_map(run_pipeline, concurrency: 4)
+
+  print("Backfill complete.")
+
+-- ─── Entry point ──────────────────────────────────────────────────────────────
+
+fn main()
+  match env("PIPELINE_MODE", default: "daily")
+    "daily"    => run_pipeline(env("DATE", default: now().format("YYYY-MM-DD")))
+    "backfill" => backfill(env("FROM_DATE"), env("TO_DATE"))
+    mode       => panic("Unknown pipeline mode: {mode}")

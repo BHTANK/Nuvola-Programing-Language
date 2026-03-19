@@ -1,0 +1,113 @@
+-- std/os.nvl — Nuvola OS and filesystem utilities
+-- Import with: import "std/os.nvl"
+-- Namespaced:  import "std/os.nvl" as os
+
+-- ── Working directory ──────────────────────────────────────────────────────
+fn os_getcwd()
+  nv_os_getcwd()
+
+-- ── Path utilities ─────────────────────────────────────────────────────────
+fn os_basename(path)
+  -- Return filename component of path (e.g. "/foo/bar.nvl" → "bar.nvl")
+  i = path.len - 1
+  while i >= 0 and path[i] != "/"
+    i = i - 1
+  if i < 0 => return path
+  path.slice(i + 1, path.len)
+
+fn os_dirname(path)
+  -- Return directory component of path
+  i = path.len - 1
+  while i >= 0 and path[i] != "/"
+    i = i - 1
+  if i < 0 => return "."
+  if i == 0 => return "/"
+  path.slice(0, i)
+
+fn os_join(dir, name)
+  -- Join directory and filename
+  if name.len > 0 and name[0] == "/" => return name
+  if dir == "." => return name
+  dir + "/" + name
+
+fn os_ext(path)
+  -- Return file extension including dot (e.g. "foo.nvl" → ".nvl"), or ""
+  i = path.len - 1
+  while i >= 0 and path[i] != "." and path[i] != "/"
+    i = i - 1
+  if i < 0 or path[i] == "/" => return ""
+  path.slice(i, path.len)
+
+-- ── Filesystem queries ─────────────────────────────────────────────────────
+fn os_exists(path)
+  nv_os_exists(path)
+
+fn os_is_file(path)
+  nv_os_is_file(path)
+
+fn os_is_dir(path)
+  nv_os_is_dir(path)
+
+fn os_file_size(path)
+  nv_os_file_size(path)
+
+fn os_listdir(path)
+  nv_os_listdir(path)
+
+fn os_listdir_full(path)
+  -- List full paths of entries in directory
+  names := nv_os_listdir(path)
+  result = []
+  for name in names
+    result.push(os_join(path, name))
+  result
+
+fn os_listdir_files(path)
+  -- List only regular files (full paths)
+  names := nv_os_listdir(path)
+  result = []
+  for name in names
+    full := os_join(path, name)
+    if nv_os_is_file(full)
+      result.push(full)
+  result
+
+fn os_listdir_dirs(path)
+  -- List only subdirectories (full paths)
+  names := nv_os_listdir(path)
+  result = []
+  for name in names
+    full := os_join(path, name)
+    if nv_os_is_dir(full)
+      result.push(full)
+  result
+
+-- ── Filesystem mutations ───────────────────────────────────────────────────
+fn os_mkdir(path)
+  nv_os_mkdir(path)
+
+fn os_remove(path)
+  nv_os_remove(path)
+
+fn os_rename(src, dst)
+  nv_os_rename(src, dst)
+
+-- ── Environment ───────────────────────────────────────────────────────────
+fn os_getenv(name)
+  nv_os_getenv(name)
+
+fn os_getenv_default(name, default_val)
+  v := nv_os_getenv(name)
+  if v == nil => return default_val
+  v
+
+fn os_setenv(name, val)
+  nv_os_setenv(name, val)
+
+-- ── Shell ──────────────────────────────────────────────────────────────────
+fn os_system(cmd)
+  nv_os_system(cmd)
+
+fn os_run_ok(cmd)
+  nv_os_system(cmd) == 0
+

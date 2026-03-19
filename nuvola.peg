@@ -1,0 +1,446 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Nuvola Language — Formal PEG Grammar  (Nuclear Edition)
+// Target: pest (Rust) or tree-sitter compatible PEG notation
+//
+// Operator precedence (low → high):
+//   or / and
+//   not
+//   == != < > <= >= is
+//   range  ..  ..=
+//   + -
+//   * / // %
+//   |>               (higher than * / so `xs |> sum / n` = `(xs|>sum)/n`)
+//   **               (right-assoc)
+//   unary  - ! not
+//   postfix  . [] ()  @ (matmul)
+//   primary
+//
+// Nuclear extensions:
+//   comptime          compile-time constants
+//   trait / impl      zero-overhead trait dispatch
+//   async fn / await  cooperative multitasking
+//   spawn             green-thread task
+//   extern fn         C FFI
+//   unsafe { }        raw operations, no safety checks
+//   Tensor<T>         typed n-dimensional tensor
+//   chan(T)           typed channel
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Top-level ───────────────────────────────────────────────────────────────
+
+Program     = { SOI ~ Stmt* ~ EOI }
+
+Stmt        = _{
+    Annotation    |
+    ImportDecl    |
+    TypeDecl      |
+    TraitDecl     |   // NUCLEAR: trait Name { fn ... }
+    ImplDecl      |   // NUCLEAR: impl Trait for Type { fn ... }
+    ComptimeDecl  |   // NUCLEAR: comptime NAME := expr
+    AsyncFnDecl   |   // NUCLEAR: async fn name(...)
+    ExternFnDecl  |   // NUCLEAR: extern "lib" fn name(...)
+    UnsafeBlock   |   // NUCLEAR: unsafe { stmts }
+    FnDecl        |
+    IfStmt        |
+    ForLoop       |
+    WhileLoop     |
+    MatchStmt     |
+    ReturnStmt    |
+    BreakStmt     |
+    ContinueStmt  |
+    AwaitStmt     |   // NUCLEAR: await expr
+    SpawnStmt     |   // NUCLEAR: spawn fn(args)
+    AssignStmt    |
+    ExprStmt
+}
+
+// ─── Annotations ─────────────────────────────────────────────────────────────
+
+Annotation  = { "@" ~ Ident ~ NEWLINE ~ Stmt }
+
+// ─── Imports ──────────────────────────────────────────────────────────────────
+
+ImportDecl  = { "import" ~ ModulePath ~ ImportNames? ~ ("as" ~ Ident)? }
+ModulePath  = { Ident ~ ("." ~ Ident)* }
+ImportNames = { "." ~ "{" ~ Ident ~ ("," ~ Ident)* ~ ","? ~ "}" }
+
+// ─── Nuclear statements ───────────────────────────────────────────────────────
+
+// comptime NAME := expr  — evaluated once at compile time, inlined everywhere
+ComptimeDecl  = { "comptime" ~ Ident ~ (":=" | "=") ~ Expr }
+
+// trait Name { fn method(self, ...) -> RetType }
+TraitDecl     = { "trait" ~ Ident ~ NEWLINE ~ TraitBody }
+TraitBody     = { (INDENT ~ FnDecl)+ }
+
+// impl TraitName for TypeName { ... }
+// impl TypeName { ... }          (inherent impl)
+ImplDecl      = { "impl" ~ Ident ~ ("for" ~ Ident)? ~ NEWLINE ~ ImplBody }
+ImplBody      = { (INDENT ~ FnDecl)+ }
+
+// async fn name(...) -> T => body
+AsyncFnDecl   = { "async" ~ "fn" ~ Ident ~ "(" ~ ParamList ~ ")" ~
+                  ("->" ~ TypeExpr)? ~ (ArrowBody | IndentedBlock) }
+
+// extern "libname" fn name(params) -> ret
+ExternFnDecl  = { "extern" ~ StringLit? ~ "fn" ~ Ident ~
+                  "(" ~ ParamList ~ ")" ~ ("->" ~ TypeExpr)? }
+
+// unsafe { stmts }
+UnsafeBlock   = { "unsafe" ~ IndentedBlock }
+
+// await / spawn statements
+AwaitStmt     = { "await" ~ Expr }
+SpawnStmt     = { "spawn" ~ Expr }
+
+// ─── Type declarations (struct + enum) ───────────────────────────────────────
+
+TypeDecl    = { "type" ~ Ident ~ NEWLINE ~ TypeBody }
+TypeBody    = { (FieldDecl | VariantDecl)+ }
+FieldDecl   = { INDENT ~ Ident ~ ":" ~ TypeExpr ~ ("=" ~ Expr)? ~ NEWLINE }
+VariantDecl = { INDENT ~ Ident ~ ("(" ~ VariantFields ~ ")")? ~ NEWLINE }
+VariantFields = { VariantField ~ ("," ~ VariantField)* ~ ","? }
+VariantField  = { (Ident ~ ":")? ~ TypeExpr }
+
+TypeExpr    = { Ident ~ ("<" ~ TypeExpr ~ ("," ~ TypeExpr)* ~ ">")? |
+                "(" ~ TypeExpr ~ ("," ~ TypeExpr)* ~ ")" |
+                "[" ~ TypeExpr ~ "]" |
+                "&" ~ TypeExpr |
+                "?" ~ TypeExpr }
+
+// ─── Function declarations ────────────────────────────────────────────────────
+
+FnDecl      = { "fn" ~ Ident ~ GenericParams? ~ "(" ~ ParamList ~ ")" ~
+                ("->" ~ TypeExpr)? ~
+                WhereClause? ~
+                (ArrowBody | IndentedBlock) }
+
+// Generic parameters: fn f<T>(x: T) -> T
+GenericParams = { "<" ~ GenericParam ~ ("," ~ GenericParam)* ~ ">" }
+GenericParam  = { Ident ~ (":" ~ Ident ~ ("+" ~ Ident)*)? }
+
+ParamList   = { Param ~ ("," ~ Param)* ~ ","? | "" }
+Param       = { ("self" | Ident) ~ (":" ~ TypeExpr)? ~ ("=" ~ Expr)? }
+WhereClause = { "where" ~ TypeConstraint ~ ("," ~ TypeConstraint)* }
+TypeConstraint = { Ident ~ ":" ~ Ident ~ ("+" ~ Ident)* }
+ArrowBody   = { "=>" ~ Expr }
+IndentedBlock = { NEWLINE ~ PUSH(INDENT_NEXT) ~ StmtList ~ DROP }
+
+StmtList    = { (Stmt ~ NEWLINE?)+ }
+
+// ─── Statements ───────────────────────────────────────────────────────────────
+
+IfStmt      = { "if" ~ Expr ~ (ArrowStmtBody | IndentedBlock) ~
+                ElseIfClause* ~
+                ElseClause? }
+ElseIfClause = { "else" ~ "if" ~ Expr ~ (ArrowStmtBody | IndentedBlock) }
+ElseClause   = { "else" ~ (ArrowStmtBody | IndentedBlock) }
+ArrowStmtBody = { "=>" ~ Stmt }
+
+ForLoop     = { "for" ~ ForVar ~ "in" ~ Expr ~ (ArrowStmtBody | IndentedBlock) }
+ForVar      = { TupleVar | Ident }
+TupleVar    = { "(" ~ Ident ~ ("," ~ Ident)+ ~ ")" |
+                Ident ~ "," ~ Ident }
+
+WhileLoop   = { "while" ~ Expr ~ (ArrowStmtBody | IndentedBlock) }
+
+MatchStmt   = { "match" ~ Expr ~ NEWLINE ~ MatchArm+ }
+MatchArm    = { INDENT ~ Pattern ~ ("if" ~ Expr)? ~ "=>" ~ (IndentedBlock | Expr) ~ NEWLINE? }
+
+ReturnStmt  = { "return" ~ Expr? }
+BreakStmt   = { "break" ~ Expr? }
+ContinueStmt = { "continue" }
+
+AssignStmt  = { AssignTarget ~ AssignOp ~ Expr }
+AssignTarget = { IndexTarget | FieldTarget | Ident }
+IndexTarget  = { Ident ~ ("[" ~ Expr ~ "]")+ }
+FieldTarget  = { Ident ~ ("." ~ Ident)+ }
+AssignOp     = { ":=" | "=" | "+=" | "-=" | "*=" | "/=" }
+
+ExprStmt    = { Expr }
+
+// ─── Expressions (Pratt / precedence climbing) ───────────────────────────────
+
+Expr        = { OrExpr }
+
+OrExpr      = { AndExpr ~ (("or" | "||") ~ AndExpr)* }
+AndExpr     = { NotExpr ~ (("and" | "&&") ~ NotExpr)* }
+NotExpr     = { ("not" | "!") ~ NotExpr | CmpExpr }
+CmpExpr     = { RangeExpr ~ (CmpOp ~ RangeExpr)? }
+CmpOp       = { "==" | "!=" | "<=" | ">=" | "<" | ">" | "is" }
+
+RangeExpr   = { AddExpr ~ ((".." | "..=") ~ AddExpr)? }
+
+AddExpr     = { MulExpr ~ (("+"|"-") ~ MulExpr)* }
+MulExpr     = { PipeExpr ~ (("*"|"/"|"//"|"%") ~ PipeExpr)* }
+
+// Pipeline has higher precedence than * and /:
+// `xs |> sum / n` → `(xs |> sum) / n`
+PipeExpr    = { PowExpr ~ ("|>" ~ PostfixExpr)* }
+
+PowExpr     = { UnaryExpr ~ ("**" ~ PowExpr)? }   // right-associative
+
+UnaryExpr   = { ("-" | "!" | "not") ~ UnaryExpr | PostfixExpr }
+
+PostfixExpr = { PrimaryExpr ~ PostfixOp* }
+PostfixOp   = {
+    FieldAccess  |
+    MethodCall   |
+    IndexAccess  |
+    FnCall       |
+    OptChain
+}
+FieldAccess = { "." ~ Ident }
+MethodCall  = { "." ~ Ident ~ "(" ~ ArgList ~ ")" }
+IndexAccess = { "[" ~ Expr ~ "]" }
+FnCall      = { "(" ~ ArgList ~ ")" }
+OptChain    = { "?." ~ Ident ~ ("(" ~ ArgList ~ ")")? }
+
+// Keyword arguments supported: f(x, name=value)
+ArgList     = { (Arg ~ ("," ~ Arg)* ~ ","?)? }
+Arg         = { (Ident ~ "=" ~ Expr) | Expr }   // kwarg or positional
+
+// Tensor type annotation:  Tensor<f32, [batch, seq, d]>
+TensorType  = { "Tensor" ~ "<" ~ DType ~ ("," ~ ShapeSpec)? ~ ">" }
+DType       = { "f64" | "f32" | "f16" | "i64" | "i32" | "i16" | "i8" | "u8" }
+ShapeSpec   = { "[" ~ DimSpec ~ ("," ~ DimSpec)* ~ "]" }
+DimSpec     = { IntLit | Ident | "?" }     // 128, batch_size, or dynamic
+
+// Channel type:  chan(T) or chan(T, 64)
+ChanType    = { "chan" ~ "(" ~ TypeExpr ~ ("," ~ IntLit)? ~ ")" }
+
+// Future type:  Future<T>
+FutureType  = { "Future" ~ "<" ~ TypeExpr ~ ">" }
+
+// ─── Primary expressions ─────────────────────────────────────────────────────
+
+PrimaryExpr = _{
+    Literal           |
+    LambdaExpr        |
+    AsyncLambdaExpr   |   // NUCLEAR: async fn(...) => body
+    AwaitExpr         |   // NUCLEAR: await expr
+    SpawnExpr         |   // NUCLEAR: spawn expr
+    UnsafeExpr        |   // NUCLEAR: unsafe { ... }
+    IfExpr            |
+    MatchExpr         |
+    StructExpr        |
+    ListExpr          |
+    MapExpr           |
+    SetExpr           |
+    TupleExpr         |
+    PlaceholderLambda |
+    SelfExpr          |   // NUCLEAR: self (inside impl methods)
+    Ident
+}
+
+// NUCLEAR primary forms
+AsyncLambdaExpr = { "async" ~ "fn" ~ "(" ~ ParamList ~ ")" ~ ArrowBody }
+AwaitExpr       = { "await" ~ PostfixExpr }
+SpawnExpr       = { "spawn" ~ PostfixExpr }
+UnsafeExpr      = { "unsafe" ~ IndentedBlock }
+SelfExpr        = { "self" }
+
+// ─── Literals ─────────────────────────────────────────────────────────────────
+
+Literal     = { FloatLit | IntLit | StringLit | BoolLit | NilLit }
+
+IntLit      = @{ ASCII_DIGIT+ ~ ("_" ~ ASCII_DIGIT+)* ~ IntSuffix? }
+IntSuffix   = { "u8"|"u16"|"u32"|"u64"|"u128"|"usize"|
+                "i8"|"i16"|"i32"|"i64"|"i128"|"isize" }
+
+FloatLit    = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* ~ FloatExp? ~ FloatSuffix? |
+                 ASCII_DIGIT+ ~ FloatExp ~ FloatSuffix? }
+FloatExp    = { ("e"|"E") ~ ("+"|"-")? ~ ASCII_DIGIT+ }
+FloatSuffix = { "f16"|"f32"|"f64"|"f128" }
+
+StringLit   = ${ "\"\"\"" ~ MultiStr ~ "\"\"\"" | "\"" ~ InterpolatedStr ~ "\"" }
+MultiStr    = @{ (!"\"\"\"" ~ ANY)* }
+InterpolatedStr = @{ (Escape | InterpExpr | !"\"" ~ ANY)* }
+Escape      = @{ "\\" ~ ("n"|"t"|"r"|"\\"|"\""|ANY) }
+InterpExpr  = !{ "{" ~ Expr ~ (":" ~ FormatSpec)? ~ "}" }
+FormatSpec  = @{ (!"}" ~ ANY)+ }
+
+BoolLit     = { "true" | "false" }
+NilLit      = { "nil" | "None" }
+
+// ─── Collections ──────────────────────────────────────────────────────────────
+
+ListExpr    = { "[" ~ (Expr ~ ("," ~ Expr)* ~ ","?)? ~ "]" }
+MapExpr     = { "{" ~ (MapPair ~ ("," ~ MapPair)* ~ ","?)? ~ "}" }
+MapPair     = { Expr ~ ":" ~ Expr }
+SetExpr     = { "{" ~ Expr ~ ("," ~ Expr)+ ~ ","? ~ "}" }   // 2+ items (vs map)
+TupleExpr   = { "(" ~ Expr ~ "," ~ (Expr ~ ",")* ~ Expr? ~ ")" }
+
+// ─── Struct literal ───────────────────────────────────────────────────────────
+
+StructExpr  = { Ident ~ "{" ~ (SpreadField | NamedField) ~ ("," ~ (SpreadField | NamedField))* ~ ","? ~ "}" }
+NamedField  = { Ident ~ (":" ~ Expr)? }   // shorthand: `{x}` = `{x: x}`
+SpreadField = { ".." ~ Expr }
+
+// ─── Lambda / anonymous function ──────────────────────────────────────────────
+
+LambdaExpr  = { "fn" ~ "(" ~ ParamList ~ ")" ~ ("->" ~ TypeExpr)? ~
+                (ArrowBody | IndentedBlock) }
+
+// Placeholder lambda: `_ * 2`, `_ + 1`, `_.field`
+PlaceholderLambda = { "_" ~ (BinPlaceholder | FieldPlaceholder)? }
+BinPlaceholder    = { ("+"|"-"|"*"|"/"|"//"|"%"|"**") ~ UnaryExpr }
+FieldPlaceholder  = { "." ~ Ident }
+
+// ─── If expression (value context) ───────────────────────────────────────────
+
+IfExpr      = { "if" ~ Expr ~ "=>" ~ Expr ~
+                ("else" ~ "if" ~ Expr ~ "=>" ~ Expr)* ~
+                ("else" ~ "=>" ~ Expr)? }
+
+// ─── Match expression ─────────────────────────────────────────────────────────
+
+MatchExpr   = { "match" ~ Expr ~ NEWLINE ~ MatchArm+ }
+
+// ─── Patterns ─────────────────────────────────────────────────────────────────
+
+Pattern     = { OrPattern }
+OrPattern   = { SinglePattern ~ ("|" ~ SinglePattern)* }
+SinglePattern = _{
+    WildCard     |
+    RangePattern |
+    LiteralPat   |
+    SomePattern  |
+    NonePattern  |
+    OkPattern    |
+    ErrPattern   |
+    CtorPattern  |
+    BindPattern
+}
+
+WildCard      = { "_" }
+LiteralPat    = { FloatLit | IntLit | StringLit | BoolLit | NilLit | "-" ~ IntLit }
+RangePattern  = { (IntLit | "-" ~ IntLit) ~ (".." | "..=") ~ (IntLit | "-" ~ IntLit)? }
+SomePattern   = { "Some" ~ "(" ~ Pattern ~ ")" }
+NonePattern   = { "None" | "nil" }
+OkPattern     = { "Ok"  ~ "(" ~ Pattern ~ ")" }
+ErrPattern    = { "Err" ~ "(" ~ Pattern ~ ")" }
+CtorPattern   = { Ident ~ ("." ~ Ident)? ~ ("(" ~ Pattern ~ ("," ~ Pattern)* ~ ")")? }
+BindPattern   = { Ident }    // lowercase = variable binding; uppercase = type check
+
+// ─── Identifiers ──────────────────────────────────────────────────────────────
+
+Ident       = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// Reserved words (must not match as Ident in final grammar)
+KEYWORD     = {
+    "fn" | "if" | "else" | "for" | "while" | "loop" | "in" |
+    "return" | "break" | "continue" | "match" | "type" | "trait" |
+    "impl" | "import" | "export" | "from" | "as" | "where" |
+    "and" | "or" | "not" | "is" | "true" | "false" | "nil" |
+    "self" | "Some" | "None" | "Ok" | "Err" |
+    // Nuclear keywords:
+    "comptime" | "async" | "await" | "spawn" | "extern" | "unsafe"
+}
+
+// ─── Whitespace & comments ────────────────────────────────────────────────────
+
+WHITESPACE  = _{ " " | "\t" | "\r" }
+NEWLINE     = _{ "\n" }
+COMMENT     = _{ "--" ~ (!"\n" ~ ANY)* }
+
+// Indentation helpers (simplified — real implementation uses indent stack)
+// In a real pest parser, indentation is tracked via a state machine or
+// converted to INDENT/DEDENT tokens in a pre-pass (Python-style).
+INDENT      = _{ " "+ | "\t"+ }
+INDENT_NEXT = _{ PEEK_ALL ~ " " }   // one level deeper (pest atomic rule)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Operator token disambiguation (order matters — longer ops first)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Matmul operator (@)
+// ─────────────────────────────────────────────────────────────────────────────
+Op_Matmul    = { "@" }   // A @ B → matrix multiply (Python convention)
+
+Op_RangeInc  = { "..=" }
+Op_Range     = { ".." }
+Op_PipeEq    = { "|>=" }
+Op_Pipe      = { "|>" }
+Op_Arrow     = { "=>" }
+Op_WalrusImm = { ":=" }
+Op_Neq       = { "!=" }
+Op_Leq       = { "<=" }
+Op_Geq       = { ">=" }
+Op_Eq        = { "==" }
+Op_And       = { "&&" }
+Op_Or        = { "||" }
+Op_Shl       = { "<<" }
+Op_Shr       = { ">>" }
+Op_Arrow2    = { "->" }
+Op_Pow       = { "**" }
+Op_IntDiv    = { "//" }
+Op_NullCoal  = { "??" }
+Op_OptChain  = { "?." }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Nuvola-specific semantic notes
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 1. BINDINGS
+//    x := expr      immutable binding (Rust `let`, Haskell default)
+//    x = expr       mutable binding OR reassignment
+//    x: T := expr   typed immutable binding
+//    x: T = expr    typed mutable binding
+//    (a, b) := expr tuple destructure (always immutable)
+//
+// 2. FUNCTIONS
+//    fn f(x, y) => x + y          single-expr (arrow form, implicit return)
+//    fn f(x, y) -> T              block body with explicit returns
+//      ...
+//    fn(x) => x * 2               anonymous lambda
+//    _ * 2                        placeholder lambda (sugar for fn(_) => _ * 2)
+//
+// 3. PIPELINE |>
+//    xs |> f          calls f(xs)
+//    xs |> f(a)       calls f(xs, a)   (xs prepended as first arg)
+//    xs |> sum / n    parses as (xs |> sum) / n   (pipe binds tighter than /)
+//
+// 4. STRINGS
+//    "Hello {name}!"           interpolation — any expression in {}
+//    "Score: {x:.2f}"          with format spec (Rust fmt style)
+//    """multi-line string"""   raw multi-line
+//
+// 5. RANGES
+//    1..10     exclusive  [1, 9]
+//    1..=10    inclusive  [1, 10]
+//    0..xs.len auto-coerced to int range in for loops
+//
+// 6. MATCH
+//    match x
+//      0        => "zero"
+//      1..=9    => "single digit"
+//      "hello"  => "greeting"
+//      Some(v)  => "has value: {v}"
+//      None     => "empty"
+//      Point{x, y} if x > 0 => "right half"
+//      _        => "anything"
+//
+// 7. TYPES (structural, no inheritance)
+//    type Point              struct: all fields
+//      x: f64
+//      y: f64
+//
+//    type Shape              enum: all variants
+//      Circle(radius: f64)
+//      Rect(w: f64, h: f64)
+//
+// 8. OPTION / RESULT  (built-in, no import needed)
+//    Some(42)   None   Ok(val)   Err("oops")
+//    x.is_some  x.value  x.is_ok  — uniform access on any value:
+//      non-None values have .is_some = true, .value = self
+//
+// 9. MODULES (future)
+//    import math.{sin, cos, PI}
+//    import io as io_lib
+//
+// 10. ANNOTATIONS (parsed, semantics TBD)
+//     @pure   fn f(x) => x + 1    no side effects
+//     @io     fn read_line() -> str
+//     @parallel fn heavy_compute(xs) -> Vec<f64>   APX hint

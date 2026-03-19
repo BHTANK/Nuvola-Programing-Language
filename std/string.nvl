@@ -1,0 +1,94 @@
+-- std/string.nvl — Nuvola standard string library
+-- Import with: import "std/string.nvl"
+
+-- ── Padding ───────────────────────────────────────────────────────────────
+fn str_pad_left(s, width, ch)
+  -- Pad string s on the left with ch until len == width
+  while s.len < width
+    s = ch + s
+  s
+
+fn str_pad_right(s, width, ch)
+  while s.len < width
+    s = s + ch
+  s
+
+fn str_pad_center(s, width, ch)
+  total := width - s.len
+  if total <= 0 => return s
+  left  := total / 2
+  right := total - left
+  str_pad_left(str_pad_right(s, s.len + right, ch), width, ch)
+
+-- ── Count occurrences of substring ───────────────────────────────────────
+fn str_count(s, sub)
+  if sub == "" => return 0
+  count = 0
+  idx   = s.index_of(sub)
+  while idx >= 0
+    count = count + 1
+    s     = s.slice(idx + sub.len, s.len)
+    idx   = s.index_of(sub)
+  count
+
+-- ── Replace all occurrences ───────────────────────────────────────────────
+fn str_replace_all(s, from, to)
+  if from == "" => return s
+  result = ""
+  idx    = s.index_of(from)
+  while idx >= 0
+    result = result + s.slice(0, idx) + to
+    s      = s.slice(idx + from.len, s.len)
+    idx    = s.index_of(from)
+  result + s
+
+-- ── Lines ─────────────────────────────────────────────────────────────────
+fn str_lines(s)
+  s.split("\n")
+
+-- ── Words (split on whitespace) ───────────────────────────────────────────
+fn str_words(s)
+  -- Split on spaces, filter empty parts
+  parts := s.split(" ")
+  result = []
+  for p in parts
+    if p.trim() != ""
+      result.push(p.trim())
+  result
+
+-- ── Is numeric ────────────────────────────────────────────────────────────
+fn str_is_int(s)
+  s = s.trim()
+  if s == "" => return false
+  i = 0
+  if s.len > 0 and (s[0] == "-" or s[0] == "+")
+    i = 1
+  if i >= s.len => return false
+  while i < s.len
+    c := s[i]
+    if c < "0" or c > "9"
+      return false
+    i = i + 1
+  true
+
+-- ── Reverse a string ──────────────────────────────────────────────────────
+fn str_reverse(s)
+  chars := s.chars()
+  result = ""
+  i = chars.len - 1
+  while i >= 0
+    result = result + chars[i]
+    i = i - 1
+  result
+
+-- ── Title case ────────────────────────────────────────────────────────────
+fn str_title(s)
+  words := str_words(s)
+  result = []
+  for w in words
+    if w.len > 0
+      result.push(w[0].upper() + w.slice(1, w.len).lower())
+  result.join(" ")
+
+-- ── Repeat alias ──────────────────────────────────────────────────────────
+fn str_repeat(s, n) => s.repeat(n)

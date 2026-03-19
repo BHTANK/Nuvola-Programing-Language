@@ -1,0 +1,18 @@
+import "std/math.nvl"
+
+-- Test that stdlib imports work from tests/ directory
+-- std/math.nvl is in project_root/std/, not tests/std/
+
+x := math_sqrt(16.0)
+assert(x == 4.0, "sqrt(16) should be 4")
+
+y := math_pow(2.0, 10.0)
+assert(y == 1024.0, "2^10 should be 1024")
+
+z := clamp(15, 0, 10)
+assert(z == 10, "clamp(15,0,10) should be 10")
+
+pi_approx := math_floor(PI * 1000.0) / 1000.0
+assert(pi_approx == 3.141, "PI floor 3 decimals should be 3.141")
+
+print("stdlib import: all tests passed")

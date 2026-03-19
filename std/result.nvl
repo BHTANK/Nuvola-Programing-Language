@@ -1,0 +1,127 @@
+-- std/result.nvl — Result and Option types for error handling
+-- Import with: import "std/result.nvl"
+--
+-- Result is a map: {"ok": true/false, "value": v, "error": e}
+-- Option is a map: {"some": true/false, "value": v}
+--
+-- These are convention-based (not language-enforced), but work great with
+-- match expressions and explicit checks.
+
+-- ── Result constructors ───────────────────────────────────────────────────────
+
+fn Ok(value)
+  r := {}
+  r.set("ok",    true)
+  r.set("value", value)
+  r.set("error", nil)
+  r
+
+fn Err(error)
+  r := {}
+  r.set("ok",    false)
+  r.set("value", nil)
+  r.set("error", error)
+  r
+
+-- ── Result predicates ─────────────────────────────────────────────────────────
+
+fn is_ok(r)  => r.get("ok") == true
+fn is_err(r) => r.get("ok") == false
+
+-- ── Result accessors ─────────────────────────────────────────────────────────
+
+fn unwrap(r)
+  if r.get("ok") == true => return r.get("value")
+  throw "unwrap called on Err: " + str(r.get("error"))
+
+fn unwrap_or(r, default)
+  if r.get("ok") == true => return r.get("value")
+  default
+
+fn unwrap_err(r)
+  if r.get("ok") == false => return r.get("error")
+  throw "unwrap_err called on Ok"
+
+fn result_map(r, f)
+  if r.get("ok") == true
+    return Ok(f(r.get("value")))
+  r
+
+fn result_and_then(r, f)
+  if r.get("ok") == true
+    return f(r.get("value"))
+  r
+
+fn result_or_else(r, f)
+  if r.get("ok") == false
+    return f(r.get("error"))
+  r
+
+-- ── Option constructors ───────────────────────────────────────────────────────
+
+fn Some(value)
+  o := {}
+  o.set("some",  true)
+  o.set("value", value)
+  o
+
+fn None()
+  o := {}
+  o.set("some",  false)
+  o.set("value", nil)
+  o
+
+-- ── Option predicates ─────────────────────────────────────────────────────────
+
+fn is_some(o) => o.get("some") == true
+fn is_none(o) => o.get("some") == false
+
+-- ── Option accessors ─────────────────────────────────────────────────────────
+
+fn option_unwrap(o)
+  if o.get("some") == true => return o.get("value")
+  throw "option_unwrap called on None"
+
+fn option_unwrap_or(o, default)
+  if o.get("some") == true => return o.get("value")
+  default
+
+fn option_map(o, f)
+  if o.get("some") == true => return Some(f(o.get("value")))
+  o
+
+fn option_and_then(o, f)
+  if o.get("some") == true => return f(o.get("value"))
+  o
+
+fn option_filter(o, pred)
+  if o.get("some") == true
+    if pred(o.get("value")) => return o
+    return None()
+  o
+
+-- ── Collect: list of Results → Result of list (all must be Ok) ───────────────
+fn result_collect(results)
+  values := []
+  for r in results
+    if r.get("ok") == false => return r
+    values.push(r.get("value"))
+  Ok(values)
+
+-- ── Try: call f(), wrap any throw in Err ─────────────────────────────────────
+fn result_try(f)
+  try
+    return Ok(f())
+  catch e
+    return Err(str(e))
+  Ok(nil)
+
+-- ── Convert nil to None / value to Some ──────────────────────────────────────
+fn to_option(v)
+  if v == nil => return None()
+  Some(v)
+
+-- ── Convert Option to Result ──────────────────────────────────────────────────
+fn option_ok_or(o, error)
+  if o.get("some") == true => return Ok(o.get("value"))
+  Err(error)

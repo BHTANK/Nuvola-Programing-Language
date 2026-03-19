@@ -1,0 +1,50 @@
+{
+  "name": "nuvola-lang",
+  "displayName": "Nuvola",
+  "description": "Syntax highlighting and language server for the Nuvola programming language (.nvl)",
+  "version": "0.1.0",
+  "publisher": "nuvola-lang",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:nuvola"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "nuvola",
+        "aliases": [
+          "Nuvola",
+          "nuvola"
+        ],
+        "extensions": [
+          ".nvl"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "nuvola",
+        "scopeName": "source.nuvola",
+        "path": "./syntaxes/nuvola.tmLanguage.json"
+      }
+    ],
+    "iconThemes": [
+      {
+        "id": "nuvola-icons",
+        "label": "Nuvola File Icons",
+        "path": "./icons/nuvola-icon-theme.json"
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

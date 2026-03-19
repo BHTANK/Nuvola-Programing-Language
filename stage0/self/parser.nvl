@@ -1,0 +1,1054 @@
+-- parser.nvl — Nuvola recursive-descent parser written in Nuvola (M7 self-hosting)
+-- Reads a .nvl source file, lexes it, then parses it into an AST.
+-- AST nodes are maps: { kind: str, ... }
+-- Usage: ./parser <file.nvl>
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- LEXER (inlined — no module system yet)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn is_alpha(c)
+  (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_"
+
+fn is_digit(c)
+  c >= "0" and c <= "9"
+
+fn is_alnum(c)
+  is_alpha(c) or is_digit(c)
+
+fn is_space(c)
+  c == " " or c == "\t"
+
+fn is_keyword(w)
+  kws := ["fn", "async", "return", "if", "elif", "else", "for", "in",
+          "while", "break", "continue", "match", "true", "false", "nil",
+          "and", "or", "not", "comptime", "extern", "unsafe", "spawn",
+          "await", "import", "trait", "impl", "type", "where", "skip"]
+  for k in kws
+    if k == w
+      return true
+  false
+
+fn peek_char(chars, i, n)
+  if i < n
+    return chars[i]
+  ""
+
+fn is_two_char_op(c, p)
+  ops := [":=", "=>", "|>", "->", "==", "!=", "<=", ">=", "**", "..", "//", "+=", "-=", "*=", "/="]
+  for op in ops
+    if op == c + p
+      return true
+  false
+
+fn make_tok(kind, val, line, col)
+  t = {}
+  t.set("kind", kind)
+  t.set("val",  val)
+  t.set("line", line)
+  t.set("col",  col)
+  t
+
+fn lex(src)
+  chars        = src.chars()
+  n            = chars.len
+  i            = 0
+  line         = 1
+  col          = 1
+  tokens       = []
+  indent_stack = [0]
+  bracket_depth = 0
+
+  while i < n
+    c = chars[i]
+    p = peek_char(chars, i + 1, n)
+
+    -- newline + indent/dedent logic
+    if c == "\n"
+      if bracket_depth == 0
+        tokens.push(make_tok("nl", "", line, col))
+        j      = i + 1
+        spaces = 0
+        while j < n and (chars[j] == " " or chars[j] == "\t")
+          spaces = spaces + 1
+          j      = j + 1
+        nxt      := peek_char(chars, j, n)
+        is_blank := nxt == "\n" or nxt == "\r" or nxt == ""
+        is_cmt   := nxt == "-" and peek_char(chars, j + 1, n) == "-"
+        if not is_blank and not is_cmt
+          top := indent_stack[indent_stack.len - 1]
+          if spaces > top
+            indent_stack.push(spaces)
+            tokens.push(make_tok("indent", "", line + 1, 1))
+          else
+            while spaces < indent_stack[indent_stack.len - 1]
+              indent_stack.pop()
+              tokens.push(make_tok("dedent", "", line + 1, 1))
+      line = line + 1
+      col  = 1
+      i    = i + 1
+
+    else if c == "\r"
+      i = i + 1
+
+    -- line comment
+    else if c == "-" and p == "-"
+      while i < n and chars[i] != "\n"
+        i   = i + 1
+        col = col + 1
+
+    -- string literal
+    else if c == "\""
+      i   = i + 1
+      col = col + 1
+      s   = ""
+      start_col := col
+      while i < n and chars[i] != "\""
+        ch := chars[i]
+        if ch == "\\"
+          i   = i + 1
+          col = col + 1
+          esc := peek_char(chars, i, n)
+          if esc == "n"
+            s = s + "\n"
+          else if esc == "t"
+            s = s + "\t"
+          else
+            s = s + esc
+        else
+          s = s + ch
+        i   = i + 1
+        col = col + 1
+      tokens.push(make_tok("str", s, line, start_col))
+      i   = i + 1
+      col = col + 1
+
+    -- number literal
+    else if is_digit(c)
+      num       = ""
+      is_f      = false
+      start_col := col
+      -- consume digits; consume "." only if next char is NOT "." (avoid eating "..")
+      while i < n and (is_digit(chars[i]) or (chars[i] == "." and peek_char(chars, i + 1, n) != "."))
+        if chars[i] == "."
+          is_f = true
+        num = num + chars[i]
+        i   = i + 1
+        col = col + 1
+      if is_f
+        tokens.push(make_tok("float", num, line, start_col))
+      else
+        tokens.push(make_tok("int", num, line, start_col))
+
+    -- identifier or keyword
+    else if is_alpha(c)
+      word      = ""
+      start_col := col
+      while i < n and is_alnum(chars[i])
+        word = word + chars[i]
+        i    = i + 1
+        col  = col + 1
+      if word == "true" or word == "false"
+        tokens.push(make_tok("bool", word, line, start_col))
+      else if word == "nil"
+        tokens.push(make_tok("nil", "nil", line, start_col))
+      else if is_keyword(word)
+        tokens.push(make_tok("kw", word, line, start_col))
+      else
+        tokens.push(make_tok("ident", word, line, start_col))
+
+    -- annotation
+    else if c == "@"
+      i    = i + 1
+      col  = col + 1
+      name = ""
+      while i < n and is_alnum(chars[i])
+        name = name + chars[i]
+        i    = i + 1
+        col  = col + 1
+      tokens.push(make_tok("annot", "@" + name, line, col))
+
+    -- open brackets
+    else if c == "(" or c == "[" or c == "{"
+      bracket_depth = bracket_depth + 1
+      tokens.push(make_tok("op", c, line, col))
+      i   = i + 1
+      col = col + 1
+
+    -- close brackets
+    else if c == ")" or c == "]" or c == "}"
+      bracket_depth = bracket_depth - 1
+      tokens.push(make_tok("op", c, line, col))
+      i   = i + 1
+      col = col + 1
+
+    -- whitespace
+    else if is_space(c)
+      i   = i + 1
+      col = col + 1
+
+    -- ..= three-char op
+    else if c == "." and p == "." and peek(chars, i + 2, n) == "="
+      tokens.push(make_tok("op", "..=", line, col))
+      i   = i + 3
+      col = col + 3
+
+    -- two-char operators
+    else if is_two_char_op(c, p)
+      tokens.push(make_tok("op", c + p, line, col))
+      i   = i + 2
+      col = col + 2
+
+    -- single-char operator
+    else
+      tokens.push(make_tok("op", c, line, col))
+      i   = i + 1
+      col = col + 1
+
+  -- flush dedents
+  while indent_stack.len > 1
+    indent_stack.pop()
+    tokens.push(make_tok("dedent", "", line, col))
+  tokens.push(make_tok("eof", "", line, col))
+  tokens
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- PARSER STATE
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn make_state(tokens)
+  s = {}
+  s.set("tokens", tokens)
+  s.set("pos", 0)
+  s
+
+fn cur_tok(state)
+  tokens := state.get("tokens")
+  pos    := state.get("pos")
+  if pos < tokens.len
+    return tokens[pos]
+  make_tok("eof", "", 0, 0)
+
+fn cur_kind(state)
+  cur_tok(state).get("kind")
+
+fn cur_val(state)
+  cur_tok(state).get("val")
+
+fn advance(state)
+  pos := state.get("pos")
+  state.set("pos", pos + 1)
+  state
+
+fn skip_nl(state)
+  while cur_kind(state) == "nl"
+    advance(state)
+  state
+
+fn skip_ws(state)
+  while cur_kind(state) == "nl" or cur_kind(state) == "indent" or cur_kind(state) == "dedent"
+    advance(state)
+  state
+
+fn eat_kw(state, kw)
+  if cur_kind(state) == "kw" and cur_val(state) == kw
+    advance(state)
+    return true
+  false
+
+fn eat_op(state, op)
+  if cur_kind(state) == "op" and cur_val(state) == op
+    advance(state)
+    return true
+  false
+
+-- ── AST node constructors ─────────────────────────────────────────────────────
+
+fn node(kind)
+  n = {}
+  n.set("kind", kind)
+  n
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- EXPRESSION PARSER (Pratt / precedence climbing)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn parse_expr(state)
+  parse_or_expr(state)
+
+fn parse_or_expr(state)
+  left := parse_and_expr(state)
+  while cur_kind(state) == "kw" and cur_val(state) == "or"
+    advance(state)
+    right := parse_and_expr(state)
+    n = node("binop")
+    n.set("op", "or")
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_and_expr(state)
+  left := parse_not_expr(state)
+  while cur_kind(state) == "kw" and cur_val(state) == "and"
+    advance(state)
+    right := parse_not_expr(state)
+    n = node("binop")
+    n.set("op", "and")
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_not_expr(state)
+  if cur_kind(state) == "kw" and cur_val(state) == "not"
+    advance(state)
+    operand := parse_cmp_expr(state)
+    n = node("unop")
+    n.set("op", "not")
+    n.set("operand", operand)
+    return n
+  parse_cmp_expr(state)
+
+fn parse_cmp_expr(state)
+  left := parse_range_expr(state)
+  cmp_ops := ["==", "!=", "<", ">", "<=", ">="]
+  while cur_kind(state) == "op" and in_cmp_ops(cur_val(state))
+    op := cur_val(state)
+    advance(state)
+    right := parse_range_expr(state)
+    n = node("binop")
+    n.set("op", op)
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_range_expr(state)
+  left := parse_add_expr(state)
+  if cur_kind(state) == "op" and (cur_val(state) == ".." or cur_val(state) == "..=")
+    op := cur_val(state)
+    advance(state)
+    right := parse_add_expr(state)
+    n = node("range")
+    n.set("op", op)
+    n.set("start", left)
+    n.set("end", right)
+    return n
+  left
+
+fn in_cmp_ops(op)
+  ops := ["==", "!=", "<", ">", "<=", ">="]
+  for o in ops
+    if o == op
+      return true
+  false
+
+fn parse_add_expr(state)
+  left := parse_mul_expr(state)
+  while cur_kind(state) == "op" and (cur_val(state) == "+" or cur_val(state) == "-")
+    op := cur_val(state)
+    advance(state)
+    right := parse_mul_expr(state)
+    n = node("binop")
+    n.set("op", op)
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_mul_expr(state)
+  left := parse_unary_expr(state)
+  while cur_kind(state) == "op" and (cur_val(state) == "*" or cur_val(state) == "/" or cur_val(state) == "%" or cur_val(state) == "//")
+    op := cur_val(state)
+    advance(state)
+    right := parse_unary_expr(state)
+    n = node("binop")
+    n.set("op", op)
+    n.set("left", left)
+    n.set("right", right)
+    left = n
+  left
+
+fn parse_unary_expr(state)
+  if cur_kind(state) == "op" and cur_val(state) == "-"
+    advance(state)
+    operand := parse_postfix_expr(state)
+    n = node("unop")
+    n.set("op", "neg")
+    n.set("operand", operand)
+    return n
+  parse_postfix_expr(state)
+
+fn parse_postfix_expr(state)
+  base := parse_primary(state)
+  -- handle .method(), .field, [index], (call)
+  running = base
+  going   = true
+  while going
+    if cur_kind(state) == "op" and cur_val(state) == "."
+      advance(state)
+      field := cur_val(state)
+      advance(state)
+      -- method call?
+      if cur_kind(state) == "op" and cur_val(state) == "("
+        advance(state)
+        args := parse_arg_list(state)
+        n = node("method_call")
+        n.set("obj", running)
+        n.set("method", field)
+        n.set("args", args)
+        running = n
+      else
+        n = node("field")
+        n.set("obj", running)
+        n.set("field", field)
+        running = n
+    else if cur_kind(state) == "op" and cur_val(state) == "["
+      advance(state)
+      idx := parse_expr(state)
+      eat_op(state, "]")
+      n = node("index")
+      n.set("obj", running)
+      n.set("idx", idx)
+      running = n
+    else if cur_kind(state) == "op" and cur_val(state) == "|>"
+      advance(state)
+      fn_expr := parse_primary(state)
+      -- parse optional call args after pipe target
+      if cur_kind(state) == "op" and cur_val(state) == "("
+        advance(state)
+        args := parse_arg_list(state)
+        n = node("pipe_call")
+        n.set("val", running)
+        n.set("fn", fn_expr)
+        n.set("args", args)
+        running = n
+      else
+        n = node("pipe")
+        n.set("val", running)
+        n.set("fn", fn_expr)
+        running = n
+    else
+      going = false
+  running
+
+fn parse_arg_list(state)
+  args = []
+  if cur_kind(state) == "op" and cur_val(state) == ")"
+    advance(state)
+    return args
+  args.push(parse_expr(state))
+  while cur_kind(state) == "op" and cur_val(state) == ","
+    advance(state)
+    skip_nl(state)
+    if cur_kind(state) == "op" and cur_val(state) == ")"
+      break
+    args.push(parse_expr(state))
+  eat_op(state, ")")
+  args
+
+fn parse_primary(state)
+  k := cur_kind(state)
+  v := cur_val(state)
+
+  -- integer literal
+  if k == "int"
+    advance(state)
+    n = node("int")
+    n.set("val", v)
+    return n
+
+  -- float literal
+  if k == "float"
+    advance(state)
+    n = node("float")
+    n.set("val", v)
+    return n
+
+  -- string literal
+  if k == "str"
+    advance(state)
+    n = node("str")
+    n.set("val", v)
+    return n
+
+  -- bool literal
+  if k == "bool"
+    advance(state)
+    n = node("bool")
+    n.set("val", v)
+    return n
+
+  -- nil
+  if k == "nil"
+    advance(state)
+    return node("nil")
+
+  -- list literal [a, b, c]
+  if k == "op" and v == "["
+    advance(state)
+    items = []
+    skip_nl(state)
+    while not (cur_kind(state) == "op" and cur_val(state) == "]")
+      items.push(parse_expr(state))
+      skip_nl(state)
+      if cur_kind(state) == "op" and cur_val(state) == ","
+        advance(state)
+        skip_nl(state)
+    eat_op(state, "]")
+    n = node("list")
+    n.set("items", items)
+    return n
+
+  -- map literal {}
+  if k == "op" and v == "{"
+    advance(state)
+    pairs = []
+    skip_nl(state)
+    while not (cur_kind(state) == "op" and cur_val(state) == "}")
+      key := parse_expr(state)
+      eat_op(state, ":")
+      val := parse_expr(state)
+      skip_nl(state)
+      if cur_kind(state) == "op" and cur_val(state) == ","
+        advance(state)
+        skip_nl(state)
+      p = []
+      p.push(key)
+      p.push(val)
+      pairs.push(p)
+    eat_op(state, "}")
+    n = node("map")
+    n.set("pairs", pairs)
+    return n
+
+  -- parenthesized expression
+  if k == "op" and v == "("
+    advance(state)
+    inner := parse_expr(state)
+    eat_op(state, ")")
+    return inner
+
+  -- lambda: fn(params) => body
+  if k == "kw" and v == "fn"
+    advance(state)
+    if cur_kind(state) == "op" and cur_val(state) == "("
+      advance(state)
+      params := parse_param_list(state)
+      eat_op(state, "=>")
+      body := parse_expr(state)
+      n = node("lambda")
+      n.set("params", params)
+      n.set("body", body)
+      return n
+
+  -- identifier (possibly a function call)
+  if k == "ident"
+    name := v
+    advance(state)
+    if cur_kind(state) == "op" and cur_val(state) == "("
+      advance(state)
+      args := parse_arg_list(state)
+      n = node("call")
+      n.set("fn", name)
+      n.set("args", args)
+      return n
+    n = node("ident")
+    n.set("name", name)
+    return n
+
+  -- if as expression
+  if k == "kw" and v == "if"
+    return parse_if_expr(state)
+
+  -- fallback
+  n = node("unknown")
+  n.set("kind_raw", k)
+  n.set("val_raw", v)
+  advance(state)
+  n
+
+fn parse_if_expr(state)
+  eat_kw(state, "if")
+  cond := parse_expr(state)
+  n = node("if_expr")
+  n.set("cond", cond)
+  if cur_kind(state) == "op" and cur_val(state) == "=>"
+    advance(state)
+    body := parse_expr(state)
+    n.set("then", body)
+  else
+    body := parse_block_or_expr(state)
+    n.set("then", body)
+  try_parse_else_chain(state, n)
+  n
+
+fn parse_block_or_expr(state)
+  if cur_kind(state) == "nl"
+    advance(state)
+    if cur_kind(state) == "indent"
+      return parse_block(state)
+  parse_expr(state)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- STATEMENT PARSER
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn parse_param_list(state)
+  params = []
+  if cur_kind(state) == "op" and cur_val(state) == ")"
+    advance(state)
+    return params
+  params.push(cur_val(state))
+  advance(state)
+  while cur_kind(state) == "op" and cur_val(state) == ","
+    advance(state)
+    params.push(cur_val(state))
+    advance(state)
+  eat_op(state, ")")
+  params
+
+fn parse_block(state)
+  stmts     = []
+  got_indent = false
+  if cur_kind(state) == "indent"
+    advance(state)
+    got_indent = true
+  if got_indent
+    -- full indented block: parse until matching DEDENT
+    while cur_kind(state) != "dedent" and cur_kind(state) != "eof"
+      if cur_kind(state) == "nl"
+        advance(state)
+        continue
+      s := parse_stmt(state)
+      stmts.push(s)
+    if cur_kind(state) == "dedent"
+      advance(state)
+  else
+    -- no INDENT: parse exactly ONE statement (inline else-body, single-line if body)
+    if cur_kind(state) != "nl" and cur_kind(state) != "dedent" and cur_kind(state) != "eof"
+      s := parse_stmt(state)
+      stmts.push(s)
+  n = node("block")
+  n.set("stmts", stmts)
+  n
+
+-- After parsing an if-body, look for elif/else continuation (possibly on next
+-- indented line).  Mutates n to add "elifs" and "else" fields.
+fn try_parse_else_chain(state, n)
+  skip_nl(state)
+  -- peek past optional INDENT to see if an else/elif follows
+  consumed_indent = false
+  if cur_kind(state) == "indent"
+    saved := state.get("pos")
+    advance(state)
+    if cur_kind(state) == "kw" and (cur_val(state) == "else" or cur_val(state) == "elif")
+      consumed_indent = true
+    else
+      state.set("pos", saved)
+  elifs = []
+  while cur_kind(state) == "kw" and cur_val(state) == "elif"
+    advance(state)
+    ec := parse_expr(state)
+    eb = node("block")
+    if cur_kind(state) == "op" and cur_val(state) == "=>"
+      advance(state)
+      single := parse_stmt(state)
+      tmp = [single]
+      eb.set("stmts", tmp)
+    else
+      skip_nl(state)
+      eb = parse_block(state)
+    elif_n = node("elif")
+    elif_n.set("cond", ec)
+    elif_n.set("body", eb)
+    elifs.push(elif_n)
+    skip_nl(state)
+  n.set("elifs", elifs)
+  if cur_kind(state) == "kw" and cur_val(state) == "else"
+    advance(state)
+    else_b = node("block")
+    if cur_kind(state) == "op" and cur_val(state) == "=>"
+      advance(state)
+      single := parse_stmt(state)
+      tmp = [single]
+      else_b.set("stmts", tmp)
+    else
+      skip_nl(state)
+      else_b = parse_block(state)
+    n.set("else", else_b)
+  if consumed_indent
+    skip_nl(state)
+    if cur_kind(state) == "dedent"
+      advance(state)
+
+fn parse_fn_def(state)
+  is_async = false
+  if cur_kind(state) == "kw" and cur_val(state) == "async"
+    is_async = true
+    advance(state)
+  eat_kw(state, "fn")
+  name := cur_val(state)
+  advance(state)
+  eat_op(state, "(")
+  params := parse_param_list(state)
+
+  -- arrow body: fn f(x) => expr
+  if cur_kind(state) == "op" and cur_val(state) == "=>"
+    advance(state)
+    body := parse_expr(state)
+    skip_nl(state)
+    n = node("fn_def")
+    n.set("name", name)
+    n.set("params", params)
+    n.set("body", body)
+    n.set("async", is_async)
+    return n
+
+  -- block body: fn f(x)\n  stmts
+  skip_nl(state)
+  body := parse_block(state)
+  n = node("fn_def")
+  n.set("name", name)
+  n.set("params", params)
+  n.set("body", body)
+  n.set("async", is_async)
+  n
+
+fn parse_stmt(state)
+  k := cur_kind(state)
+  v := cur_val(state)
+
+  -- function declaration
+  if (k == "kw" and v == "fn") or (k == "kw" and v == "async")
+    return parse_fn_def(state)
+
+  -- return
+  if k == "kw" and v == "return"
+    advance(state)
+    if cur_kind(state) == "nl" or cur_kind(state) == "eof"
+      n = node("return")
+      n.set("val", node("nil"))
+      return n
+    val := parse_expr(state)
+    skip_nl(state)
+    n = node("return")
+    n.set("val", val)
+    return n
+
+  -- if statement: two forms
+  --   inline: if cond => stmt      (no block)
+  --   block:  if cond\n  indented_block
+  if k == "kw" and v == "if"
+    advance(state)
+    cond := parse_expr(state)
+    then_b = node("block")
+    if cur_kind(state) == "op" and cur_val(state) == "=>"
+      -- inline form
+      advance(state)
+      single := parse_stmt(state)
+      tmp_stmts = [single]
+      then_b.set("stmts", tmp_stmts)
+    else
+      skip_nl(state)
+      then_b = parse_block(state)
+    n = node("if")
+    n.set("cond", cond)
+    n.set("then", then_b)
+    try_parse_else_chain(state, n)
+    return n
+
+  -- for loop
+  if k == "kw" and v == "for"
+    advance(state)
+    var := cur_val(state)
+    advance(state)
+    eat_kw(state, "in")
+    iter := parse_expr(state)
+    skip_nl(state)
+    body := parse_block(state)
+    n = node("for")
+    n.set("var", var)
+    n.set("iter", iter)
+    n.set("body", body)
+    return n
+
+  -- while loop
+  if k == "kw" and v == "while"
+    advance(state)
+    cond := parse_expr(state)
+    skip_nl(state)
+    body := parse_block(state)
+    n = node("while")
+    n.set("cond", cond)
+    n.set("body", body)
+    return n
+
+  -- match
+  if k == "kw" and v == "match"
+    advance(state)
+    subject := parse_expr(state)
+    skip_nl(state)
+    if cur_kind(state) == "indent"
+      advance(state)
+    arms = []
+    while cur_kind(state) != "dedent" and cur_kind(state) != "eof"
+      if cur_kind(state) == "nl"
+        advance(state)
+        continue
+      pat := parse_expr(state)
+      eat_op(state, "=>")
+      arm_body := parse_expr(state)
+      skip_nl(state)
+      arm = node("arm")
+      arm.set("pat", pat)
+      arm.set("body", arm_body)
+      arms.push(arm)
+    if cur_kind(state) == "dedent"
+      advance(state)
+    n = node("match")
+    n.set("subject", subject)
+    n.set("arms", arms)
+    return n
+
+  -- break / continue
+  if k == "kw" and v == "break"
+    advance(state)
+    skip_nl(state)
+    return node("break")
+
+  if k == "kw" and v == "continue"
+    advance(state)
+    skip_nl(state)
+    return node("continue")
+
+  -- comptime
+  if k == "kw" and v == "comptime"
+    advance(state)
+    name := cur_val(state)
+    advance(state)
+    eat_op(state, ":=")
+    val := parse_expr(state)
+    skip_nl(state)
+    n = node("comptime")
+    n.set("name", name)
+    n.set("val", val)
+    return n
+
+  -- expression statement: could be assignment (:= or =) or bare expression
+  expr := parse_expr(state)
+
+  -- := immutable bind
+  if cur_kind(state) == "op" and cur_val(state) == ":="
+    advance(state)
+    rhs := parse_expr(state)
+    skip_nl(state)
+    n = node("let")
+    n.set("name", ast_name(expr))
+    n.set("val", rhs)
+    return n
+
+  -- = mutable assign
+  if cur_kind(state) == "op" and cur_val(state) == "="
+    advance(state)
+    rhs := parse_expr(state)
+    skip_nl(state)
+    n = node("assign")
+    n.set("target", expr)
+    n.set("val", rhs)
+    return n
+
+  -- compound assign +=, -=, *=, /=
+  if cur_kind(state) == "op" and is_compound_assign(cur_val(state))
+    op := cur_val(state)
+    advance(state)
+    rhs := parse_expr(state)
+    skip_nl(state)
+    n = node("compound_assign")
+    n.set("target", expr)
+    n.set("op", op)
+    n.set("val", rhs)
+    return n
+
+  -- bare expression statement
+  skip_nl(state)
+  n = node("expr_stmt")
+  n.set("expr", expr)
+  n
+
+fn is_compound_assign(op)
+  ops := ["+=", "-=", "*=", "/="]
+  for o in ops
+    if o == op
+      return true
+  false
+
+fn ast_name(expr)
+  if expr.get("kind") == "ident"
+    return expr.get("name")
+  "?"
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- PROGRAM PARSER
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn parse_program(state)
+  stmts = []
+  skip_ws(state)
+  while cur_kind(state) != "eof"
+    if cur_kind(state) == "nl" or cur_kind(state) == "indent" or cur_kind(state) == "dedent"
+      advance(state)
+      continue
+    s := parse_stmt(state)
+    stmts.push(s)
+    skip_ws(state)
+  stmts
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- AST PRINTER
+-- ══════════════════════════════════════════════════════════════════════════════
+
+fn indent_str(depth)
+  s = ""
+  i = 0
+  while i < depth
+    s = s + "  "
+    i = i + 1
+  s
+
+fn print_expr(expr, depth)
+  ind := indent_str(depth)
+  k   := expr.get("kind")
+
+  if k == "int" or k == "float" or k == "bool"
+    print(ind + k + "(" + expr.get("val") + ")")
+  else if k == "str"
+    print(ind + "str(\"" + expr.get("val") + "\")")
+  else if k == "nil"
+    print(ind + "nil")
+  else if k == "ident"
+    print(ind + "ident(" + expr.get("name") + ")")
+  else if k == "binop"
+    print(ind + "binop(" + expr.get("op") + ")")
+    print_expr(expr.get("left"), depth + 1)
+    print_expr(expr.get("right"), depth + 1)
+  else if k == "unop"
+    print(ind + "unop(" + expr.get("op") + ")")
+    print_expr(expr.get("operand"), depth + 1)
+  else if k == "call"
+    args := expr.get("args")
+    print(ind + "call(" + expr.get("fn") + ", " + str(args.len) + " args)")
+  else if k == "method_call"
+    args := expr.get("args")
+    print(ind + "method_call(." + expr.get("method") + ", " + str(args.len) + " args)")
+    print_expr(expr.get("obj"), depth + 1)
+  else if k == "index"
+    print(ind + "index[]")
+    print_expr(expr.get("obj"), depth + 1)
+    print_expr(expr.get("idx"), depth + 1)
+  else if k == "list"
+    items := expr.get("items")
+    print(ind + "list[" + str(items.len) + "]")
+  else if k == "map"
+    pairs := expr.get("pairs")
+    print(ind + "map{" + str(pairs.len) + "}")
+  else if k == "pipe"
+    print(ind + "pipe |>")
+    print_expr(expr.get("val"), depth + 1)
+    print_expr(expr.get("fn"), depth + 1)
+  else if k == "if_expr"
+    print(ind + "if_expr")
+    print_expr(expr.get("cond"), depth + 1)
+    print_expr(expr.get("then"), depth + 1)
+  else
+    print(ind + "expr(" + k + ")")
+
+fn print_stmt(stmt, depth)
+  ind := indent_str(depth)
+  k   := stmt.get("kind")
+
+  if k == "fn_def"
+    params := stmt.get("params")
+    print(ind + "fn " + stmt.get("name") + "(" + str(params.len) + " params)")
+    print_stmt(stmt.get("body"), depth + 1)
+
+  else if k == "block"
+    stmts := stmt.get("stmts")
+    i = 0
+    while i < stmts.len
+      print_stmt(stmts[i], depth)
+      i = i + 1
+
+  else if k == "return"
+    print(ind + "return")
+    print_expr(stmt.get("val"), depth + 1)
+
+  else if k == "let"
+    print(ind + ":= " + stmt.get("name"))
+    print_expr(stmt.get("val"), depth + 1)
+
+  else if k == "assign"
+    print(ind + "= (assign)")
+    print_expr(stmt.get("val"), depth + 1)
+
+  else if k == "compound_assign"
+    print(ind + stmt.get("op"))
+    print_expr(stmt.get("val"), depth + 1)
+
+  else if k == "if"
+    print(ind + "if")
+    print_expr(stmt.get("cond"), depth + 1)
+    print(ind + "  then:")
+    print_stmt(stmt.get("then"), depth + 2)
+
+  else if k == "for"
+    print(ind + "for " + stmt.get("var") + " in ...")
+    print_stmt(stmt.get("body"), depth + 1)
+
+  else if k == "while"
+    print(ind + "while ...")
+    print_stmt(stmt.get("body"), depth + 1)
+
+  else if k == "match"
+    arms := stmt.get("arms")
+    print(ind + "match (" + str(arms.len) + " arms)")
+
+  else if k == "expr_stmt"
+    print(ind + "expr_stmt:")
+    print_expr(stmt.get("expr"), depth + 1)
+
+  else if k == "comptime"
+    print(ind + "comptime " + stmt.get("name"))
+
+  else if k == "break"
+    print(ind + "break")
+
+  else if k == "continue"
+    print(ind + "continue")
+
+  else
+    print(ind + "stmt(" + k + ")")
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ENTRY POINT
+-- ══════════════════════════════════════════════════════════════════════════════
+
+argv := args()
+if argv.len < 2
+  print("Usage: parser <file.nvl>")
+else
+  path := argv[1]
+  src  := read_file(path)
+  if src == nil
+    print("Error: cannot read " + path)
+  else
+    tokens := lex(src)
+    state  := make_state(tokens)
+    stmts  := parse_program(state)
+    print("=== AST: " + path + " (" + str(stmts.len) + " top-level stmts) ===")
+    i = 0
+    while i < stmts.len
+      print_stmt(stmts[i], 0)
+      i = i + 1
+    print("=== END ===")

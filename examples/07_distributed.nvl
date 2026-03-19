@@ -1,0 +1,187 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 07_distributed.nvl — Distributed computing at planet scale
+-- Same code runs on 1 machine or 10,000 — compiler handles the rest
+-- ─────────────────────────────────────────────────────────────────────────────
+
+import cluster.{Cluster, Node, Partition}
+import data.{Parquet, Stream}
+import math.{log2, sqrt}
+
+-- ─── Word count (MapReduce in 8 lines) ────────────────────────────────────────
+
+@io
+fn word_count(cluster: Cluster, input_path: str) -> Map(str, i64)
+  cluster.read_text(input_path)         -- reads from distributed filesystem
+    |> flat_map(line => line.split(" "))
+    |> map(word => (word.to_lower(), 1))
+    |> group_by_key                      -- shuffles across nodes
+    |> map((word, counts) => (word, counts |> sum))
+    |> collect_to_map()
+
+-- ─── PageRank ─────────────────────────────────────────────────────────────────
+
+@io
+fn page_rank(cluster: Cluster, edges_path: str, iterations: i32 = 20) -> Map(str, f64)
+  -- Load graph edges (distributed across nodes)
+  edges := cluster.read_parquet(edges_path) as Stream({ from: str, to: str })
+
+  -- Build adjacency lists
+  out_links := edges
+    |> group_by(.from)
+    |> map((node, es) => (node, es |> map(.to) |> collect()))
+
+  -- Initialize ranks
+  node_count := out_links.len().to_f64()
+  ranks = out_links |> map((node, _) => (node, 1.0 / node_count)) |> collect_to_map()
+
+  -- Iterate
+  for _ in 0..iterations
+    -- Compute contributions (parallel across all nodes)
+    contributions := out_links
+      |> par_flat_map((node, links) =>
+        rank := ranks[node] ?? 0.0
+        links |> map(target => (target, rank / links.len.to_f64()))
+      )
+
+    -- Aggregate (shuffle + reduce)
+    ranks = contributions
+      |> group_by_key
+      |> map((node, contribs) => (node, 0.15 / node_count + 0.85 * (contribs |> sum)))
+      |> collect_to_map()
+
+  ranks |> sort_by_value(desc: true)
+
+-- ─── Distributed K-Means ──────────────────────────────────────────────────────
+
+type Point = [f64]    -- variable-dimension point
+
+@io
+fn kmeans(cluster: Cluster, data_path: str, k: i32, max_iters: i32 = 100) -> [Point]
+  data := cluster.read_parquet(data_path) as Stream(Point)
+
+  -- Random initial centroids (sample from data)
+  centroids = data |> sample(k) |> collect()
+
+  for iteration in 0..max_iters
+    -- Assignment step: each point → nearest centroid (parallel across all nodes)
+    assignments := data
+      |> par_map(point =>
+        nearest := centroids
+          |> enumerate()
+          |> min_by((i, c) => euclidean_distance(point, c))
+        (nearest.0, point)   -- (centroid_index, point)
+      )
+
+    -- Update step: recompute centroid positions (shuffle + aggregate)
+    new_centroids := assignments
+      |> group_by_key                    -- group by centroid index
+      |> par_map((_, points) =>
+        -- Mean of all points in this cluster
+        n := points.len.to_f64()
+        points |> fold(Point.zeros(points[0].len), |a, p| a + p) |> map(_ / n)
+      )
+      |> sort_by_key                     -- ensure consistent ordering
+      |> map((_, c) => c)
+      |> collect()
+
+    -- Check convergence
+    delta := centroids |> zip(new_centroids)
+      |> map((old, new) => euclidean_distance(old, new))
+      |> max ?? 0.0
+
+    centroids = new_centroids
+    print("Iteration {iteration}: max centroid shift = {delta:.6f}")
+    if delta < 1e-6 => break
+
+  centroids
+
+fn euclidean_distance(a: Point, b: Point) -> f64
+  a |> zip(b) |> map((x, y) => (x - y)**2) |> sum |> sqrt
+
+-- ─── Distributed neural network training ──────────────────────────────────────
+
+@io
+fn distributed_train(cluster: Cluster, model_config: str, data_path: str)
+  -- Data parallelism: each node trains on a shard of data
+  -- Gradients are averaged across nodes (AllReduce)
+
+  model := Model.load_config(model_config)
+  data  := cluster.partition_parquet(data_path, shards: cluster.node_count())
+
+  for epoch in 0..100
+    -- Each node trains on its shard (in parallel across the cluster)
+    local_gradients := cluster.each_node(fn(node_data: Partition) =>
+      local_model := model.clone()
+      optimizer   := Adam(lr: 1e-4)
+      for batch in node_data.batch(size: 256)
+        loss := local_model.forward(batch.x) |> cross_entropy(batch.y)
+        grads := loss.backward()
+        optimizer.step(local_model.params(), grads)
+      local_model.gradients()
+    )
+
+    -- AllReduce: average gradients across all nodes (ring-allreduce algorithm)
+    avg_gradients := cluster.all_reduce(local_gradients, op: mean)
+
+    -- Apply averaged gradients to master model
+    model.apply_gradients(avg_gradients)
+
+    -- Evaluate on held-out set (only on rank-0 node)
+    if cluster.is_coordinator()
+      accuracy := evaluate(model, val_data)
+      print("Epoch {epoch}: accuracy = {accuracy:.4f}")
+      if accuracy > best
+        model.save("checkpoints/distributed_best.nvmodel")
+
+-- ─── Real-time streaming analytics ───────────────────────────────────────────
+
+@io
+fn streaming_analytics(cluster: Cluster)
+  -- Consume from Kafka, process in real-time, write to ClickHouse
+  kafka  := cluster.kafka("kafka:9092", topics: ["events"])
+  output := cluster.clickhouse("clickhouse:9000", table: "metrics")
+
+  kafka.stream()
+    |> map(msg => JSON.parse(msg.value) as Event)
+    |> filter(.event_type != "internal")
+
+    -- 1-minute tumbling window
+    |> window(tumbling: 1.min)
+    |> group_by(.country)
+    |> map((country, events) => {
+      country,
+      window_start:  events[0].timestamp.floor(1.min),
+      event_count:   events.len.to_i64(),
+      unique_users:  events |> map(.user_id) |> dedupe |> count,
+      revenue:       events |> filter(.event_type == "purchase") |> sum(.amount),
+    })
+
+    -- Write results with exactly-once semantics
+    |> output.write(on_duplicate: "update", batch_size: 1000)
+
+-- ─── Entry point ──────────────────────────────────────────────────────────────
+
+fn main()
+  cluster := Cluster.connect(env("CLUSTER_URL", default: "local://"))
+  print("Connected to cluster: {cluster.node_count()} nodes")
+
+  match env("JOB", default: "wordcount")
+    "wordcount"   =>
+      result := word_count(cluster, env("INPUT"))
+      result |> take(20) |> for_each((w, c) => print("{c:10} {w}"))
+
+    "pagerank"    =>
+      result := page_rank(cluster, env("INPUT"))
+      result |> take(10) |> for_each((node, rank) => print("{rank:.6f}  {node}"))
+
+    "kmeans"      =>
+      centroids := kmeans(cluster, env("INPUT"), k: env("K", "8").parse_i32())
+      centroids |> for_each(c => print("centroid: {c}"))
+
+    "train"       =>
+      distributed_train(cluster, env("MODEL_CONFIG"), env("DATA"))
+
+    "stream"      =>
+      streaming_analytics(cluster)
+
+    job => panic("Unknown job: {job}")

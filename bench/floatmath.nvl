@@ -1,0 +1,12 @@
+-- Benchmark 10: Heavy floating-point math — 2M iterations
+-- Tests: transcendental function throughput (sin, cos, sqrt, exp, log)
+
+n := 2000000
+sum := 0.0
+i := 0
+while i < n
+  x := float(i) * 0.000001
+  sum = sum + sin(x) * cos(x) + sqrt(x + 1.0) + log(x + 1.0)
+  i = i + 1
+
+print("floatmath 2M iters, sum=" + str(sum))

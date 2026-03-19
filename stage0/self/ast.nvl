@@ -1,0 +1,232 @@
+-- ast.nvl — AST node constructors for the Nuvola self-hosted compiler
+-- Every node is a map with at minimum a "kind" field.
+-- Constructor names mirror the node kinds used by the parser and codegen.
+
+-- ── Statement nodes ───────────────────────────────────────────────────────────
+
+fn ast_let(name, type_ann, mutable, value)
+  n = {}
+  n.set("kind",     "let")
+  n.set("name",     name)
+  n.set("type_ann", type_ann)
+  n.set("mutable",  mutable)
+  n.set("val",      value)
+  n
+
+fn ast_assign(target, value)
+  n = {}
+  n.set("kind",   "assign")
+  n.set("target", target)
+  n.set("val",    value)
+  n
+
+fn ast_fn(name, params, ret_type, body, is_async)
+  n = {}
+  n.set("kind",     "fn_def")
+  n.set("name",     name)
+  n.set("params",   params)
+  n.set("ret_type", ret_type)
+  n.set("body",     body)
+  n.set("async",    is_async)
+  n
+
+fn ast_if(cond, then_body, elif_clauses, else_body)
+  n = {}
+  n.set("kind",  "if")
+  n.set("cond",  cond)
+  n.set("then",  then_body)
+  n.set("elifs", elif_clauses)
+  n.set("else",  else_body)
+  n
+
+fn ast_for(var, iter, body)
+  n = {}
+  n.set("kind", "for")
+  n.set("var",  var)
+  n.set("iter", iter)
+  n.set("body", body)
+  n
+
+fn ast_while(cond, body)
+  n = {}
+  n.set("kind", "while")
+  n.set("cond", cond)
+  n.set("body", body)
+  n
+
+fn ast_match(expr, arms)
+  n = {}
+  n.set("kind",    "match")
+  n.set("subject", expr)
+  n.set("arms",    arms)
+  n
+
+fn ast_return(value)
+  n = {}
+  n.set("kind", "return")
+  n.set("val",  value)
+  n
+
+fn ast_break(value)
+  n = {}
+  n.set("kind", "break")
+  n.set("val",  value)
+  n
+
+fn ast_type_decl(name, kind, fields)
+  n = {}
+  n.set("kind",   "type_decl")
+  n.set("name",   name)
+  n.set("flavor", kind)
+  n.set("fields", fields)
+  n
+
+fn ast_import(path, names, alias)
+  n = {}
+  n.set("kind",  "import")
+  n.set("path",  path)
+  n.set("names", names)
+  n.set("alias", alias)
+  n
+
+fn ast_expr_stmt(expr)
+  n = {}
+  n.set("kind", "expr_stmt")
+  n.set("expr", expr)
+  n
+
+-- ── Literal nodes ─────────────────────────────────────────────────────────────
+
+fn ast_int(v)
+  n = {}
+  n.set("kind", "int")
+  n.set("val",  v)
+  n
+
+fn ast_float(f)
+  n = {}
+  n.set("kind", "float")
+  n.set("val",  f)
+  n
+
+fn ast_str(s)
+  n = {}
+  n.set("kind", "str")
+  n.set("val",  s)
+  n
+
+fn ast_bool(b)
+  n = {}
+  n.set("kind", "bool")
+  n.set("val",  b)
+  n
+
+fn ast_nil()
+  n = {}
+  n.set("kind", "nil")
+  n
+
+fn ast_ident(name)
+  n = {}
+  n.set("kind", "ident")
+  n.set("name", name)
+  n
+
+-- ── Expression nodes ──────────────────────────────────────────────────────────
+
+fn ast_binop(op, lhs, rhs)
+  n = {}
+  n.set("kind",  "binop")
+  n.set("op",    op)
+  n.set("left",  lhs)
+  n.set("right", rhs)
+  n
+
+fn ast_unop(op, expr)
+  n = {}
+  n.set("kind",    "unop")
+  n.set("op",      op)
+  n.set("operand", expr)
+  n
+
+fn ast_call(callee, a_args, kwargs)
+  n = {}
+  n.set("kind",   "call")
+  n.set("fn",     callee)
+  n.set("args",   a_args)
+  n.set("kwargs", kwargs)
+  n
+
+fn ast_method_call(obj, method, a_args, kwargs)
+  n = {}
+  n.set("kind",   "method_call")
+  n.set("obj",    obj)
+  n.set("method", method)
+  n.set("args",   a_args)
+  n.set("kwargs", kwargs)
+  n
+
+fn ast_index(obj, idx)
+  n = {}
+  n.set("kind", "index")
+  n.set("obj",  obj)
+  n.set("idx",  idx)
+  n
+
+fn ast_field(obj, field)
+  n = {}
+  n.set("kind",  "field")
+  n.set("obj",   obj)
+  n.set("field", field)
+  n
+
+fn ast_pipe(lhs, rhs)
+  n = {}
+  n.set("kind", "pipe")
+  n.set("val",  lhs)
+  n.set("fn",   rhs)
+  n
+
+fn ast_range(start, end_, inclusive)
+  n = {}
+  n.set("kind",      "range")
+  n.set("start",     start)
+  n.set("end",       end_)
+  n.set("inclusive", inclusive)
+  n
+
+fn ast_list(items)
+  n = {}
+  n.set("kind",  "list")
+  n.set("items", items)
+  n
+
+fn ast_map_lit(pairs)
+  n = {}
+  n.set("kind",  "map")
+  n.set("pairs", pairs)
+  n
+
+fn ast_struct_lit(name, fields)
+  n = {}
+  n.set("kind",   "struct_lit")
+  n.set("name",   name)
+  n.set("fields", fields)
+  n
+
+fn ast_lambda(params, body)
+  n = {}
+  n.set("kind",   "lambda")
+  n.set("params", params)
+  n.set("body",   body)
+  n
+
+-- ── Pattern / arm helpers ─────────────────────────────────────────────────────
+
+fn ast_match_arm(pattern, guard, body)
+  n = {}
+  n.set("kind",  "arm")
+  n.set("pat",   pattern)
+  n.set("guard", guard)
+  n.set("body",  body)
+  n

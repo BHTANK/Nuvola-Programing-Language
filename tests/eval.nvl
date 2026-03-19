@@ -1,0 +1,803 @@
+-- eval.nvl — Nuvola tree-walking interpreter (replaces nuvola_eval.py)
+--
+-- Interprets Nuvola source directly without compiling to C or LLVM IR.
+-- Uses the self-hosted lexer + parser from stage0/self/ to produce an AST,
+-- then walks the AST in an environment (map of name→value).
+--
+-- Supported:
+--   := / = bindings, primitives (int, float, str, bool, nil)
+--   Arithmetic, comparison, logical, string-concat operators
+--   fn declarations and first-class fn values, closures, recursion
+--   if / elif / else, while, for-in
+--   match with literal / wildcard / binding arms
+--   Pipeline operator |>
+--   List [] and map {} literals, indexing, field access
+--   .push(), .pop(), .len(), .keys(), .has(), .get(), .set()
+--   Builtins: print, str, int, float, bool, len, sqrt, abs, floor, ceil,
+--             range, push, pop, keys, values, type_of, exit
+--   return (early-exit via tagged value)
+--   import (loads and evaluates another .nvl file)
+
+import stage0.self.lexer
+import stage0.self.parser
+import stage0.self.ast
+
+-- ── Return signal ──────────────────────────────────────────────────────────────
+
+-- We wrap early returns in a map so we can propagate them up the call stack.
+fn make_return(val)
+  r := {}
+  r.set("__return__", true)
+  r.set("val", val)
+  r
+
+fn is_return(v)
+  v != nil and v.is_map() and v.has("__return__") and v.get("__return__") == true
+
+-- ── Environment ───────────────────────────────────────────────────────────────
+
+fn env_new(parent)
+  e := {}
+  e.set("__parent__", parent)
+  e.set("__vars__", {})
+  e
+
+fn env_set(e, name, val)
+  vars := e.get("__vars__")
+  vars.set(name, val)
+  e.set("__vars__", vars)
+
+fn env_has_local(e, name)
+  e.get("__vars__").has(name)
+
+fn env_get(e, name)
+  if e.get("__vars__").has(name)
+    return e.get("__vars__").get(name)
+  parent := e.get("__parent__")
+  if parent != nil
+    return env_get(parent, name)
+  nil
+
+fn env_assign(e, name, val)
+  -- Assign to existing binding (walk up scope chain).
+  if e.get("__vars__").has(name)
+    vars := e.get("__vars__")
+    vars.set(name, val)
+    e.set("__vars__", vars)
+    return true
+  parent := e.get("__parent__")
+  if parent != nil
+    return env_assign(parent, name, val)
+  false
+
+-- ── Builtins ─────────────────────────────────────────────────────────────────
+
+fn make_global_env()
+  g := env_new(nil)
+
+  -- print
+  env_set(g, "print", fn(args, _env)
+    if args.len() > 0
+      print(str_of(args[0]))
+    nil
+  )
+
+  -- str
+  env_set(g, "str", fn(args, _env)
+    if args.len() > 0 => return str_of(args[0])
+    ""
+  )
+
+  -- int
+  env_set(g, "int", fn(args, _env)
+    if args.len() > 0 => return int(args[0])
+    0
+  )
+
+  -- float
+  env_set(g, "float", fn(args, _env)
+    if args.len() > 0 => return float(args[0])
+    0.0
+  )
+
+  -- bool
+  env_set(g, "bool", fn(args, _env)
+    if args.len() > 0
+      v := args[0]
+      if v == nil or v == false or v == 0 or v == "" => return false
+      return true
+    false
+  )
+
+  -- len
+  env_set(g, "len", fn(args, _env)
+    if args.len() > 0
+      v := args[0]
+      if v.is_list() => return v.len()
+      if v.is_str()  => return v.len()
+      if v.is_map()  => return v.keys().len()
+    0
+  )
+
+  -- sqrt
+  env_set(g, "sqrt",  fn(args, _env) sqrt(float(args[0])))
+  env_set(g, "abs",   fn(args, _env)
+    v := args[0]
+    if v < 0 => return -v
+    v
+  )
+  env_set(g, "floor", fn(args, _env) floor(float(args[0])))
+  env_set(g, "ceil",  fn(args, _env) ceil(float(args[0])))
+  env_set(g, "round", fn(args, _env) floor(float(args[0]) + 0.5))
+  env_set(g, "pow",   fn(args, _env)
+    b := args[0]
+    e := int(args[1])
+    result := 1
+    i := 0
+    while i < e
+      result = result * b
+      i = i + 1
+    result
+  )
+
+  -- range
+  env_set(g, "range", fn(args, _env)
+    start := 0
+    end2  := 0
+    step  := 1
+    if args.len() == 1
+      end2 = int(args[0])
+    elif args.len() == 2
+      start = int(args[0])
+      end2  = int(args[1])
+    elif args.len() >= 3
+      start = int(args[0])
+      end2  = int(args[1])
+      step  = int(args[2])
+    out := []
+    i   := start
+    while i < end2
+      out.push(i)
+      i = i + step
+    out
+  )
+
+  -- type_of
+  env_set(g, "type_of", fn(args, _env)
+    v := args[0]
+    if v == nil        => return "nil"
+    if v == true or v == false => return "bool"
+    if v.is_str()      => return "str"
+    if v.is_list()     => return "list"
+    if v.is_map()      => return "map"
+    if v.is_fn()       => return "fn"
+    "num"
+  )
+
+  -- exit
+  env_set(g, "exit", fn(args, _env)
+    code := 0
+    if args.len() > 0 => code = int(args[0])
+    nv_shell("exit " + str(code))
+    nil
+  )
+
+  -- min / max / sum
+  env_set(g, "min", fn(args, _env)
+    if args.len() == 1 and args[0].is_list()
+      lst := args[0]
+      if lst.len() == 0 => return nil
+      m := lst[0]
+      i := 1
+      while i < lst.len()
+        if lst[i] < m => m = lst[i]
+        i = i + 1
+      return m
+    if args.len() == 2
+      if args[0] < args[1] => return args[0]
+      return args[1]
+    nil
+  )
+  env_set(g, "max", fn(args, _env)
+    if args.len() == 1 and args[0].is_list()
+      lst := args[0]
+      if lst.len() == 0 => return nil
+      m := lst[0]
+      i := 1
+      while i < lst.len()
+        if lst[i] > m => m = lst[i]
+        i = i + 1
+      return m
+    if args.len() == 2
+      if args[0] > args[1] => return args[0]
+      return args[1]
+    nil
+  )
+  env_set(g, "sum", fn(args, _env)
+    lst := args[0]
+    acc := 0
+    i   := 0
+    while i < lst.len()
+      acc = acc + lst[i]
+      i = i + 1
+    acc
+  )
+
+  -- map / filter / reduce / zip / enumerate / sorted / reversed / flatten
+  env_set(g, "map", fn(args, _env)
+    lst := args[0]
+    f   := args[1]
+    out := []
+    i   := 0
+    while i < lst.len()
+      out.push(nv_call(f, [lst[i]], _env))
+      i = i + 1
+    out
+  )
+  env_set(g, "filter", fn(args, _env)
+    lst := args[0]
+    f   := args[1]
+    out := []
+    i   := 0
+    while i < lst.len()
+      if nv_call(f, [lst[i]], _env)
+        out.push(lst[i])
+      i = i + 1
+    out
+  )
+  env_set(g, "reduce", fn(args, _env)
+    lst  := args[0]
+    f    := args[1]
+    init := args[2]
+    acc  := init
+    i    := 0
+    while i < lst.len()
+      acc = nv_call(f, [acc, lst[i]], _env)
+      i   = i + 1
+    acc
+  )
+  env_set(g, "zip", fn(args, _env)
+    a := args[0]
+    b := args[1]
+    out := []
+    lim := a.len()
+    if b.len() < lim => lim = b.len()
+    i := 0
+    while i < lim
+      out.push([a[i], b[i]])
+      i = i + 1
+    out
+  )
+  env_set(g, "enumerate", fn(args, _env)
+    lst := args[0]
+    out := []
+    i   := 0
+    while i < lst.len()
+      out.push([i, lst[i]])
+      i = i + 1
+    out
+  )
+  env_set(g, "sorted", fn(args, _env)
+    lst := args[0]
+    out := []
+    i   := 0
+    while i < lst.len()
+      out.push(lst[i])
+      i = i + 1
+    -- simple insertion sort
+    i = 1
+    while i < out.len()
+      key := out[i]
+      j   := i - 1
+      while j >= 0 and out[j] > key
+        out[j + 1] = out[j]
+        j = j - 1
+      out[j + 1] = key
+      i = i + 1
+    out
+  )
+  env_set(g, "reversed", fn(args, _env)
+    lst := args[0]
+    out := []
+    i   := lst.len() - 1
+    while i >= 0
+      out.push(lst[i])
+      i = i - 1
+    out
+  )
+  env_set(g, "flatten", fn(args, _env)
+    lst := args[0]
+    out := []
+    i   := 0
+    while i < lst.len()
+      sub := lst[i]
+      if sub.is_list()
+        j := 0
+        while j < sub.len()
+          out.push(sub[j])
+          j = j + 1
+      else
+        out.push(sub)
+      i = i + 1
+    out
+  )
+  env_set(g, "contains", fn(args, _env)
+    col := args[0]
+    val := args[1]
+    if col.is_list()
+      i := 0
+      while i < col.len()
+        if col[i] == val => return true
+        i = i + 1
+      return false
+    if col.is_str()
+      return col.contains(val)
+    if col.is_map()
+      return col.has(str(val))
+    false
+  )
+  env_set(g, "any", fn(args, _env)
+    lst := args[0]
+    f   := args[1]
+    i   := 0
+    while i < lst.len()
+      if nv_call(f, [lst[i]], _env) => return true
+      i = i + 1
+    false
+  )
+  env_set(g, "all", fn(args, _env)
+    lst := args[0]
+    f   := args[1]
+    i   := 0
+    while i < lst.len()
+      if not nv_call(f, [lst[i]], _env) => return false
+      i = i + 1
+    true
+  )
+  env_set(g, "take", fn(args, _env)
+    lst := args[0]
+    n   := int(args[1])
+    out := []
+    i   := 0
+    while i < n and i < lst.len()
+      out.push(lst[i])
+      i = i + 1
+    out
+  )
+  env_set(g, "drop", fn(args, _env)
+    lst := args[0]
+    n   := int(args[1])
+    out := []
+    i   := n
+    while i < lst.len()
+      out.push(lst[i])
+      i = i + 1
+    out
+  )
+  env_set(g, "join", fn(args, _env)
+    lst := args[0]
+    sep := ""
+    if args.len() > 1 => sep = str(args[1])
+    if lst.len() == 0 => return ""
+    out := str_of(lst[0])
+    i   := 1
+    while i < lst.len()
+      out = out + sep + str_of(lst[i])
+      i = i + 1
+    out
+  )
+  env_set(g, "split", fn(args, _env)
+    s   := str(args[0])
+    sep := " "
+    if args.len() > 1 => sep = str(args[1])
+    s.split(sep)
+  )
+
+  g
+
+-- ── Value to string ───────────────────────────────────────────────────────────
+
+fn str_of(v)
+  if v == nil    => return "nil"
+  if v == true   => return "true"
+  if v == false  => return "false"
+  if v.is_str()  => return v
+  if v.is_list()
+    parts := []
+    i     := 0
+    while i < v.len()
+      parts.push(str_of(v[i]))
+      i = i + 1
+    return "[" + parts.join(", ") + "]"
+  if v.is_map()
+    ks    := v.keys()
+    parts := []
+    i     := 0
+    while i < ks.len()
+      k := ks[i]
+      parts.push(k + ": " + str_of(v.get(k)))
+      i = i + 1
+    return "{" + parts.join(", ") + "}"
+  if v.is_fn()  => return "<fn>"
+  str(v)
+
+-- ── Call a Nuvola function value ──────────────────────────────────────────────
+
+fn nv_call(fn_val, args, caller_env)
+  if fn_val.is_fn()
+    -- Native (builtin) fn: fn(args, env)
+    return fn_val(args, caller_env)
+  if fn_val.is_map() and fn_val.has("__fn__")
+    -- User-defined closure: {__fn__: true, params, body, env}
+    params   := fn_val.get("params")
+    body     := fn_val.get("body")
+    clos_env := fn_val.get("env")
+    local    := env_new(clos_env)
+    -- bind params to args
+    i := 0
+    while i < params.len()
+      pname := params[i]
+      aval  := nil
+      if i < args.len() => aval = args[i]
+      env_set(local, pname, aval)
+      i = i + 1
+    result := eval_block(body, local)
+    if is_return(result) => return result.get("val")
+    return result
+  nil
+
+-- ── Expression evaluator ──────────────────────────────────────────────────────
+
+fn eval_expr(node, env)
+  kind := node.get("kind")
+
+  if kind == "int_lit"   => return node.get("val")
+  if kind == "float_lit" => return node.get("val")
+  if kind == "bool_lit"  => return node.get("val")
+  if kind == "str_lit"   => return node.get("val")
+  if kind == "nil_lit"   => return nil
+
+  if kind == "ident"
+    name := node.get("name")
+    val  := env_get(env, name)
+    if val == nil and not env_has_local(env, name)
+      -- Not found: return nil silently (may be a function def loaded later)
+    return val
+
+  if kind == "list_lit"
+    out   := []
+    elems := node.get("elems")
+    i     := 0
+    while i < elems.len()
+      out.push(eval_expr(elems[i], env))
+      i = i + 1
+    return out
+
+  if kind == "map_lit"
+    out   := {}
+    pairs := node.get("pairs")
+    i     := 0
+    while i < pairs.len()
+      k := pairs[i][0]
+      v := eval_expr(pairs[i][1], env)
+      out.set(k, v)
+      i = i + 1
+    return out
+
+  if kind == "fn_lit"
+    -- Anonymous function literal
+    closure := {}
+    closure.set("__fn__", true)
+    closure.set("params", node.get("params"))
+    closure.set("body",   node.get("body"))
+    closure.set("env",    env)
+    return closure
+
+  if kind == "binop"
+    op := node.get("op")
+    -- Short-circuit logical
+    if op == "and"
+      lv := eval_expr(node.get("left"), env)
+      if not lv => return false
+      return eval_expr(node.get("right"), env)
+    if op == "or"
+      lv := eval_expr(node.get("left"), env)
+      if lv => return lv
+      return eval_expr(node.get("right"), env)
+    lv := eval_expr(node.get("left"),  env)
+    rv := eval_expr(node.get("right"), env)
+    if op == "+"   => return lv + rv
+    if op == "-"   => return lv - rv
+    if op == "*"   => return lv * rv
+    if op == "/"   => return lv / rv
+    if op == "%"   => return lv % rv
+    if op == "**"  => return lv ** rv
+    if op == "=="  => return lv == rv
+    if op == "!="  => return lv != rv
+    if op == "<"   => return lv < rv
+    if op == "<="  => return lv <= rv
+    if op == ">"   => return lv > rv
+    if op == ">="  => return lv >= rv
+    if op == "++"  => return str_of(lv) + str_of(rv)
+    return nil
+
+  if kind == "unary"
+    op := node.get("op")
+    v  := eval_expr(node.get("operand"), env)
+    if op == "-"   => return -v
+    if op == "not" => return not v
+    return v
+
+  if kind == "call"
+    fn_expr := node.get("fn")
+    arg_nodes := node.get("args")
+    args := []
+    i    := 0
+    while i < arg_nodes.len()
+      args.push(eval_expr(arg_nodes[i], env))
+      i = i + 1
+    fn_val := eval_expr(fn_expr, env)
+    if fn_val == nil
+      print("Error: calling nil as function: " + str_of(fn_expr))
+      return nil
+    return nv_call(fn_val, args, env)
+
+  if kind == "index"
+    obj := eval_expr(node.get("obj"), env)
+    idx := eval_expr(node.get("idx"), env)
+    if obj.is_list()
+      i := int(idx)
+      if i < 0 => i = obj.len() + i
+      return obj[i]
+    if obj.is_map()
+      return obj.get(str(idx))
+    if obj.is_str()
+      i := int(idx)
+      if i < 0 => i = obj.len() + i
+      return obj[i]
+    return nil
+
+  if kind == "field"
+    obj   := eval_expr(node.get("obj"), env)
+    field := node.get("field")
+    -- Method dispatch
+    if field == "len"
+      if obj.is_list() => return obj.len()
+      if obj.is_str()  => return obj.len()
+      if obj.is_map()  => return obj.keys().len()
+    if field == "push"
+      return fn(args, _env)
+        obj.push(args[0])
+        nil
+    if field == "pop"
+      return fn(args, _env)
+        obj.pop()
+    if field == "keys"   => return obj.keys()
+    if field == "values" => return obj.values()
+    if field == "has"
+      return fn(args, _env) obj.has(str(args[0]))
+    if field == "get"
+      return fn(args, _env) obj.get(str(args[0]))
+    if field == "set"
+      return fn(args, _env)
+        obj.set(str(args[0]), args[1])
+        nil
+    if obj.is_map()
+      return obj.get(field)
+    return nil
+
+  if kind == "pipe"
+    lv     := eval_expr(node.get("left"), env)
+    fn_val := eval_expr(node.get("right"), env)
+    return nv_call(fn_val, [lv], env)
+
+  if kind == "if_expr"
+    cond := eval_expr(node.get("cond"), env)
+    if cond
+      return eval_expr(node.get("then"), env)
+    elif node.has("else") and node.get("else") != nil
+      return eval_expr(node.get("else"), env)
+    return nil
+
+  nil
+
+-- ── Statement evaluator ───────────────────────────────────────────────────────
+
+fn eval_stmt(node, env)
+  kind := node.get("kind")
+
+  if kind == "let" or kind == "var"
+    val := eval_expr(node.get("val"), env)
+    env_set(env, node.get("name"), val)
+    return nil
+
+  if kind == "assign"
+    val := eval_expr(node.get("val"), env)
+    -- Try to update existing binding up scope chain
+    if not env_assign(env, node.get("name"), val)
+      -- New implicit var
+      env_set(env, node.get("name"), val)
+    return nil
+
+  if kind == "index_assign"
+    obj := eval_expr(node.get("obj"), env)
+    idx := eval_expr(node.get("idx"), env)
+    val := eval_expr(node.get("val"), env)
+    if obj.is_list()
+      i := int(idx)
+      if i < 0 => i = obj.len() + i
+      obj[i] = val
+    elif obj.is_map()
+      obj.set(str(idx), val)
+    return nil
+
+  if kind == "field_assign"
+    obj   := eval_expr(node.get("obj"), env)
+    field := node.get("field")
+    val   := eval_expr(node.get("val"), env)
+    if obj.is_map()
+      obj.set(field, val)
+    return nil
+
+  if kind == "return"
+    if node.has("val") and node.get("val") != nil
+      val := eval_expr(node.get("val"), env)
+      return make_return(val)
+    return make_return(nil)
+
+  if kind == "expr_stmt"
+    result := eval_expr(node.get("expr"), env)
+    if is_return(result) => return result
+    return nil
+
+  if kind == "if"
+    cond := eval_expr(node.get("cond"), env)
+    if cond
+      result := eval_block(node.get("then"), env)
+      if is_return(result) => return result
+    else
+      elifs := node.get("elifs")
+      handled := false
+      if elifs != nil
+        i := 0
+        while i < elifs.len() and not handled
+          elif_node := elifs[i]
+          elif_cond := eval_expr(elif_node.get("cond"), env)
+          if elif_cond
+            result := eval_block(elif_node.get("body"), env)
+            if is_return(result) => return result
+            handled = true
+          i = i + 1
+      if not handled and node.has("else") and node.get("else") != nil
+        result := eval_block(node.get("else"), env)
+        if is_return(result) => return result
+    return nil
+
+  if kind == "while"
+    while eval_expr(node.get("cond"), env)
+      result := eval_block(node.get("body"), env)
+      if is_return(result) => return result
+    return nil
+
+  if kind == "for"
+    iter_val := eval_expr(node.get("iter"), env)
+    item_name := node.get("item")
+    items := []
+    if iter_val.is_list()
+      items = iter_val
+    elif iter_val.is_str()
+      i := 0
+      while i < iter_val.len()
+        items.push(iter_val[i])
+        i = i + 1
+    elif iter_val.is_map()
+      items = iter_val.keys()
+    i := 0
+    while i < items.len()
+      local := env_new(env)
+      env_set(local, item_name, items[i])
+      result := eval_block(node.get("body"), local)
+      if is_return(result) => return result
+      i = i + 1
+    return nil
+
+  if kind == "match"
+    val  := eval_expr(node.get("val"), env)
+    arms := node.get("arms")
+    i    := 0
+    while i < arms.len()
+      arm   := arms[i]
+      pat   := arm.get("pat")
+      bound := {}
+      if match_pat(pat, val, bound)
+        local := env_new(env)
+        ks    := bound.keys()
+        j     := 0
+        while j < ks.len()
+          env_set(local, ks[j], bound.get(ks[j]))
+          j = j + 1
+        result := eval_block(arm.get("body"), local)
+        if is_return(result) => return result
+        return nil
+      i = i + 1
+    return nil
+
+  if kind == "fn_def"
+    params := []
+    plist  := node.get("params")
+    i      := 0
+    while i < plist.len()
+      params.push(plist[i].get("name"))
+      i = i + 1
+    closure := {}
+    closure.set("__fn__", true)
+    closure.set("params", params)
+    closure.set("body",   node.get("body"))
+    closure.set("env",    env)
+    env_set(env, node.get("name"), closure)
+    return nil
+
+  if kind == "import"
+    path := node.get("path")
+    eval_file(path, env)
+    return nil
+
+  nil
+
+fn match_pat(pat, val, bound)
+  pk := pat.get("kind")
+  if pk == "wildcard"  => return true
+  if pk == "nil_lit"   => return val == nil
+  if pk == "bool_lit"  => return val == pat.get("val")
+  if pk == "int_lit"   => return val == pat.get("val")
+  if pk == "float_lit" => return val == pat.get("val")
+  if pk == "str_lit"   => return val == pat.get("val")
+  if pk == "ident"
+    bound.set(pat.get("name"), val)
+    return true
+  if pk == "range"
+    lo := pat.get("lo")
+    hi := pat.get("hi")
+    return val >= lo and val <= hi
+  if pk == "or"
+    pats := pat.get("pats")
+    i    := 0
+    while i < pats.len()
+      if match_pat(pats[i], val, bound) => return true
+      i = i + 1
+    return false
+  false
+
+fn eval_block(stmts, env)
+  i := 0
+  while i < stmts.len()
+    result := eval_stmt(stmts[i], env)
+    if is_return(result) => return result
+    i = i + 1
+  nil
+
+-- ── File evaluator ────────────────────────────────────────────────────────────
+
+fn eval_file(path, env)
+  src  := nv_read_file(path)
+  if src == nil or src == ""
+    print("Error: cannot read file: " + path)
+    return nil
+  -- Lex → parse → eval
+  toks  := lex(src)
+  state := make_state(toks)
+  stmts := parse_program(state)
+  eval_block(stmts, env)
+
+-- ── Entry point ───────────────────────────────────────────────────────────────
+
+fn eval_run(path)
+  g := make_global_env()
+  eval_file(path, g)
+
+-- Run from CLI if invoked directly
+args := nv_args()
+if args.len() >= 2
+  eval_run(args[1])
+else
+  print("Usage: nuvc eval.nvl <source.nvl>")

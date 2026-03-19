@@ -1,0 +1,155 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SIMPLE TESTS — Variables, arithmetic, strings, basic functions, loops
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- TEST: immutable binding
+x := 42
+assert(x == 42, "immutable binding failed")
+
+-- TEST: mutable binding
+y = 10
+y = y + 5
+assert(y == 15, "mutable binding failed")
+
+-- TEST: integer arithmetic
+a := 100
+b := 7
+assert(a + b == 107, "addition failed")
+assert(a - b == 93, "subtraction failed")
+assert(a * b == 700, "multiplication failed")
+assert(a // b == 14, "integer division failed")
+assert(a % b == 2, "modulo failed")
+assert(2 ** 10 == 1024, "power failed")
+
+-- TEST: float arithmetic
+pi := 3.14159
+r  := 5.0
+area := pi * r ** 2
+assert(area > 78.53 and area < 78.54, "float arithmetic failed")
+
+-- TEST: string creation
+greeting := "Hello, World!"
+assert(greeting == "Hello, World!", "string creation failed")
+
+-- TEST: string interpolation
+name := "Nuvola"
+version := 1
+msg := "Welcome to {name} v{version}!"
+assert(msg == "Welcome to Nuvola v1!", "string interpolation failed")
+
+-- TEST: string methods
+s := "  hello world  "
+assert(s.trim() == "hello world", "trim failed")
+assert(s.trim().to_upper() == "HELLO WORLD", "to_upper failed")
+assert("hello".contains("ell"), "contains failed")
+assert("hello world".split(" ").len == 2, "split failed")
+
+-- TEST: boolean logic
+t := true
+f := false
+assert(t and not f, "boolean and/not failed")
+assert(t or f, "boolean or failed")
+assert(not f, "not false failed")
+assert(not (t and f), "not (true and false) failed")
+
+-- TEST: comparison operators
+assert(5 > 3, "greater than failed")
+assert(3 < 5, "less than failed")
+assert(5 >= 5, "greater or equal failed")
+assert(5 <= 5, "less or equal failed")
+assert(5 == 5, "equality failed")
+assert(5 != 4, "inequality failed")
+
+-- TEST: if expression
+x := 10
+label := if x > 5 => "big" else "small"
+assert(label == "big", "if expression failed")
+
+label2 := if x > 100 => "huge"
+  else if x > 50 => "large"
+  else if x > 5 => "medium"
+  else "tiny"
+assert(label2 == "medium", "if-else chain failed")
+
+-- TEST: simple function definition
+fn double(x) => x * 2
+fn square(x) => x * x
+fn add(a, b) => a + b
+
+assert(double(21) == 42, "double function failed")
+assert(square(7) == 49, "square function failed")
+assert(add(30, 12) == 42, "add function failed")
+
+-- TEST: function with block body
+fn factorial(n)
+  if n <= 1 => return 1
+  return n * factorial(n - 1)
+
+assert(factorial(0) == 1, "factorial(0) failed")
+assert(factorial(1) == 1, "factorial(1) failed")
+assert(factorial(5) == 120, "factorial(5) failed")
+assert(factorial(10) == 3628800, "factorial(10) failed")
+
+-- TEST: list literals and indexing
+nums := [1, 2, 3, 4, 5]
+assert(nums[0] == 1, "list index 0 failed")
+assert(nums[4] == 5, "list index 4 failed")
+assert(nums[-1] == 5, "list index -1 failed")
+assert(nums.len == 5, "list len failed")
+
+-- TEST: for loop over range
+total = 0
+for i in 1..=10
+  total = total + i
+assert(total == 55, "for loop sum failed")
+
+-- TEST: for loop over list
+words := ["hello", "world", "nuvola"]
+count = 0
+for word in words
+  count = count + 1
+assert(count == 3, "for loop count failed")
+
+-- TEST: while loop
+n = 1
+product = 1
+while n <= 5
+  product = product * n
+  n = n + 1
+assert(product == 120, "while loop factorial failed")
+
+-- TEST: map function
+doubled := map(fn(x) => x * 2, [1, 2, 3, 4, 5])
+assert(doubled == [2, 4, 6, 8, 10], "map failed")
+
+-- TEST: filter function
+evens := filter(fn(x) => x % 2 == 0, [1, 2, 3, 4, 5, 6])
+assert(evens == [2, 4, 6], "filter failed")
+
+-- TEST: pipeline operator
+result := [1, 2, 3, 4, 5]
+  |> filter(fn(x) => x % 2 == 1)
+  |> map(fn(x) => x * x)
+  |> sum
+assert(result == 35, "pipeline failed")
+
+-- TEST: map literal
+capitals := {"France": "Paris", "Japan": "Tokyo", "Brazil": "Brasilia"}
+assert(capitals["France"] == "Paris", "map access failed")
+assert(capitals.len == 3, "map len failed")
+
+-- TEST: string format values
+score := 95
+msg := "Score: {score} ({score * 1.0 / 100.0:.2f}%)"
+print(msg)
+assert(msg == "Score: 95 (0.95%)", "format failed")
+
+-- TEST: recursive fibonacci
+fn fib(n)
+  if n <= 1 => return n
+  return fib(n - 1) + fib(n - 2)
+
+assert(fib(0) == 0, "fib(0) failed")
+assert(fib(1) == 1, "fib(1) failed")
+assert(fib(10) == 55, "fib(10) failed")
+assert(fib(15) == 610, "fib(15) failed")

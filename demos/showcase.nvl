@@ -1,0 +1,103 @@
+-- Nuvola showcase: a tiny JSON REST API server
+-- Demonstrates: HTTP server, JSON, math, string ops, try/catch, spawn
+
+-- ── In-memory task store ─────────────────────────────────────────────────────
+tasks = []
+next_id = 1
+
+fn task_new(title)
+  t = {}
+  t.set("id", next_id)
+  t.set("title", title)
+  t.set("done", false)
+  next_id = next_id + 1
+  tasks.push(t)
+  t
+
+fn task_find(id)
+  for t in tasks
+    if t.get("id") == id
+      return t
+  nil
+
+-- ── Request handler ──────────────────────────────────────────────────────────
+fn handle(req)
+  method := req.get("method")
+  path   := req.get("path")
+  body   := req.get("body")
+
+  -- GET /tasks — list all tasks as JSON
+  if method == "GET" and path == "/tasks"
+    return http_response(200, json_stringify(tasks))
+
+  -- POST /tasks — create a task
+  if method == "POST" and path == "/tasks"
+    data = nil
+    try
+      data = json_parse(body)
+    catch _
+      return http_response(400, "{" + "\"error\":\"invalid JSON\"" + "}")
+    title := data.get("title")
+    if title == nil
+      return http_response(400, "{" + "\"error\":\"title required\"" + "}")
+    t := task_new(title)
+    return http_response(201, json_stringify(t))
+
+  -- GET /stats — some math fun
+  if method == "GET" and path == "/stats"
+    n   := tasks.len
+    pct := 0.0
+    if n > 0
+      done_count = 0
+      for t in tasks
+        if t.get("done")
+          done_count = done_count + 1
+      pct = round(100.0 * done_count.to_float() / n.to_float()).to_float()
+    stats = {}
+    stats.set("total", n)
+    stats.set("done_pct", pct)
+    stats.set("uptime_ms", time_ms())
+    return http_response(200, json_stringify(stats))
+
+  -- GET /health
+  if method == "GET" and path == "/health"
+    return http_response(200, "{" + "\"status\":\"ok\",\"language\":\"Nuvola\"" + "}")
+
+  http_response(404, "{" + "\"error\":\"not found\"" + "}")
+
+-- ── Server ───────────────────────────────────────────────────────────────────
+fn serve_bg(port)
+  http_serve(port, handle)
+
+fn main()
+  port := 18080
+  spawn(serve_bg, port)
+  sleep_ms(80)
+
+  -- seed with a couple of tasks
+  body1 := "{" + "\"title\":\"Write Nuvola compiler\"" + "}"
+  body2 := "{" + "\"title\":\"Ship v1.0\"" + "}"
+  http_post("http://127.0.0.1:18080/tasks", body1)
+  http_post("http://127.0.0.1:18080/tasks", body2)
+
+  -- list tasks
+  resp := http_get("http://127.0.0.1:18080/tasks")
+  assert(resp.contains("Nuvola compiler"), "tasks list failed")
+
+  -- stats
+  stats_r := http_get("http://127.0.0.1:18080/stats")
+  assert(stats_r.contains("total"), "stats failed")
+
+  -- health
+  health_r := http_get("http://127.0.0.1:18080/health")
+  assert(health_r.contains("Nuvola"), "health failed")
+
+  -- bad JSON → 400 (missing title field)
+  bad_r := http_post("http://127.0.0.1:18080/tasks", "not-json")
+  assert(bad_r.contains("error"), "bad json check failed")
+
+  -- 404
+  miss_r := http_get("http://127.0.0.1:18080/missing")
+  assert(miss_r.contains("not found"), "404 check failed")
+
+  print("Showcase OK: REST API with JSON + math + try/catch")

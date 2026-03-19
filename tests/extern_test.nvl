@@ -1,0 +1,34 @@
+-- M14.1 extern fn test
+-- Verifies C FFI: @cinclude + extern fn declaration + typed calls
+
+@cinclude("stdio.h")
+extern fn printf(fmt: str, ...) -> i32
+
+@cinclude("string.h")
+extern fn strlen(s: str) -> i64
+
+@cinclude("stdlib.h")
+extern fn abs(x: i32) -> i32
+
+@cinclude("math.h")
+extern fn sqrt(x: f64) -> f64
+
+fn main()
+  -- Basic string output via C
+  printf("=== M14.1 extern fn test ===\n")
+
+  -- String length
+  n := strlen("hello world")
+  printf("strlen('hello world') = %lld\n", n)
+  assert(n == 11, "strlen failed")
+
+  -- Integer function
+  x := abs(-42)
+  printf("abs(-42) = %d\n", x)
+  assert(x == 42, "abs failed")
+
+  -- Float function
+  r := sqrt(2.0)
+  printf("sqrt(2.0) = %f\n", r)
+
+  printf("=== all extern tests passed ===\n")

@@ -1,0 +1,433 @@
+-- nuvola.nvl — Stage-0 Bootstrap Runtime
+--
+-- Core runtime library. Every compiled Nuvola program implicitly uses this.
+--
+-- Value model: NvVal is a tagged union (16 bytes on 64-bit).
+--   None, Int, Float, Bool — stored inline (no heap)
+--   Str                    — heap-allocated null-terminated UTF-8
+--   List                   — heap-allocated dynamic array
+--   Map                    — heap-allocated array of key-value pairs
+--   Fn                     — function pointer + optional closure env
+--   Ptr                    — raw C pointer (FFI only)
+--   Chan                   — pthread-backed channel
+
+@io
+module nuvola_runtime
+
+use std.math      -- sqrt, floor, ceil, round, pow, sin, cos, tan, exp, log, log2, log10, fabs, hypot, atan2
+use std.string    -- trim, upper, lower, contains, starts_with, ends_with, replace, split, join, repeat, index_of, slice
+use std.io        -- print, eprint, read_file, write_file
+use std.os        -- getcwd, exists, is_file, is_dir, listdir, mkdir, remove, rename, getenv, setenv, system, file_size
+use std.time      -- now_ms, now_us, now_sec, sleep_ms, sleep_sec, clock_ns, format, format_iso
+use std.json      -- parse, stringify
+use std.net.http  -- get, post, serve, response
+use std.thread    -- spawn, await_, Channel, parallel_map, parallel_for, cpu_count
+use std.crypto    -- sha256, sha256_bytes, hmac_sha256, base64_encode, base64_decode
+use std.regex     -- match, find, find_all, replace, split
+use std.utf8      -- len, at, chars
+
+-- ── Optional Boehm GC ────────────────────────────────────────────────────────
+-- When enabled: malloc/free route through GC, preventing leaks in long-running
+-- servers and recursive programs without explicit memory management.
+
+-- Compile with @gc annotation to enable:
+--   @gc module my_server
+
+-- ── Runtime call stack (stack traces) ─────────────────────────────────────────
+-- NV_ENTER("fn_name") placed at start of every generated function.
+-- Uses cleanup attribute so frame pops automatically on any return.
+
+-- ── Per-request bump arena ────────────────────────────────────────────────────
+-- Thread-local arena for HTTP server per-request allocations.
+-- Between arena_begin() and arena_end(), string allocations use arena.
+-- After arena_end(), all arena strings freed at once.
+
+ARENA_SIZE := 4 * 1024 * 1024  -- 4 MB per-request arena
+
+@io
+fn arena_begin()
+  std.mem.arena_begin(ARENA_SIZE)
+
+@io
+fn arena_end()
+  std.mem.arena_end()
+
+-- ── Value types ───────────────────────────────────────────────────────────────
+-- Nuvola's type system handles these natively:
+--   None, Int, Float, Bool, Str, List(T), Map(K,V), Fn, Ptr, Chan
+
+-- ── Constructors ──────────────────────────────────────────────────────────────
+-- All constructors are built into the language:
+--   None, 42, 3.14, true/false, "hello", [], {}, fn(x) -> x
+
+-- ── List operations ───────────────────────────────────────────────────────────
+
+-- list.push(item) — mutates in place
+-- list.pop() — removes and returns last element
+-- list.append(item) — alias for push
+-- list[i] — get element (negative indices supported)
+-- list[i] = v — set element
+-- list.len() — length
+-- list.first() — first element or None
+-- list.last() — last element or None
+-- list.take(n) — first n elements
+-- list.drop(n) — skip first n elements
+-- list ++ list — concatenation
+-- list.contains(v) — membership test
+-- list.flatten() — flatten nested lists
+-- list.unique() — deduplicate
+-- list.enumerate() — list of [index, value] pairs
+-- list.zip(other) — zip two lists into pairs
+
+-- ── Map operations ────────────────────────────────────────────────────────────
+
+-- map[key] — get value (None for missing keys)
+-- map[key] = val — set value
+-- map.len() — number of entries
+-- map.entries() — list of [key, val] pairs
+-- map.merge(other) — copy entries from other into this map
+-- map.copy() — shallow copy
+
+-- ── Truthiness ────────────────────────────────────────────────────────────────
+
+-- None → false
+-- Bool → value
+-- Int → non-zero
+-- Float → non-zero
+-- Str → non-empty
+-- List → non-empty
+-- Map → non-empty
+-- everything else → true
+
+-- ── Arithmetic ────────────────────────────────────────────────────────────────
+
+-- + — add (numeric, string concat, list concat, tensor add)
+-- - — subtract (numeric, tensor sub)
+-- * — multiply (numeric, tensor mul)
+-- / — divide (int/int → int truncation, float → float, tensor div)
+-- // — floor division
+-- % — modulo (Python-style: result has sign of divisor)
+-- ** — power
+-- @ — matrix multiply (tensor matmul)
+-- -x — negation
+
+-- ── Comparisons ───────────────────────────────────────────────────────────────
+
+-- ==, !=, <, <=, >, >= — polymorphic (numeric, string)
+-- and, or, not — logical
+-- is — identity comparison
+
+-- ── String conversion ─────────────────────────────────────────────────────────
+
+fn to_str(v: Any) -> Str
+  str(v)
+
+fn to_str_fmt(v: Any, fmt: Str) -> Str
+  -- Format spec: ".2f" → 2 decimal places
+  str(v, format = fmt)
+
+-- ── String methods ────────────────────────────────────────────────────────────
+
+-- str.trim() → trimmed string
+-- str.upper() → uppercase
+-- str.lower() → lowercase
+-- str.contains(sub) → bool
+-- str.starts_with(prefix) → bool
+-- str.ends_with(suffix) → bool
+-- str.replace(from, to) → replaced string
+-- str.split(delim) → list of strings
+-- str.join(list) → joined string
+-- str.len() → length (bytes)
+-- str.repeat(n) → repeated string
+-- str.index_of(sub) → index or -1
+-- str.slice(start, end) → substring
+-- str.chars() → list of single-char strings
+-- str.parse_int() → Int
+
+-- ── Polymorphic .len ──────────────────────────────────────────────────────────
+
+-- Works on Str, List, Map — returns Int
+
+-- ── Index operator ────────────────────────────────────────────────────────────
+
+-- list[i] — element (negative indices supported)
+-- map[key] — value (None for missing)
+-- str[i] — single character as string
+-- tensor[i] — element (1D) or row (2D)
+
+-- ── Number conversions ────────────────────────────────────────────────────────
+
+-- int(v) — convert to Int
+-- float(v) — convert to Float
+
+-- ── I/O builtins ──────────────────────────────────────────────────────────────
+
+-- print(v) — print with newline
+-- eprint(v) — print to stderr
+-- read_file(path) → Str or None
+-- write_file(path, content) → None
+-- file_exists(path) → Bool
+-- file_append(path, content) → Bool
+
+-- ── Path operations ───────────────────────────────────────────────────────────
+
+-- path.dirname(p) → directory part
+-- path.join(dir, rel) → joined path
+
+-- ── Command line ──────────────────────────────────────────────────────────────
+
+-- args() → List(Str) of command line arguments
+
+-- ── Assertions ────────────────────────────────────────────────────────────────
+
+-- assert(cond, msg) — fatal if cond is false
+-- panic(msg) — fatal runtime error
+
+-- ── Functional builtins ───────────────────────────────────────────────────────
+
+-- map(fn, list) → mapped list
+-- filter(fn, list) → filtered list
+-- sum(list) → sum of elements
+-- range(start, end) → list of ints
+-- max(list) → maximum element
+-- min(list) → minimum element
+-- sorted(list) → sorted copy
+-- reversed(list) → reversed copy
+-- len(v) → length
+-- abs(v) → absolute value
+-- sqrt(v) → square root
+-- floor(v) → floor
+-- ceil(v) → ceiling
+-- round(v) → rounded
+
+-- ── Math builtins ─────────────────────────────────────────────────────────────
+
+-- sin(x), cos(x), tan(x) — trig functions
+-- exp(x) — e^x
+-- log(x) — natural log (tensor-aware)
+-- log2(x), log10(x) — base-2/10 log
+-- pow(a, b) — power
+-- hypot(a, b) — hypotenuse
+-- atan2(a, b) — 2-argument arctangent
+
+-- ── System builtins ───────────────────────────────────────────────────────────
+
+-- time_ms() → milliseconds (monotonic clock)
+-- exit(code) — terminate process
+-- env_get(name) → Str or None
+
+-- ── OS / filesystem builtins ──────────────────────────────────────────────────
+
+-- os.getcwd() → Str
+-- os.exists(path) → Bool
+-- os.is_file(path) → Bool
+-- os.is_dir(path) → Bool
+-- os.listdir(path) → List(Str)
+-- os.mkdir(path) → Bool
+-- os.remove(path) → Bool
+-- os.rename(src, dst) → Bool
+-- os.getenv(name) → Str or None
+-- os.setenv(name, val) → Bool
+-- os.system(cmd) → Int (exit code)
+-- os.file_size(path) → Int or -1
+
+-- ── Time builtins ─────────────────────────────────────────────────────────────
+
+-- time.now_ms() → ms since epoch
+-- time.now_us() → us since epoch
+-- time.now_sec() → seconds since epoch (Float)
+-- time.sleep_ms(n) — sleep n milliseconds
+-- time.sleep_sec(s) — sleep s seconds
+-- time.clock_ns() → nanoseconds (monotonic, for benchmarking)
+-- time.format(ms) → "YYYY-MM-DD HH:MM:SS"
+-- time.format_iso(ms) → "YYYY-MM-DDTHH:MM:SSZ"
+
+-- ── String builtins ───────────────────────────────────────────────────────────
+
+-- str.repeat(n) → repeated string
+-- str.index_of(sub) → index or -1
+-- str.slice(start, end) → substring
+
+-- ── List builtins ─────────────────────────────────────────────────────────────
+
+-- list.first() → first element or None
+-- list.last() → last element or None
+-- list.zip(other) → list of pairs
+-- list.flatten() → flattened list
+-- list.unique() → deduplicated list
+-- list.enumerate() → list of [index, value]
+
+-- ── JSON ──────────────────────────────────────────────────────────────────────
+
+-- json.parse(s) → Any (recursive descent parser)
+-- json.stringify(v) → Str (recursive stringifier)
+
+-- ── HTTP ──────────────────────────────────────────────────────────────────────
+
+@io
+fn http_get(url: Str) -> Str
+  http.get(url)
+
+@io
+fn http_post(url: Str, body: Str) -> Str
+  http.post(url, body)
+
+@io
+fn http_response(status: Int, body: Str) -> Map(Str, Any)
+  { "status": status, "body": body }
+
+@io
+fn http_serve(port: Int, handler: Fn(Map) -> Map)
+  -- Multi-threaded HTTP server
+  -- Each connection handled in a new thread with per-request arena
+  http.serve(port, fn(req) ->
+    arena_begin()
+    resp := handler(req)
+    arena_end()
+    resp
+  )
+
+-- ── Channels + Spawn ──────────────────────────────────────────────────────────
+
+CHAN_CAP := 256  -- ring-buffer capacity
+
+type Channel
+  buf:     List(Any)
+  head:    Int
+  tail:    Int
+  count:   Int
+  mutex:   Mutex
+  not_empty: CondVar
+  not_full:  CondVar
+
+@io
+fn chan_new() -> Channel
+  thread.Channel.new(CHAN_CAP)
+
+@io
+fn chan_send(ch: Channel, val: Any)
+  ch.send(val)
+
+@io
+fn chan_recv(ch: Channel) -> Any
+  ch.recv()
+
+@io
+fn chan_try_recv(ch: Channel) -> Option(Any)
+  ch.try_recv()
+
+-- ── Futures (spawn + await) ──────────────────────────────────────────────────
+
+@io
+fn spawn(f: Fn, arg: Any = None) -> Future
+  thread.spawn(f, arg)
+
+@io
+fn await_(fut: Future) -> Any
+  thread.await_(fut)
+
+-- ── Thread Pool ───────────────────────────────────────────────────────────────
+
+@io
+fn parallel_map(f: Fn(Any) -> Any, list: List) -> List
+  thread.parallel_map(f, list)
+
+@io
+fn parallel_for(items: List, f: Fn(Any))
+  thread.parallel_for(items, f)
+
+fn cpu_count() -> Int
+  thread.cpu_count()
+
+-- ── Sleep ─────────────────────────────────────────────────────────────────────
+
+@io
+fn sleep_ms(ms: Int)
+  time.sleep_ms(ms)
+
+@io
+fn sleep_sec(s: Float)
+  time.sleep_sec(s)
+
+-- ── Shell / subprocess ────────────────────────────────────────────────────────
+
+@io
+fn shell(cmd: Str) -> Int
+  os.system(cmd)
+
+@io
+fn popen_read(cmd: Str) -> Str
+  os.popen_read(cmd)
+
+-- ── try/catch/throw ───────────────────────────────────────────────────────────
+
+-- Built into language syntax:
+--   match try(fn() -> risky_operation())
+--     Ok(val) -> handle_success(val)
+--     Err(e)  -> handle_error(e)
+--
+--   throw "error message"
+
+-- ── Regex ─────────────────────────────────────────────────────────────────────
+
+fn regex_match(pattern: Str, s: Str) -> Bool
+  regex.match(pattern, s)
+
+fn regex_find(pattern: Str, s: Str) -> Option(Str)
+  regex.find(pattern, s)
+
+fn regex_find_all(pattern: Str, s: Str) -> List(Str)
+  regex.find_all(pattern, s)
+
+fn regex_replace(pattern: Str, s: Str, repl: Str) -> Str
+  regex.replace(pattern, s, repl)
+
+fn regex_split(pattern: Str, s: Str) -> List(Str)
+  regex.split(pattern, s)
+
+-- ── SHA-256 ───────────────────────────────────────────────────────────────────
+-- Self-contained implementation, no OpenSSL needed.
+
+fn sha256(s: Str) -> Str
+  crypto.sha256(s)
+
+fn sha256_bytes(data: List(Int)) -> Str
+  crypto.sha256_bytes(data)
+
+fn hmac_sha256(key: Str, msg: Str) -> Str
+  crypto.hmac_sha256(key, msg)
+
+-- ── Base64 ────────────────────────────────────────────────────────────────────
+
+fn base64_encode(s: Str) -> Str
+  crypto.base64_encode(s)
+
+fn base64_decode(s: Str) -> Str
+  crypto.base64_decode(s)
+
+-- ── UTF-8 ─────────────────────────────────────────────────────────────────────
+
+fn utf8_len(s: Str) -> Int
+  utf8.len(s)
+
+fn utf8_at(s: Str, idx: Int) -> Option(Str)
+  utf8.at(s, idx)
+
+fn utf8_chars(s: Str) -> List(Str)
+  utf8.chars(s)
+
+-- ── String formatting ─────────────────────────────────────────────────────────
+
+-- Nuvola uses string interpolation natively: "hello {name}"
+-- For positional formatting: format_str("{0} is {1}", [name, age])
+
+fn format_str(fmt: Str, args: List(Any)) -> Str
+  result = fmt
+  for (i, arg) in args.enumerate()
+    result = result |> replace("{" ++ str(i) ++ "}", str(arg))
+  result
+
+-- ── Tensor, trait, channel runtime ────────────────────────────────────────────
+-- Defined in nuvola_tensor.nvl (included conceptually at end)
+
+use nuvola_tensor

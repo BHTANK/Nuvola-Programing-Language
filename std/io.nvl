@@ -1,0 +1,80 @@
+-- std/io.nvl — Nuvola standard I/O library
+-- Import with: import "std/io.nvl"
+
+-- ── Console output ────────────────────────────────────────────────────────
+fn println(s)
+  -- Print with newline (alias for print)
+  print(s)
+
+fn print_err(s)
+  -- Print to stderr
+  eprint(s)
+
+fn print_table(headers, rows)
+  -- Pretty-print a table to stdout
+  -- headers: list of strings
+  -- rows:    list of lists of strings
+  widths = []
+  for h in headers
+    widths.push(h.len)
+  for row in rows
+    i = 0
+    for cell in row
+      w := cell.len
+      if i < widths.len and w > widths[i]
+        widths[i] = w
+      i = i + 1
+  -- Header row
+  line = ""
+  i = 0
+  for h in headers
+    w := widths[i]
+    line = line + h.repeat(1) + " ".repeat(w - h.len + 2)
+    i = i + 1
+  print(line.trim())
+  -- Separator
+  sep = ""
+  for w in widths
+    sep = sep + "-".repeat(w + 2)
+  print(sep)
+  -- Data rows
+  for row in rows
+    line = ""
+    i = 0
+    for cell in row
+      w := widths[i]
+      line = line + cell + " ".repeat(w - cell.len + 2)
+      i = i + 1
+    print(line.trim())
+
+-- ── File utilities ────────────────────────────────────────────────────────
+fn read_lines(path)
+  -- Read a file and return list of lines
+  src := read_file(path)
+  if src == nil => return nil
+  src.split("\n")
+
+fn write_lines(path, lines)
+  -- Write a list of strings to a file (one per line)
+  write_file(path, lines.join("\n"))
+
+fn append_line(path, line)
+  -- Append a single line to a file
+  existing := read_file(path)
+  if existing == nil
+    write_file(path, line + "\n")
+  else
+    write_file(path, existing + line + "\n")
+
+-- ── Environment ───────────────────────────────────────────────────────────
+fn env(name, default_val)
+  -- Get env var or return default_val
+  v := env_get(name)
+  if v == nil => return default_val
+  v
+
+fn require_env(name)
+  -- Get env var or abort with a clear message
+  v := env_get(name)
+  assert(v != nil, "required environment variable not set: " + name)
+  v

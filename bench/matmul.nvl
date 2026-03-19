@@ -1,0 +1,32 @@
+-- Benchmark 6: Matrix multiplication 256x256
+-- Tests: nested loops, indexed access, float multiply-add
+
+fn matmul_run(n)
+  -- Build matrices as flat arrays (row-major)
+  a := []
+  b := []
+  c := []
+  i := 0
+  while i < n * n
+    a.push(float(i % 97) * 0.01)
+    b.push(float(i % 53) * 0.01)
+    c.push(0.0)
+    i = i + 1
+
+  -- C = A * B
+  row := 0
+  while row < n
+    col := 0
+    while col < n
+      sum := 0.0
+      k := 0
+      while k < n
+        sum = sum + a[row * n + k] * b[k * n + col]
+        k = k + 1
+      c[row * n + col] = sum
+      col = col + 1
+    row = row + 1
+  c
+
+result := matmul_run(256)
+print("matmul 256x256 c[0]=" + str(result[0]) + " c[last]=" + str(result[result.len - 1]))

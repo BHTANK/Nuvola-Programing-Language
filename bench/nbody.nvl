@@ -1,0 +1,83 @@
+-- Benchmark 5: N-body simulation (3 bodies, 500k steps)
+-- Tests: floating-point math, scalar specialization, sqrt
+
+fn nbody_run(steps)
+  sun_x  := 0.0
+  sun_y  := 0.0
+  sun_z  := 0.0
+  sun_vx := 0.0
+  sun_vy := 0.0
+  sun_vz := 0.0
+  sun_m  := 1.0
+  jup_x  := 4.84143144246472090
+  jup_y  := -1.16032004402742839
+  jup_z  := -0.10327910045777416
+  jup_vx := 0.00166003245 * 365.25
+  jup_vy := 0.007699011275 * 365.25
+  jup_vz := -0.0000690460016 * 365.25
+  jup_m  := 0.000954791938
+  sat_x  := 8.34336671824457987
+  sat_y  := 4.12479856412430479
+  sat_z  := -0.40352044297
+  sat_vx := -0.002767425107 * 365.25
+  sat_vy := 0.004998528012 * 365.25
+  sat_vz := 0.0000230417297 * 365.25
+  sat_m  := 0.000285885980
+  dt     := 0.01
+
+  i := 0
+  while i < steps
+    dx := sun_x - jup_x
+    dy := sun_y - jup_y
+    dz := sun_z - jup_z
+    dist2 := dx*dx + dy*dy + dz*dz
+    dist  := sqrt(dist2)
+    mag   := dt / (dist2 * dist)
+    sun_vx = sun_vx - dx * jup_m * mag
+    sun_vy = sun_vy - dy * jup_m * mag
+    sun_vz = sun_vz - dz * jup_m * mag
+    jup_vx = jup_vx + dx * sun_m * mag
+    jup_vy = jup_vy + dy * sun_m * mag
+    jup_vz = jup_vz + dz * sun_m * mag
+    dx2 := sun_x - sat_x
+    dy2 := sun_y - sat_y
+    dz2 := sun_z - sat_z
+    d2  := dx2*dx2 + dy2*dy2 + dz2*dz2
+    d   := sqrt(d2)
+    m2  := dt / (d2 * d)
+    sun_vx = sun_vx - dx2 * sat_m * m2
+    sun_vy = sun_vy - dy2 * sat_m * m2
+    sun_vz = sun_vz - dz2 * sat_m * m2
+    sat_vx = sat_vx + dx2 * sun_m * m2
+    sat_vy = sat_vy + dy2 * sun_m * m2
+    sat_vz = sat_vz + dz2 * sun_m * m2
+    dx3 := jup_x - sat_x
+    dy3 := jup_y - sat_y
+    dz3 := jup_z - sat_z
+    d3s := dx3*dx3 + dy3*dy3 + dz3*dz3
+    d3  := sqrt(d3s)
+    m3  := dt / (d3s * d3)
+    jup_vx = jup_vx - dx3 * sat_m * m3
+    jup_vy = jup_vy - dy3 * sat_m * m3
+    jup_vz = jup_vz - dz3 * sat_m * m3
+    sat_vx = sat_vx + dx3 * jup_m * m3
+    sat_vy = sat_vy + dy3 * jup_m * m3
+    sat_vz = sat_vz + dz3 * jup_m * m3
+    sun_x = sun_x + dt * sun_vx
+    sun_y = sun_y + dt * sun_vy
+    sun_z = sun_z + dt * sun_vz
+    jup_x = jup_x + dt * jup_vx
+    jup_y = jup_y + dt * jup_vy
+    jup_z = jup_z + dt * jup_vz
+    sat_x = sat_x + dt * sat_vx
+    sat_y = sat_y + dt * sat_vy
+    sat_z = sat_z + dt * sat_vz
+    i = i + 1
+
+  energy := sun_m * (sun_vx*sun_vx + sun_vy*sun_vy + sun_vz*sun_vz) * 0.5
+  energy = energy + jup_m * (jup_vx*jup_vx + jup_vy*jup_vy + jup_vz*jup_vz) * 0.5
+  energy = energy + sat_m * (sat_vx*sat_vx + sat_vy*sat_vy + sat_vz*sat_vz) * 0.5
+  energy
+
+result := nbody_run(500000)
+print("nbody 500k steps, KE = " + str(result))

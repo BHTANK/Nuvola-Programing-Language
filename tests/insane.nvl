@@ -1,0 +1,414 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- INSANE TESTS — Extreme algorithms, complex patterns, stress cases
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- TEST: Ackermann function (extreme recursion depth)
+fn ackermann(m, n)
+  if m == 0 => return n + 1
+  if n == 0 => return ackermann(m - 1, 1)
+  return ackermann(m - 1, ackermann(m, n - 1))
+
+assert(ackermann(0, 0) == 1,   "A(0,0) failed")
+assert(ackermann(1, 1) == 3,   "A(1,1) failed")
+assert(ackermann(2, 2) == 7,   "A(2,2) failed")
+assert(ackermann(2, 5) == 13,  "A(2,5) failed")
+assert(ackermann(3, 0) == 5,   "A(3,0) failed")
+assert(ackermann(3, 1) == 13,  "A(3,1) failed")
+
+-- TEST: N-Queens solver (backtracking)
+fn nq_safe(board, row, col)
+  for r in 0..row
+    c := board[r]
+    if c == col => return false
+    if abs(c - col) == abs(r - row) => return false
+  return true
+
+fn nq_solve(board, row, n)
+  if row == n => return 1
+  count = 0
+  for col in 0..n
+    if nq_safe(board, row, col)
+      board.push(col)
+      count = count + nq_solve(board, row + 1, n)
+      board.pop()
+  return count
+
+fn queens(n) => nq_solve([], 0, n)
+
+assert(queens(1) == 1,  "1-queens failed")
+assert(queens(4) == 2,  "4-queens failed")
+assert(queens(5) == 10, "5-queens failed")
+assert(queens(6) == 4,  "6-queens failed")
+
+-- TEST: Towers of Hanoi move count
+fn hanoi_count(n) => if n <= 0 => 0 else 2 * hanoi_count(n - 1) + 1
+
+assert(hanoi_count(1) == 1,       "hanoi 1 failed")
+assert(hanoi_count(3) == 7,       "hanoi 3 failed")
+assert(hanoi_count(10) == 1023,   "hanoi 10 failed")
+assert(hanoi_count(20) == 1048575, "hanoi 20 failed")
+
+-- TEST: Levenshtein edit distance (rolling-array DP, push only)
+fn edit_distance(s, t)
+  m := s.len
+  n := t.len
+  sc := s.chars()
+  tc := t.chars()
+  prev = []
+  for j in 0..=n
+    prev.push(j)
+  for i in 1..=m
+    curr = [i]
+    for j in 1..=n
+      if sc[i-1] == tc[j-1]
+        curr.push(prev[j-1])
+      else
+        ins := curr[curr.len - 1] + 1
+        del := prev[j] + 1
+        sub := prev[j-1] + 1
+        best = ins
+        if del < best => best = del
+        if sub < best => best = sub
+        curr.push(best)
+    prev = curr
+  return prev[n]
+
+assert(edit_distance("kitten", "sitting") == 3, "edit_distance kitten/sitting failed")
+assert(edit_distance("horse", "ros") == 3,      "edit_distance horse/ros failed")
+assert(edit_distance("", "abc") == 3,           "edit_distance empty/abc failed")
+assert(edit_distance("abc", "abc") == 0,        "edit_distance identical failed")
+assert(edit_distance("abc", "") == 3,           "edit_distance abc/empty failed")
+
+-- TEST: Run-length encoding + decoding
+fn rle_encode(s)
+  if s.len == 0 => return ""
+  chs := s.chars()
+  result = []
+  count = 1
+  i = 1
+  while i < chs.len
+    if chs[i] == chs[i - 1]
+      count = count + 1
+    else
+      result.push(str(count) + chs[i - 1])
+      count = 1
+    i = i + 1
+  result.push(str(count) + chs[chs.len - 1])
+  return result |> join("")
+
+fn rle_decode(s)
+  if s.len == 0 => return ""
+  chs := s.chars()
+  result = []
+  i = 0
+  while i < chs.len
+    num_s = ""
+    while i < chs.len and chs[i] >= "0" and chs[i] <= "9"
+      num_s = num_s + chs[i]
+      i = i + 1
+    if i < chs.len
+      ch := chs[i]
+      n = num_s.parse_i64()
+      j = 0
+      while j < n
+        result.push(ch)
+        j = j + 1
+      i = i + 1
+  return result |> join("")
+
+assert(rle_encode("AAABBBCC")           == "3A3B2C",  "RLE encode 1 failed")
+assert(rle_encode("ABCD")               == "1A1B1C1D","RLE encode singles failed")
+assert(rle_encode("AAAAAA")             == "6A",       "RLE encode all-same failed")
+assert(rle_decode("3A3B2C")             == "AAABBBCC", "RLE decode 1 failed")
+assert(rle_decode(rle_encode("XXXXXYYZZZ")) == "XXXXXYYZZZ", "RLE round-trip failed")
+
+-- TEST: Coin change (minimum coins, iterative push DP)
+fn coin_change(coins, amount)
+  dp = []
+  dp.push(0)
+  i = 1
+  while i <= amount
+    best = amount + 1
+    for c in coins
+      if c <= i
+        prev := dp[i - c]
+        if prev + 1 < best => best = prev + 1
+    dp.push(best)
+    i = i + 1
+  if dp[amount] > amount => return -1
+  return dp[amount]
+
+assert(coin_change([1, 5, 10, 25], 41) == 4,  "coin_change 41 cents failed")
+assert(coin_change([1, 5, 10, 25], 30) == 2,  "coin_change 30 cents failed")
+assert(coin_change([1, 2, 5], 11)      == 3,  "coin_change 11 failed")
+assert(coin_change([2], 3)             == -1, "coin_change impossible failed")
+assert(coin_change([1], 0)             == 0,  "coin_change zero failed")
+
+-- TEST: Dijkstra shortest path (dict-based, 5-node graph)
+fn dijkstra(graph, start, n)
+  dist     = {}
+  visited  = {}
+  for i in 0..n
+    dist.set(str(i),    999999)
+    visited.set(str(i), false)
+  dist.set(str(start), 0)
+  for _ in 0..n
+    u    = -1
+    mind = 999999
+    for i in 0..n
+      si := str(i)
+      if not visited.get(si) and dist.get(si) < mind
+        mind = dist.get(si)
+        u    = i
+    if u == -1 => return dist
+    visited.set(str(u), true)
+    row := graph[u]
+    for v in 0..n
+      w  := row[v]
+      sv := str(v)
+      su := str(u)
+      if w > 0 and not visited.get(sv)
+        nd := dist.get(su) + w
+        if nd < dist.get(sv)
+          dist.set(sv, nd)
+  return dist
+
+-- 5-node weighted directed graph (adjacency matrix)
+g := [
+  [0, 10, 3, 0, 0],
+  [0, 0,  1, 2, 0],
+  [0, 4,  0, 8, 2],
+  [0, 0,  0, 0, 7],
+  [0, 0,  0, 9, 0],
+]
+dists := dijkstra(g, 0, 5)
+assert(dists.get("0") == 0, "dijkstra d[0] failed")
+assert(dists.get("1") == 7, "dijkstra d[1] failed")
+assert(dists.get("2") == 3, "dijkstra d[2] failed")
+assert(dists.get("3") == 9, "dijkstra d[3] failed")
+assert(dists.get("4") == 5, "dijkstra d[4] failed")
+
+-- TEST: Pascal's triangle + binomial coefficients
+fn pascal_row(n)
+  row = [1]
+  for i in 1..=n
+    next = [1]
+    for j in 1..i
+      next.push(row[j-1] + row[j])
+    next.push(1)
+    row = next
+  return row
+
+fn binom(n, k) => pascal_row(n)[k]
+
+assert(pascal_row(0) == [1],              "pascal row 0 failed")
+assert(pascal_row(1) == [1, 1],           "pascal row 1 failed")
+assert(pascal_row(4) == [1, 4, 6, 4, 1], "pascal row 4 failed")
+assert(pascal_row(5) == [1, 5, 10, 10, 5, 1], "pascal row 5 failed")
+assert(binom(10, 3) == 120, "binom(10,3) failed")
+assert(binom(6,  2) == 15,  "binom(6,2) failed")
+assert(binom(7,  3) == 35,  "binom(7,3) failed")
+
+-- TEST: Catalan numbers (recursive)
+fn catalan(n)
+  if n <= 1 => return 1
+  total = 0
+  for i in 0..n
+    total = total + catalan(i) * catalan(n - 1 - i)
+  return total
+
+assert(catalan(0) == 1,  "catalan 0 failed")
+assert(catalan(1) == 1,  "catalan 1 failed")
+assert(catalan(2) == 2,  "catalan 2 failed")
+assert(catalan(3) == 5,  "catalan 3 failed")
+assert(catalan(4) == 14, "catalan 4 failed")
+assert(catalan(5) == 42, "catalan 5 failed")
+
+-- TEST: Balanced parentheses checker
+fn is_balanced(s)
+  depth = 0
+  for ch in s.chars()
+    if ch == "("
+      depth = depth + 1
+    else if ch == ")"
+      depth = depth - 1
+      if depth < 0 => return false
+  return depth == 0
+
+assert(is_balanced("((()))"),  "balanced ((()))  failed")
+assert(is_balanced("()()()"),  "balanced ()()() failed")
+assert(is_balanced("(()())"),  "balanced (()()) failed")
+assert(is_balanced(""),        "balanced empty   failed")
+assert(not is_balanced("((()"), "unbalanced 1 failed")
+assert(not is_balanced(")("),   "unbalanced 2 failed")
+assert(not is_balanced("())"),  "unbalanced 3 failed")
+assert(not is_balanced("(()"),  "unbalanced 4 failed")
+
+-- Verify catalan(3)=5: exactly 5 balanced strings of length 6
+valid := ["((()))", "(()())", "(())()", "()(())", "()()()"]
+for s in valid
+  assert(is_balanced(s), "catalan string {s} should be balanced")
+
+invalid := ["((())", ")()(", "(()", ")))(((" ]
+for s in invalid
+  assert(not is_balanced(s), "catalan string {s} should NOT be balanced")
+
+-- TEST: Large Fibonacci (iterative, no recursion limit)
+fn fib(n)
+  if n == 0 => return 0
+  if n == 1 => return 1
+  a = 0
+  b = 1
+  for _ in 2..=n
+    c := a + b
+    a  = b
+    b  = c
+  return b
+
+assert(fib(0)  == 0,         "fib(0) failed")
+assert(fib(10) == 55,        "fib(10) failed")
+assert(fib(20) == 6765,      "fib(20) failed")
+assert(fib(30) == 832040,    "fib(30) failed")
+assert(fib(40) == 102334155, "fib(40) failed")
+assert(fib(50) == 12586269025, "fib(50) failed")
+
+-- TEST: Prime factorization
+fn prime_factors(n)
+  factors = []
+  d = 2
+  while d * d <= n
+    while n % d == 0
+      factors.push(d)
+      n = n // d
+    d = d + 1
+  if n > 1 => factors.push(n)
+  return factors
+
+assert(prime_factors(84)   == [2, 2, 3, 7],             "factors 84 failed")
+assert(prime_factors(360)  == [2, 2, 2, 3, 3, 5],       "factors 360 failed")
+assert(prime_factors(97)   == [97],                      "factors prime 97 failed")
+assert(prime_factors(1024) == [2, 2, 2, 2, 2, 2, 2, 2, 2, 2], "factors 1024 failed")
+assert(prime_factors(2310) == [2, 3, 5, 7, 11],         "factors 2310 failed")
+
+-- TEST: Roman numeral encoder
+fn to_roman(n)
+  vals    := [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+  syms    := ["M","CM","D","CD","C","XC","L","XL","X","IX","V","IV","I"]
+  result   = ""
+  i        = 0
+  while n > 0
+    while n >= vals[i]
+      result = result + syms[i]
+      n      = n - vals[i]
+    i = i + 1
+  return result
+
+assert(to_roman(3)    == "III",     "roman 3 failed")
+assert(to_roman(4)    == "IV",      "roman 4 failed")
+assert(to_roman(9)    == "IX",      "roman 9 failed")
+assert(to_roman(58)   == "LVIII",   "roman 58 failed")
+assert(to_roman(1994) == "MCMXCIV", "roman 1994 failed")
+assert(to_roman(2024) == "MMXXIV",  "roman 2024 failed")
+
+-- TEST: Longest increasing subsequence (iterative push DP)
+fn lis(xs)
+  n := xs.len
+  if n == 0 => return 0
+  dp = [1]
+  i  = 1
+  while i < n
+    best = 1
+    for j in 0..i
+      if xs[j] < xs[i] and dp[j] + 1 > best
+        best = dp[j] + 1
+    dp.push(best)
+    i = i + 1
+  return dp |> max
+
+assert(lis([10, 9, 2, 5, 3, 7, 101, 18]) == 4, "LIS 1 failed")
+assert(lis([0, 1, 0, 3, 2, 3])            == 4, "LIS 2 failed")
+assert(lis([7, 7, 7, 7])                  == 1, "LIS all-same failed")
+assert(lis([1, 2, 3, 4, 5])               == 5, "LIS sorted asc failed")
+assert(lis([5, 4, 3, 2, 1])               == 1, "LIS sorted desc failed")
+assert(lis([3, 1, 4, 1, 5, 9, 2, 6])     == 4, "LIS pi failed")
+
+-- TEST: Collatz sequence length
+fn collatz(n)
+  steps = 0
+  while n != 1
+    if n % 2 == 0
+      n = n // 2
+    else
+      n = 3 * n + 1
+    steps = steps + 1
+  return steps
+
+assert(collatz(1)  == 0,   "collatz 1 failed")
+assert(collatz(2)  == 1,   "collatz 2 failed")
+assert(collatz(6)  == 8,   "collatz 6 failed")
+assert(collatz(27) == 111, "collatz 27 failed")
+
+-- Longest Collatz chain in 1..20 starts at 18 (or 19, same length — first wins)
+best_n     = 0
+best_steps = 0
+for i in 1..=20
+  s := collatz(i)
+  if s > best_steps
+    best_steps = s
+    best_n     = i
+assert(best_n == 18 or best_n == 19, "longest collatz 1..20 failed")
+assert(best_steps == 20,             "longest collatz steps failed")
+
+-- TEST: Polynomial evaluation (Horner's method)
+fn poly_eval(coeffs, x)
+  -- coeffs[0] is highest degree: c[0]*x^n + c[1]*x^(n-1) + ... + c[n]
+  result = 0
+  for c in coeffs
+    result = result * x + c
+  return result
+
+-- p(x) = x^3 - 6x^2 + 11x - 6  (roots at 1,2,3)  coeffs = [1, -6, 11, -6]
+assert(poly_eval([1, -6, 11, -6], 1) == 0,  "poly eval root 1 failed")
+assert(poly_eval([1, -6, 11, -6], 2) == 0,  "poly eval root 2 failed")
+assert(poly_eval([1, -6, 11, -6], 3) == 0,  "poly eval root 3 failed")
+assert(poly_eval([1, -6, 11, -6], 0) == -6, "poly eval at 0 failed")
+assert(poly_eval([1, -6, 11, -6], 4) == 6,  "poly eval at 4 failed")
+
+-- p(x) = 2x^2 + 3x + 1 = (2x+1)(x+1), roots at -0.5, -1
+assert(poly_eval([2, 3, 1], 0)  == 1,  "poly2 at 0 failed")
+assert(poly_eval([2, 3, 1], 1)  == 6,  "poly2 at 1 failed")
+assert(poly_eval([2, 3, 1], -1) == 0,  "poly2 root -1 failed")
+assert(poly_eval([2, 3, 1], 2)  == 15, "poly2 at 2 failed")
+
+-- TEST: Number theory — extended GCD and modular inverse
+fn gcd(a, b)
+  while b != 0
+    temp := b
+    b = a % b
+    a = temp
+  return a
+
+fn lcm(a, b) => a * b // gcd(a, b)
+
+fn power_mod(base, exp, mod)
+  -- Fast modular exponentiation (square-and-multiply)
+  result = 1
+  base   = base % mod
+  e      = exp
+  while e > 0
+    if e % 2 == 1
+      result = result * base % mod
+    e    = e // 2
+    base = base * base % mod
+  return result
+
+assert(gcd(48, 18) == 6,   "gcd 48,18 failed")
+assert(gcd(17, 13) == 1,   "gcd coprime failed")
+assert(lcm(4, 6)   == 12,  "lcm 4,6 failed")
+assert(lcm(12, 18) == 36,  "lcm 12,18 failed")
+
+-- Fermat's little theorem: a^(p-1) ≡ 1 (mod p) for prime p
+assert(power_mod(2, 16, 17)  == 1,  "fermat 2^16 mod 17 failed")
+assert(power_mod(3, 100, 101)== 1,  "fermat 3^100 mod 101 failed")
+assert(power_mod(2, 10, 1000)== 24, "power_mod 2^10 mod 1000 failed")
+assert(power_mod(7, 0, 13)   == 1,  "power_mod base case failed")

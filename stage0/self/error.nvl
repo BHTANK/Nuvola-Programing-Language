@@ -1,0 +1,53 @@
+-- error.nvl — Diagnostic types for the Nuvola self-hosted compiler
+-- Errors are maps with a "kind" field whose value ends in "_error".
+-- Two flavours are defined: lex_error and parse_error.
+-- The is_error() predicate works for any error map produced by this module.
+
+-- ── Constructors ──────────────────────────────────────────────────────────────
+
+fn make_lex_error(msg, line, col)
+  e = {}
+  e.set("kind", "lex_error")
+  e.set("msg",  msg)
+  e.set("line", line)
+  e.set("col",  col)
+  e
+
+fn make_parse_error(msg, line, col)
+  e = {}
+  e.set("kind", "parse_error")
+  e.set("msg",  msg)
+  e.set("line", line)
+  e.set("col",  col)
+  e
+
+-- ── Formatter ────────────────────────────────────────────────────────────────
+
+fn error_to_str(err)
+  ln  := err.get("line")
+  cl  := err.get("col")
+  msg := err.get("msg")
+  str(ln) + ":" + str(cl) + ": " + msg
+
+-- ── Predicate ────────────────────────────────────────────────────────────────
+-- Returns true when val is a map whose "kind" field ends with "_error".
+
+fn is_error(val)
+  if val == nil
+    return false
+  k := val.get("kind")
+  if k == nil
+    return false
+  -- check suffix "_error" (6 chars)
+  ks := str(k)
+  klen := ks.len
+  if klen < 6
+    return false
+  -- build suffix by slicing last 6 characters
+  suffix = ""
+  i = klen - 6
+  chars := ks.chars()
+  while i < klen
+    suffix = suffix + chars[i]
+    i = i + 1
+  suffix == "_error"

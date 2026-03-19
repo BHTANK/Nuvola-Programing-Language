@@ -1,0 +1,110 @@
+-- M14+ finalize test: math, system, string, list, JSON, try/catch
+
+-- ── Math ──────────────────────────────────────────────────────────────────────
+pi := 3.141592653589793
+assert(abs(sin(pi) - 0.0) < 0.0001, "sin(pi) failed")
+assert(abs(cos(0.0) - 1.0) < 0.0001, "cos(0) failed")
+assert(abs(exp(1.0) - 2.71828) < 0.001, "exp(1) failed")
+assert(abs(log(2.71828) - 1.0) < 0.001, "log(e) failed")
+assert(abs(log2(8.0) - 3.0) < 0.0001, "log2(8) failed")
+assert(abs(log10(100.0) - 2.0) < 0.0001, "log10(100) failed")
+assert(abs(pow(2.0, 10.0) - 1024.0) < 0.01, "pow(2,10) failed")
+assert(floor(3.9) == 3, "floor failed")
+assert(ceil(3.1) == 4, "ceil failed")
+assert(round(3.5) == 4, "round failed")
+assert(sqrt(9.0).to_int() == 3, "sqrt failed")
+print("Math OK")
+
+-- ── System ────────────────────────────────────────────────────────────────────
+t0 := time_ms()
+t1 := time_ms()
+assert(t1 >= t0, "time_ms monotonic failed")
+print("System OK: time_ms=" + str(t0))
+
+-- ── String methods ────────────────────────────────────────────────────────────
+s := "hello"
+assert(s.repeat(3) == "hellohellohello", "repeat failed")
+assert("hello world".index_of("world") == 6, "index_of failed")
+assert("hello world".index_of("xyz") == -1, "index_of miss failed")
+assert("hello world".slice(6, 11) == "world", "slice failed")
+assert("hello world".slice(0, 5) == "hello", "slice start failed")
+print("String methods OK")
+
+-- ── List methods ─────────────────────────────────────────────────────────────
+lst := [3, 1, 4, 1, 5, 9, 2, 6]
+assert(lst.first() == 3, "first failed")
+assert(lst.last() == 6, "last failed")
+
+a := [1, 2, 3]
+b := [4, 5, 6]
+z := a.zip(b)
+assert(z.len == 3, "zip len failed")
+assert(z[0][0] == 1, "zip[0][0] failed")
+assert(z[0][1] == 4, "zip[0][1] failed")
+
+nested := [[1, 2], [3, 4], [5]]
+flat := nested.flatten()
+assert(flat.len == 5, "flatten len failed")
+assert(flat[2] == 3, "flatten[2] failed")
+
+dup := [1, 2, 2, 3, 1, 4]
+u := dup.unique()
+assert(u.len == 4, "unique len failed")
+
+nums := [10, 20, 30]
+en := nums.enumerate()
+assert(en[0][0] == 0, "enumerate idx failed")
+assert(en[0][1] == 10, "enumerate val failed")
+assert(en[2][0] == 2, "enumerate idx2 failed")
+print("List methods OK")
+
+-- ── JSON ─────────────────────────────────────────────────────────────────────
+data := {"name": "Nuvola", "version": 1, "ready": true}
+js := json_stringify(data)
+assert(js.contains("Nuvola"), "stringify name failed")
+assert(js.contains("1"), "stringify version failed")
+
+json_obj_str := "{" + "\"x\": 42, \"y\": 3.14" + "}"
+parsed := json_parse(json_obj_str)
+assert(parsed.get("x") == 42, "json_parse int failed")
+
+arr_js := "[1, 2, 3]"
+arr := json_parse(arr_js)
+assert(arr.len == 3, "json_parse array len failed")
+assert(arr[1] == 2, "json_parse array[1] failed")
+
+roundtrip := json_stringify(json_parse("[\"a\", \"b\", \"c\"]"))
+assert(roundtrip.contains("a"), "roundtrip failed")
+print("JSON OK")
+
+-- ── try / catch / throw ───────────────────────────────────────────────────────
+caught = false
+try
+  throw "oops"
+catch e
+  caught = true
+  assert(e == "oops", "catch value wrong: {e}")
+
+assert(caught, "catch block not reached")
+
+-- throw an int
+try
+  throw 99
+catch e2
+  assert(e2 == 99, "catch int failed")
+
+-- nested try: inner catches, outer unaffected
+outer_ok = false
+try
+  try
+    throw "inner"
+  catch ie
+    assert(ie == "inner", "inner catch failed")
+  outer_ok = true
+catch _
+  assert(false, "outer should not catch")
+
+assert(outer_ok, "outer_ok false")
+print("try/catch OK")
+
+print("ALL FINALIZE TESTS PASSED")

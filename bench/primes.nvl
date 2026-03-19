@@ -1,0 +1,30 @@
+-- Benchmark 3: Sieve of Eratosthenes
+-- Tests: list allocation, indexed writes, boolean logic
+
+fn sieve(limit)
+  -- Build boolean list: true = prime candidate
+  composite := []
+  i := 0
+  while i <= limit
+    composite.push(false)
+    i = i + 1
+  -- Mark composites
+  p := 2
+  while p * p <= limit
+    if composite[p] == false
+      mult := p * p
+      while mult <= limit
+        composite[mult] = true
+        mult = mult + p
+    p = p + 1
+  -- Count primes
+  count := 0
+  n := 2
+  while n <= limit
+    if composite[n] == false
+      count = count + 1
+    n = n + 1
+  count
+
+result := sieve(1000000)
+print("primes below 1_000_000 = " + str(result))

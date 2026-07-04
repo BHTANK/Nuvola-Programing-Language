@@ -81,21 +81,29 @@ window.addEventListener('contextmenu', e => e.preventDefault());
 function key(c) { return !!keys[c]; }
 // mouse-look (pointer lock)
 let mouseYaw = 0, mousePitch = 0.18, ptrLocked = false, lastMouseMove = 0;
+let camZoom = 1;                                     // Ctrl+wheel camera distance
 document.addEventListener('pointerlockchange', () => {
   ptrLocked = document.pointerLockElement !== null;
 });
 window.addEventListener('mousemove', e => {
   if (!ptrLocked) return;
   mouseYaw += (e.movementX || 0) * 0.0032;
-  mousePitch = clamp(mousePitch + (e.movementY || 0) * 0.0022, -0.06, 0.7);
+  mousePitch = clamp(mousePitch + (e.movementY || 0) * 0.0022, -1.45, 1.45);   // near-vertical both ways
   lastMouseMove = performance.now();
 });
 window.addEventListener('wheel', e => {
+  if (e.ctrlKey) {
+    // Ctrl + wheel: camera distance (works on foot and in vehicles)
+    e.preventDefault();
+    if (state !== 'play') return;
+    camZoom = clamp(camZoom * (e.deltaY > 0 ? 1.1 : 0.9), 0.5, 2.4);
+    return;
+  }
   if (state !== 'play' || paused || shopOpen || player.car) return;
   const i = WORDER.indexOf(player.weapon);
   const step = e.deltaY > 0 ? 1 : WORDER.length - 1;
   player.weapon = WORDER[(i + step) % WORDER.length];
-});
+}, { passive: false });
 // ---------------------------------------------------------------- cheat console
 const consoleEl = document.getElementById('console');
 let godMode = false;
@@ -2052,13 +2060,13 @@ function updCopCar(c, dt) {
   if (!player.car && Math.abs(c.speed) > 120 && d < 24 && player.hurtT <= 0) { hurtPlayer(35); player.hurtT = 0.6; }
 }
 function fireShell(c, ang) {
-  const s = { x: c.x + Math.cos(ang) * (c.len / 2 + 14), y: c.y + Math.sin(ang) * (c.len / 2 + 14), vx: Math.cos(ang) * 520, vy: Math.sin(ang) * 520, life: 1.1, src: c, pby: false, done: false, h: 3.5, mesh: grabMesh(shellMeshes) };
+  const s = { x: c.x + Math.cos(ang) * (c.len / 2 + 14), y: c.y + Math.sin(ang) * (c.len / 2 + 14), vx: Math.cos(ang) * 520, vy: Math.sin(ang) * 520, life: 1.1, src: c, pby: false, done: false, h: 3.5, vh: 0, mesh: grabMesh(shellMeshes) };
   shells.push(s);
   addPart(s.x, s.y, 3.5, 0, 0, 0, 0.07, 0xffe9a0, 2.4, true);
   sfx('cannon');
 }
-function fireRocket(x, y, ang) {
-  const s = { x: x + Math.cos(ang) * 20, y: y + Math.sin(ang) * 20, vx: Math.cos(ang) * 430, vy: Math.sin(ang) * 430, life: 1.4, src: null, pby: true, done: false, h: 1.5, mesh: grabMesh(shellMeshes) };
+function fireRocket(x, y, ang, vh) {
+  const s = { x: x + Math.cos(ang) * 20, y: y + Math.sin(ang) * 20, vx: Math.cos(ang) * 430, vy: Math.sin(ang) * 430, life: 1.4, src: null, pby: true, done: false, h: 1.6, vh: vh || 0, mesh: grabMesh(shellMeshes) };
   shells.push(s);
   sfx('rocket');
 }
@@ -2066,13 +2074,15 @@ function updShells(dt) {
   for (const s of shells) {
     if (s.done) continue;
     s.x += s.vx * dt; s.y += s.vy * dt;
+    if (s.h === undefined) s.h = 1.6;
+    s.h += (s.vh || 0) * dt;
     s.life -= dt;
-    if (s.mesh) s.mesh.position.set(s.x * RS, s.h || 1.6, s.y * RS);
-    let boom = s.life <= 0 || solidAtPx(s.x, s.y);
+    if (s.mesh) s.mesh.position.set(s.x * RS, s.h, s.y * RS);
+    let boom = s.life <= 0 || s.h <= 0.2 || (s.h < 14 && solidAtPx(s.x, s.y));
     let hitCar = null;
-    if (!boom) for (const c of cars) { if (c.dead || c === s.src) continue; if (dist(c.x, c.y, s.x, s.y) < c.len / 2) { boom = true; hitCar = c; break; } }
-    if (!boom) for (const p of peds) { if (!p.dead && dist(p.x, p.y, s.x, s.y) < 12) { boom = true; break; } }
-    if (!boom && !player.car && !s.pby && dist(player.x, player.y, s.x, s.y) < 14) boom = true;
+    if (!boom && s.h < 7) for (const c of cars) { if (c.dead || c === s.src) continue; if (dist(c.x, c.y, s.x, s.y) < c.len / 2) { boom = true; hitCar = c; break; } }
+    if (!boom && s.h < 5) for (const p of peds) { if (!p.dead && dist(p.x, p.y, s.x, s.y) < 12) { boom = true; break; } }
+    if (!boom && s.h < 5 && !player.car && !s.pby && dist(player.x, player.y, s.x, s.y) < 14) boom = true;
     if (boom) {
       s.done = true;
       if (s.mesh) { s.mesh.visible = false; s.mesh = null; }
@@ -2330,8 +2340,8 @@ function hurtPlayer(dmg) {
   sfx('hurt');
   if (player.hp <= 0) wasted();
 }
-function spawnBullet(x, y, vx, vy, life, dmg, cdmg, from) {
-  bullets.push({ x, y, vx, vy, life, dmg, cdmg, from, mesh: grabMesh(bulletMeshes) });
+function spawnBullet(x, y, vx, vy, life, dmg, cdmg, from, h, vh) {
+  bullets.push({ x, y, vx, vy, life, dmg, cdmg, from, h: h === undefined ? 1.5 : h, vh: vh || 0, mesh: grabMesh(bulletMeshes) });
 }
 function computeAim() {
   aimTarget = null;
@@ -2398,16 +2408,18 @@ function fireWeapon() {
   if (W.rocket) {
     player.fireT = W.rate;
     player.ammo.rpg--;
-    fireRocket(player.x, player.y, aimAng);
+    fireRocket(player.x, player.y, aimAng, aimTarget ? 0 : Math.tan(-mousePitch) * 430 * RS);
     scare(player.x, player.y, 280);
     return;
   }
   player.ammo[player.weapon]--;
   player.fireT = W.rate;
   const n = W.pellets || 1;
+  // shots follow the crosshair's vertical angle too (locked targets aim level)
+  const vh0 = aimTarget ? 0 : Math.tan(-mousePitch) * W.spd * RS;
   for (let i = 0; i < n; i++) {
     const ang = aimAng + (Math.random() - 0.5) * 2 * W.spread;
-    spawnBullet(player.x + Math.cos(aimAng) * 16, player.y + Math.sin(aimAng) * 16, Math.cos(ang) * W.spd, Math.sin(ang) * W.spd, W.life, W.dmg, W.cdmg, 'p');
+    spawnBullet(player.x + Math.cos(aimAng) * 16, player.y + Math.sin(aimAng) * 16, Math.cos(ang) * W.spd, Math.sin(ang) * W.spd, W.life, W.dmg, W.cdmg, 'p', 1.9, vh0);
   }
   addPart(player.x + Math.cos(aimAng) * 18, player.y + Math.sin(aimAng) * 18, 2.1, 0, 0, 0, 0.05, 0xffe9a0, 1.4, true);
   sfx(W.sfx);
@@ -2961,11 +2973,13 @@ function update(dt) {
     b.life -= dt;
     if (b.life <= 0) continue;
     b.x += b.vx * dt; b.y += b.vy * dt;
-    if (b.mesh) b.mesh.position.set(b.x * RS, 1.5, b.y * RS);
-    if (solidAtPx(b.x, b.y)) { b.life = 0; sparks(b.x, b.y); continue; }
+    b.h += b.vh * dt;
+    if (b.mesh) b.mesh.position.set(b.x * RS, b.h, b.y * RS);
+    if (b.h <= 0) { b.life = 0; sparks(b.x, b.y); continue; }                    // ground impact
+    if (b.h < 14 && solidAtPx(b.x, b.y)) { b.life = 0; sparks(b.x, b.y); continue; }
     for (const p of peds) {
       if (p.dead) continue;
-      if (dist(p.x, p.y, b.x, b.y) < 11) {
+      if (b.h <= 4.5 && dist(p.x, p.y, b.x, b.y) < 11) {
         p.hp -= b.dmg;
         bloodFx(p.x, p.y);
         b.life = 0;
@@ -2977,7 +2991,7 @@ function update(dt) {
     if (b.life <= 0) continue;
     for (const c of cars) {
       if (c.dead || (b.from === 'p' && c === player.car)) continue;
-      if (dist(c.x, c.y, b.x, b.y) < c.len / 2) {
+      if (b.h <= 6 && dist(c.x, c.y, b.x, b.y) < c.len / 2) {
         if (c.kind !== 'tank') carDamage(c, b.cdmg || 5, b.from === 'p' ? 'p' : null);
         sparks(b.x, b.y);
         b.life = 0;
@@ -2987,8 +3001,8 @@ function update(dt) {
     }
     if (b.life <= 0) continue;
     if (b.from === 'c') {
-      if (!player.car && dist(player.x, player.y, b.x, b.y) < 11) { hurtPlayer(b.dmg); bloodFx(player.x, player.y); b.life = 0; }
-      else if (player.car && dist(player.car.x, player.car.y, b.x, b.y) < player.car.len / 2) { if (player.car.kind !== 'tank') carDamage(player.car, 3); b.life = 0; }
+      if (!player.car && b.h <= 4.5 && dist(player.x, player.y, b.x, b.y) < 11) { hurtPlayer(b.dmg); bloodFx(player.x, player.y); b.life = 0; }
+      else if (player.car && b.h <= 6 && dist(player.car.x, player.car.y, b.x, b.y) < player.car.len / 2) { if (player.car.kind !== 'tank') carDamage(player.car, 3); b.life = 0; }
     }
   }
 
@@ -3214,24 +3228,30 @@ function syncScene(dt, t) {
   }
   const f = focus();
   camYaw = mouseYaw;                                  // mouse drives the camera directly
-  const cd = player.car ? (player.car.kind === 'tank' ? 26 : 18) : 10.5;
-  const hDist = cd * Math.cos(mousePitch);
-  const ch = 2.2 + cd * Math.sin(mousePitch) + (player.car ? 1.6 : 0);
+  const cd = (player.car ? (player.car.kind === 'tank' ? 26 : 18) : 10.5) * camZoom;
+  // full free-look: view direction from yaw + pitch (+pitch looks down, -pitch up);
+  // the camera orbits a shoulder-height pivot and LOOKS ALONG this ray, so the
+  // crosshair is exactly the camera's line of sight
+  const cvp = Math.cos(mousePitch), svp = Math.sin(mousePitch);
+  const dirX = Math.cos(camYaw) * cvp, dirY = -svp, dirZ = Math.sin(camYaw) * cvp;
   const fx = f.x * RS, fz = f.y * RS;
+  const pivotY = player.car ? 4 : 3.2;
   // camera collision: pull in so we never sit inside a building
   let tMax = 1;
+  const hDist = cd * cvp;
   for (let i = 1; i <= 8; i++) {
     const tt = i / 8;
     if (solidAtPx(f.x - Math.cos(camYaw) * (hDist / RS) * tt, f.y - Math.sin(camYaw) * (hDist / RS) * tt)) { tMax = (i - 1) / 8; break; }
   }
-  const cdEff = hDist * Math.max(0.2, tMax);
-  const dx = fx - Math.cos(camYaw) * cdEff;
-  const dz = fz - Math.sin(camYaw) * cdEff;
+  const cdEff = cd * Math.max(0.2, tMax);
+  const dx = fx - dirX * cdEff;
+  const dy = Math.max(0.5, pivotY - dirY * cdEff);    // never below the pavement
+  const dz = fz - dirZ * cdEff;
   camPos.x += (dx - camPos.x) * Math.min(1, dt * 14);
-  camPos.y += (ch - camPos.y) * Math.min(1, dt * 10);
+  camPos.y += (dy - camPos.y) * Math.min(1, dt * 10);
   camPos.z += (dz - camPos.z) * Math.min(1, dt * 14);
   camera.position.copy(camPos);
-  camera.lookAt(fx, 2.6, fz);
+  camera.lookAt(camPos.x + dirX * 30, camPos.y + dirY * 30, camPos.z + dirZ * 30);
 }
 
 // ---------------------------------------------------------------- HUD
@@ -3241,6 +3261,7 @@ const CONTROLS = [
   'Click ................ shoot at the crosshair (soft lock)',
   'E .................... car / phone / shop / hot dog',
   'Wheel or 1-7 / Q ..... weapons      Shift ... sprint',
+  'Ctrl + Wheel ......... camera distance',
   'Space handbrake   R radio   P pause   M mute   Esc frees mouse',
   'Respray shop: drive in, $200 clears your stars',
   'Pass 3 phone jobs to open the Harbor Bridge'

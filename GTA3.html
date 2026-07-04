@@ -8,11 +8,16 @@
   html,body{margin:0;padding:0;overflow:hidden;background:#05050a;height:100%;}
   #gl{display:block;position:absolute;top:0;left:0;}
   #hud{display:block;position:absolute;top:0;left:0;pointer-events:none;}
+  #console{display:none;position:absolute;left:50%;transform:translateX(-50%);bottom:14px;
+    width:min(640px,80%);padding:10px 14px;background:rgba(5,8,14,0.92);color:#3fdc5f;
+    border:1px solid #3fdc5f;outline:none;font:bold 15px monospace;z-index:10;border-radius:4px;}
+  #console::placeholder{color:#2a8f42;}
 </style>
 </head>
 <body>
 <canvas id="gl"></canvas>
 <canvas id="hud"></canvas>
+<input id="console" autocomplete="off" spellcheck="false" placeholder="enter cheat code or JS....">
 <script>
 /**
  * @license
@@ -60,12 +65,17 @@ const keys = {};
 const pressed = new Set();
 let mdown = false;
 window.addEventListener('keydown', e => {
+  if (document.activeElement === consoleEl) return;   // typing in the cheat console
   if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
   if (!keys[e.code]) pressed.add(e.code);
   keys[e.code] = true;
 });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
-window.addEventListener('mousedown', () => { mdown = true; onClick(); });
+window.addEventListener('mousedown', e => {
+  if (e.target === consoleEl) return;       // typing/clicking the console is not gameplay
+  mdown = true;
+  onClick();
+});
 window.addEventListener('mouseup', () => { mdown = false; });
 window.addEventListener('contextmenu', e => e.preventDefault());
 function key(c) { return !!keys[c]; }
@@ -85,6 +95,57 @@ window.addEventListener('wheel', e => {
   const i = WORDER.indexOf(player.weapon);
   const step = e.deltaY > 0 ? 1 : WORDER.length - 1;
   player.weapon = WORDER[(i + step) % WORDER.length];
+});
+// ---------------------------------------------------------------- cheat console
+const consoleEl = document.getElementById('console');
+let godMode = false;
+function syncConsole() {
+  // console lives on the pause screen AND the title screen (pre-game testing)
+  const show = (paused && state === 'play') || state === 'menu';
+  if (show) {
+    consoleEl.style.display = 'block';
+    if (paused) consoleEl.focus();           // on the menu, click it to type
+  } else {
+    consoleEl.style.display = 'none';
+    consoleEl.blur();
+  }
+}
+function runConsole(raw) {
+  const cmd = raw.trim().toLowerCase();
+  if (!cmd) return;
+  let out;
+  if (cmd === 'fix car') {
+    if (player.car) {
+      player.car.hp = CAR_KINDS[player.car.kind].hp;
+      player.car.onFireT = 0;
+      player.car.burnT = 0;
+      out = 'Vehicle repaired.';
+    } else out = 'You are not in a vehicle.';
+  } else if (cmd === 'shut up and take my money') {
+    player.ammo.pistol = 999; player.ammo.uzi = 999; player.ammo.shotgun = 999;
+    player.ammo.flame = 999; player.ammo.grenade = 99; player.ammo.rpg = 99;
+    player.armor = 100;
+    if (player.weapon === 'fist') player.weapon = 'pistol';
+    out = 'All weapons, max ammo, full armor.';
+  } else if (cmd === 'medic') {
+    player.hp = 100;
+    out = 'Patched up.';
+  } else if (cmd === 'in god we trust') {
+    godMode = !godMode;
+    out = godMode ? 'Invincibility ON.' : 'Invincibility OFF.';
+  } else {
+    // raw JS injection — this is your game, break it however you like
+    try { const r = eval(raw); out = r === undefined ? 'OK.' : String(r).slice(0, 90); }
+    catch (e) { out = 'ERR: ' + e.message; }
+  }
+  consoleEl.placeholder = out;
+  msg('CONSOLE: ' + out);
+  sfx('pickup');
+}
+consoleEl.addEventListener('keydown', e => {
+  e.stopPropagation();
+  if (e.key === 'Enter') { runConsole(consoleEl.value); consoleEl.value = ''; }
+  else if (e.key === 'Escape') { paused = false; consoleEl.blur(); syncConsole(); }
 });
 
 // ---------------------------------------------------------------- audio
@@ -190,7 +251,8 @@ function solidAtPx(x, y) {
 function isBridge(ix, iy) { return (iy === 28 || iy === 29 || iy === 64 || iy === 65) && ix >= 54 && ix <= 83; }
 const buildings = [], trees = [], pickups = [], phones = [], lamps = [], pads = [], gunShops = [], foodCarts = [];
 const props = { cranes: [], tanks: [], stacks: [], conts: [], bills: [], masts: [], ponds: [], gas: [], steeples: [], signs: [], tcranes: [], ships: [] };
-let stadiumPos = null;
+let stadiumPos = null, policeStation = null, DISTRICT_MAP = null;
+let policePads = [];
 let hospitals = [], playerStart = null, armyBase = null;
 const bridgesOpen = [false, false];
 function anyBridgeOpen() { return bridgesOpen[0] || bridgesOpen[1]; }
@@ -282,6 +344,7 @@ function genCity() {
     }
     return placed;
   }
+  DISTRICT_MAP = DISTRICT;
   for (const cb of [4, 16, 28, 40, 84, 96, 108, 120]) {
     for (const rb of ROADROW_BASES.slice(0, 7)) {
       const x0 = cb + 3, y0 = rb + 3;
@@ -361,6 +424,16 @@ function genCity() {
           tx: x0 + 1, ty: y0 + 2, tw: 6, th: 4, floors: 4,
           tint: kind === 'police' ? 0x2e3e55 : 0x5c6168, tex: 'conc', sign: kind
         });
+        if (kind === 'police') {
+          policeStation = { x: (x0 + 4) * TILE, y: (y0 + 4) * TILE };
+          // parking spots on the precinct lot for spare cruisers
+          policePads = [
+            { x: (x0 + 0.5) * TILE, y: (y0 + 1) * TILE },
+            { x: (x0 + 7.5) * TILE, y: (y0 + 3.5) * TILE },
+            { x: (x0 + 2.5) * TILE, y: (y0 + 7) * TILE },
+            { x: (x0 + 6) * TILE, y: (y0 + 7) * TILE }
+          ];
+        }
       } else if (kind === 'mall') {
         paveAll(x0, y0);
         markSolidRect(x0 + 1, y0 + 1, 6, 5);
@@ -462,6 +535,17 @@ genCity();
 
 // zone names
 function zoneOf(x) { return islandOfPx(x) === 0 ? 'OLD PORT' : islandOfPx(x) === 1 ? 'NUVOLA HEIGHTS' : 'HARBOR BRIDGE'; }
+// which district block a position sits in (null on roads/bridges/water)
+function districtAt(x, y) {
+  const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
+  for (const cb of [4, 16, 28, 40, 84, 96, 108, 120]) {
+    if (ix < cb + 2 || ix > cb + 11) continue;
+    for (const rb of [4, 16, 28, 40, 52, 64, 76]) {
+      if (iy >= rb + 2 && iy <= rb + 11) return DISTRICT_MAP[cb + ',' + rb] || null;
+    }
+  }
+  return null;
+}
 
 // minimap prerender
 const mm = document.createElement('canvas');
@@ -499,7 +583,7 @@ function mkCar(x, y, dir, kind, driver) {
     color: k.color !== null ? k.color : CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)],
     len: k.len, w: k.w, laneX: x, laneY: y, lastInter: '', keep: false,
     stuck: 0, revT: 0, smokeT: 0, burnT: 0, dead: false, dmgBy: null, deployT: 0,
-    turret: dirAng(dir), fireT: 0, onFireT: 0, fireBy: null, mesh: null
+    turret: dirAng(dir), fireT: 0, onFireT: 0, fireBy: null, mesh: null, stolen: false
   };
 }
 function mkPed(x, y, opts) {
@@ -527,14 +611,29 @@ const player = {
   x: 0, y: 0, angle: 0, hp: 100, armor: 0, cash: 0, car: null, weapon: 'pistol',
   ammo: { pistol: 60, uzi: 0, shotgun: 0, flame: 0, grenade: 0, rpg: 0 }, fireT: 0, hurtT: 0, dead: false, mesh: null, aimHold: 0, rag: null
 };
-let heat = 0, heatTimer = 0, frenzy = null, aimTarget = null;
+let heat = 0, wantedClearT = 0, copSeen = false, seenTick = 0, frenzy = null, aimTarget = null;
 let best = 0;
 try { best = parseInt(localStorage.getItem('gta3_best_cash') || '0', 10) || 0; } catch (e) {}
 function saveBest() {
   if (player.cash > best) { best = player.cash; try { localStorage.setItem('gta3_best_cash', String(best)); } catch (e) {} }
 }
 function stars() { return Math.min(5, Math.floor(heat)); }
-function addHeat(n) { heat = Math.min(5.9, heat + n); heatTimer = 14; }
+function addHeat(n) { heat = Math.min(5.9, heat + n); wantedClearT = 30; }
+function setWanted(n) { heat = Math.max(heat, Math.min(5.9, n)); wantedClearT = 30; }
+// any officer or military unit with eyes on you (empty parked cars can't see)
+function policeCanSee() {
+  const t = focus();
+  for (const p of peds) {
+    if (!p.cop || p.dead) continue;
+    if (dist(p.x, p.y, t.x, t.y) < 650 && hasLOS(p.x, p.y, t.x, t.y)) return true;
+  }
+  for (const c of cars) {
+    if (c.dead) continue;
+    if (c.driver !== 'cop' && !(c.kind === 'cop' && c.driver === 'ai')) continue;
+    if (dist(c.x, c.y, t.x, t.y) < 650 && hasLOS(c.x, c.y, t.x, t.y)) return true;
+  }
+  return false;
+}
 function focus() { return player.car || player; }
 function msg(t) { msgs.push({ t, life: 4 }); if (msgs.length > 4) msgs.shift(); }
 
@@ -1008,14 +1107,19 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
     g.rotation.y = -cr.rot;
     scene.add(g);
   }
-  // container stacks (classic pre-darkened container colors)
-  const contGeo = new THREE.BoxGeometry(18, 3.1, 4.6);
+  // shipping containers at true scale (~10m x 2.4m x 2.4m each). Each stack
+  // is a DOUBLE row filling its whole 2x1-tile solid footprint, so the
+  // collision wall is exactly where the steel is — no invisible margins.
+  const contGeo = new THREE.BoxGeometry(22, 5.4, 5.4);
   const CONT_MATS = [0x7a2e22, 0x1f4e79, 0x1f5c33, 0xb35418, 0x5a5f63, 0x5c2331, 0x8a7a55].map(c => new THREE.MeshLambertMaterial({ color: c }));
   for (const ct of props.conts) {
-    for (let t2 = 0; t2 < ct.tiers; t2++) {
-      const m = new THREE.Mesh(contGeo, CONT_MATS[(Math.random() * CONT_MATS.length) | 0]);
-      m.position.set(ct.x * RS + rndf(-0.4, 0.4), 1.55 + t2 * 3.12, ct.y * RS + rndf(-0.3, 0.3));
-      scene.add(m);
+    for (const rowZ of [-3, 3]) {
+      const tiers = Math.max(1, ct.tiers - (Math.random() < 0.4 ? 1 : 0));   // uneven skyline
+      for (let t2 = 0; t2 < tiers; t2++) {
+        const m = new THREE.Mesh(contGeo, CONT_MATS[(Math.random() * CONT_MATS.length) | 0]);
+        m.position.set(ct.x * RS + rndf(-0.5, 0.5), 2.75 + t2 * 5.45, ct.y * RS + rowZ);
+        scene.add(m);
+      }
     }
   }
   // fuel tanks (squat, with a top rim)
@@ -1110,8 +1214,8 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
     scene.add(sup);
     for (let i2 = 0; i2 < 5; i2++) {
       const m = new THREE.Mesh(contGeo, CONT_MATS[(Math.random() * CONT_MATS.length) | 0]);
-      m.scale.set(0.45, 1, 1);
-      m.position.set(sx2 - 8 + i2 * 9, 7.2, sz2 + (i2 % 2 ? 2.5 : -2.5));
+      m.scale.set(0.4, 0.9, 0.9);
+      m.position.set(sx2 - 20 + i2 * 10, 8.1, sz2 + (i2 % 2 ? 2.8 : -2.8));
       scene.add(m);
     }
   }
@@ -1691,14 +1795,52 @@ function spawnPed() {
     return;
   }
 }
-function spawnCopFoot() {
+function spawnCopFoot(patrol) {
   const f = focus();
   const p = roadPoint(f.x, f.y, 450, 900);
   const s = findSidewalkNear(p.ix, p.iy);
-  const cop = mkPed(s.x, s.y, { cop: true, hp: 50, spd: 132, shirt: 0x20306a });
+  const cop = mkPed(s.x, s.y, { cop: true, hp: 50, spd: patrol ? 40 : 132, shirt: 0x20306a, patrol: !!patrol });
   attachPedMesh(cop);
   cop.mesh.userData.gun.visible = true;
   peds.push(cop);
+}
+function spawnStationCop() {
+  const jx = ((Math.random() * 7) | 0) - 3, jy = ((Math.random() * 7) | 0) - 3;
+  const s2 = findSidewalkNear(Math.floor(policeStation.x / TILE) + jx, Math.floor(policeStation.y / TILE) + jy);
+  const cop = mkPed(s2.x, s2.y, { cop: true, hp: 50, spd: 40, shirt: 0x20306a, patrol: true });
+  attachPedMesh(cop);
+  cop.mesh.userData.gun.visible = true;
+  peds.push(cop);
+}
+function spawnStationCar() {
+  // an unoccupied cruiser on one of the precinct parking pads
+  for (let t = 0; t < 6; t++) {
+    const pad = policePads[(Math.random() * policePads.length) | 0];
+    const c = mkCar(pad.x, pad.y, (Math.random() * 4) | 0, 'cop', null);
+    if (carHitsSolid(c)) continue;
+    let clear = true;
+    for (const o of cars) if (dist(o.x, o.y, c.x, c.y) < 60) { clear = false; break; }
+    if (!clear) continue;
+    attachCarMesh(c);
+    cars.push(c);
+    return;
+  }
+}
+function spawnPatrolCar() {
+  // a beat cruiser that drives the lanes like ordinary traffic
+  const f = focus();
+  for (let t = 0; t < 30; t++) {
+    const p = roadPoint(f.x, f.y, 700, 1500);
+    if (isRoadColIdx(p.ix) && isRoadRowIdx(p.iy)) continue;
+    let clear = true;
+    for (const c of cars) if (dist(c.x, c.y, p.x, p.y) < 80) { clear = false; break; }
+    if (!clear) continue;
+    const c = mkCar(p.x, p.y, 0, 'cop', 'ai');
+    if (!laneSetup(c, p.ix, p.iy)) continue;
+    attachCarMesh(c);
+    cars.push(c);
+    return;
+  }
 }
 function spawnCopCar() {
   const f = focus();
@@ -2094,15 +2236,19 @@ function updPed(p, dt) {
     return;
   }
   if (p.cop) {
-    const d = dist(p.x, p.y, player.x, player.y);
-    p.angle = Math.atan2(player.y - p.y, player.x - p.x);
-    if (!player.car) {
-      moveCircle(p, Math.cos(p.angle) * p.spd * dt, Math.sin(p.angle) * p.spd * dt);
-      if (d < 22 && stars() >= 1) { p.bustT += dt; if (p.bustT > 0.4) { busted(); return; } }
-      else p.bustT = 0;
+    if (p.patrol && stars() > 0) { p.patrol = false; p.spd = 132; }   // beat cop joins the response
+    if (!p.patrol) {
+      const d = dist(p.x, p.y, player.x, player.y);
+      p.angle = Math.atan2(player.y - p.y, player.x - p.x);
+      if (!player.car) {
+        moveCircle(p, Math.cos(p.angle) * p.spd * dt, Math.sin(p.angle) * p.spd * dt);
+        if (d < 22 && stars() >= 1) { p.bustT += dt; if (p.bustT > 0.4) { busted(); return; } }
+        else p.bustT = 0;
+      }
+      if (stars() >= 2) pedShoot(p, dt);
+      return;
     }
-    if (stars() >= 2) pedShoot(p, dt);
-    return;
+    // patrolling at zero stars: amble the beat like anyone else (wander below)
   }
   if (p.goon) {
     const d = dist(p.x, p.y, player.x, player.y);
@@ -2177,6 +2323,7 @@ function killPed(p, byPlayer) {
 // ---------------------------------------------------------------- player combat
 function hurtPlayer(dmg) {
   if (player.dead) return;
+  if (godMode) return;                     // in god we trust
   const ab = Math.min(player.armor, dmg);
   player.armor -= ab;
   player.hp -= (dmg - ab);
@@ -2332,20 +2479,32 @@ function tryEnterExit() {
   }
   if (!bc) return false;
   if (bc.driver === 'ai') {
-    const dp = mkPed(bc.x + Math.cos(bc.angle + Math.PI / 2) * 20, bc.y + Math.sin(bc.angle + Math.PI / 2) * 20);
-    dp.state = 'flee'; dp.fleeT = 5; dp.angle = rndf(0, TAU);
-    attachPedMesh(dp);
-    peds.push(dp);
-    addHeat(0.4);
-    scare(bc.x, bc.y, 140);
-  } else if (bc.driver === 'cop') {
-    addHeat(1.5);
+    if (bc.kind === 'cop') {
+      // jacking a patrol cruiser ejects an officer, not a civilian
+      const op = mkPed(bc.x + Math.cos(bc.angle + Math.PI / 2) * 20, bc.y + Math.sin(bc.angle + Math.PI / 2) * 20,
+        { cop: true, hp: 50, spd: 132, shirt: 0x20306a });
+      attachPedMesh(op);
+      op.mesh.userData.gun.visible = true;
+      peds.push(op);
+    } else {
+      const dp = mkPed(bc.x + Math.cos(bc.angle + Math.PI / 2) * 20, bc.y + Math.sin(bc.angle + Math.PI / 2) * 20);
+      dp.state = 'flee'; dp.fleeT = 5; dp.angle = rndf(0, TAU);
+      attachPedMesh(dp);
+      peds.push(dp);
+      addHeat(0.4);
+      scare(bc.x, bc.y, 140);
+    }
   }
   bc.driver = 'player';
   bc.keep = true;
   bc.speed *= 0.3;
   player.car = bc;
-  if (bc.kind === 'tank') { addHeat(2); msg('Army hardware acquired!'); }
+  // stealing police property carries a mandatory wanted level
+  if (!bc.stolen) {
+    bc.stolen = true;
+    if (bc.kind === 'tank') { setWanted(5); msg('ARMY HARDWARE THEFT — maximum response!'); }
+    else if (bc.kind === 'cop') { setWanted(2); msg('Police vehicle theft!'); }
+  }
   sfx('enter');
   return true;
 }
@@ -2360,12 +2519,38 @@ function ensureCops(dt) {
   const footQ = s >= 1 ? s * 2 : 0;
   const carQ = s >= 2 ? s - 1 : 0;
   const tankQ = s >= 5 ? 1 : 0;
-  let foot = 0, cruis = 0, tanks = 0;
-  for (const p of peds) if (p.cop && !p.dead) foot++;
-  for (const c of cars) if (c.driver === 'cop' && !c.dead) { if (c.kind === 'tank') tanks++; else cruis++; }
-  if (foot < footQ) spawnCopFoot();
+  let foot = 0, cruis = 0, tanks = 0, pFoot = 0, pCars = 0, stationCars = 0;
+  for (const p of peds) if (p.cop && !p.dead) { if (p.patrol) pFoot++; else foot++; }
+  for (const c of cars) {
+    if (c.dead) continue;
+    if (c.driver === 'cop') { if (c.kind === 'tank') tanks++; else cruis++; }
+    else if (c.kind === 'cop' && c.driver === 'ai') {
+      pCars++;
+      if (s >= 2) c.driver = 'cop';        // the beat cruiser lights up and joins
+    } else if (c.kind === 'cop' && c.driver === null && policeStation && dist(c.x, c.y, policeStation.x, policeStation.y) < 500) stationCars++;
+  }
+  if (foot < footQ) spawnCopFoot(false);
   if (cruis < carQ) spawnCopCar();
   if (tanks < tankQ) spawnArmyTank();
+  if (s === 0) {
+    // ambient patrols are a CHANCE, not a guarantee — and the odds depend on
+    // the district: shopping streets see cops often, industrial areas rarely
+    const d2 = districtAt(player.x, player.y);
+    const busy = d2 === 'commercial' || d2 === 'mall' || d2 === 'gas' || d2 === 'towers';
+    const quiet = d2 === 'industry' || d2 === 'docks' || d2 === 'construction';
+    const footChance = busy ? 0.12 : quiet ? 0.025 : 0.06;
+    const carChance = busy ? 0.08 : quiet ? 0.015 : 0.04;
+    if (pFoot < (busy ? 2 : 1) && Math.random() < footChance) spawnCopFoot(true);
+    if (pCars < 1 && Math.random() < carChance) spawnPatrolCar();
+    // the precinct is almost never unguarded, with spare cruisers parked
+    // around the building at chance
+    if (policeStation && dist(player.x, player.y, policeStation.x, policeStation.y) < 1100) {
+      let near = 0;
+      for (const p of peds) if (p.cop && !p.dead && dist(p.x, p.y, policeStation.x, policeStation.y) < 500) near++;
+      if (near < 2) spawnStationCop();
+      if (stationCars < 2 && Math.random() < 0.2) spawnStationCar();
+    }
+  }
   if (cruis > 0 && s >= 2 && !muted) sirenOn(); else sirenOff();
 }
 
@@ -2415,7 +2600,7 @@ function updPads(dt) {
       continue;
     }
     player.cash -= 200;
-    heat = 0; heatTimer = 0;
+    heat = 0; wantedClearT = 0; copSeen = false;
     player.car.hp = CAR_KINDS[player.car.kind].hp;
     player.car.onFireT = 0;
     if (CAR_KINDS[player.car.kind].color === null) {
@@ -2605,7 +2790,7 @@ function respawn() {
   const isl = islandOfPx(player.x);
   const h = hospitals[isl === 1 ? 1 : 0];
   player.x = h.x; player.y = h.y;
-  heat = 0; heatTimer = 0;
+  heat = 0; wantedClearT = 0; copSeen = false;
   frenzy = null;
   for (const p of peds) if (p.cop) p.dead = true;
   for (const c of cars) if (c.driver === 'cop') c.dead = true;
@@ -2620,6 +2805,8 @@ function startGame() {
   player.y = playerStart.y;
   mouseYaw = player.angle;
   state = 'play';
+  mdown = false;                             // the click that started the game is not a trigger pull
+  syncConsole();
   msg('Nuvola City. Two islands. One night.');
   msg('Green payphones have work for you.');
   msg('Pass 3 jobs to open the Harbor Bridge.');
@@ -2627,6 +2814,7 @@ function startGame() {
 function onClick() {
   audioInit();
   if (state === 'menu') startGame();
+  if (paused) return;                      // clicking the cheat console must not grab the mouse
   if (state !== 'menu' && !ptrLocked) {
     try {
       const p = glCanvas.requestPointerLock();
@@ -2637,13 +2825,14 @@ function onClick() {
 
 // ---------------------------------------------------------------- update (sim)
 function update(dt) {
-  if (pressed.has('KeyM')) { muted = !muted; if (muted) sirenOff(); msg(muted ? 'Sound OFF' : 'Sound ON'); }
-  if (pressed.has('KeyR')) { radioOn = !radioOn; msg(radioOn ? 'Radio ON' : 'Radio OFF'); }
   if (state === 'menu') {
+    // no game inputs on the title screen — only Enter/click to play
     if (pressed.has('Enter')) { audioInit(); startGame(); }
     pressed.clear();
     return;
   }
+  if (pressed.has('KeyM')) { muted = !muted; if (muted) sirenOff(); msg(muted ? 'Sound OFF' : 'Sound ON'); }
+  if (pressed.has('KeyR')) { radioOn = !radioOn; msg(radioOn ? 'Radio ON' : 'Radio OFF'); }
   if (state === 'over') {
     overT -= dt;
     if (overT <= 0) respawn();
@@ -2661,7 +2850,7 @@ function update(dt) {
     pressed.clear();
     return;
   }
-  if (pressed.has('KeyP') || pressed.has('Escape')) paused = !paused;
+  if (pressed.has('KeyP') || pressed.has('Escape')) { paused = !paused; syncConsole(); }
   if (paused) { pressed.clear(); return; }
   if (pressed.has('KeyE') && !player.rag) { if (!tryShops()) { tryEnterExit(); tryPhone(); } }
   const digits = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7'];
@@ -2860,8 +3049,18 @@ function update(dt) {
     }
   }
 
-  heatTimer -= dt;
-  if (heatTimer < 0 && heat > 0) heat = Math.max(0, heat - 0.06 * dt);
+  // evasion: stars NEVER decay in pursuit. Break line of sight from every
+  // officer and survive a full 30s countdown — then all stars drop at once.
+  // Getting spotted resets the clock.
+  if (stars() > 0) {
+    seenTick -= dt;
+    if (seenTick <= 0) { seenTick = 0.25; copSeen = policeCanSee(); }
+    if (copSeen) wantedClearT = 30;
+    else {
+      wantedClearT -= dt;
+      if (wantedClearT <= 0) { heat = 0; msg('You lost them.'); sfx('pickup'); }
+    }
+  } else copSeen = false;
   ensureCops(dt);
   updMission(dt);
 
@@ -2879,7 +3078,8 @@ function update(dt) {
     const p = peds[i];
     const d = dist(p.x, p.y, f.x, f.y);
     if (p.dead) { removePedMesh(p); peds.splice(i, 1); continue; }
-    if (p.cop && (stars() === 0 || d > 1900)) { removePedMesh(p); peds.splice(i, 1); continue; }
+    if (p.cop && !p.patrol && (stars() === 0 || d > 1900)) { removePedMesh(p); peds.splice(i, 1); continue; }
+    if (p.cop && p.patrol && d > 1600) { removePedMesh(p); peds.splice(i, 1); continue; }
     if (p.despawnOk && d > 800) { removePedMesh(p); peds.splice(i, 1); continue; }
     if (!p.cop && !p.guard && !p.target && !p.warTarget && !p.goon && d > 1400) { removePedMesh(p); peds.splice(i, 1); }
   }
@@ -2889,6 +3089,7 @@ function update(dt) {
     if (c === player.car || c.keep) continue;
     const d = dist(c.x, c.y, f.x, f.y);
     if (c.driver === 'cop' && (stars() < 2 || d > 2200)) { removeCarMesh(c); cars.splice(i, 1); continue; }
+    if (c.driver === null && d > 1800) { removeCarMesh(c); cars.splice(i, 1); continue; }
     if (c.driver === 'ai' && d > 1700) { removeCarMesh(c); cars.splice(i, 1); }
   }
   for (let i = bullets.length - 1; i >= 0; i--) {
@@ -2912,9 +3113,14 @@ function syncScene(dt, t) {
     c.mesh.rotation.y = -c.angle;
     if (c.mesh.userData.turret) c.mesh.userData.turret.rotation.y = -(c.turret - c.angle);
     if (c.mesh.userData.copR) {
-      const flash = ((t * 6) | 0) % 2 === 0;
-      c.mesh.userData.copR.visible = flash;
-      c.mesh.userData.copB.visible = !flash;
+      if (c.driver === 'cop') {              // responding: bar flashes
+        const flash = ((t * 6) | 0) % 2 === 0;
+        c.mesh.userData.copR.visible = flash;
+        c.mesh.userData.copB.visible = !flash;
+      } else {                               // on patrol: bar steady
+        c.mesh.userData.copR.visible = true;
+        c.mesh.userData.copB.visible = true;
+      }
     }
   }
   // peds (ragdolls fly and tumble)
@@ -3068,6 +3274,9 @@ function drawHUD(t) {
     hctx.font = '16px monospace';
     hctx.fillStyle = '#888';
     hctx.fillText('BEST HAUL: $' + best, VW / 2, VH * 0.82);
+    hctx.font = '13px monospace';
+    hctx.fillStyle = '#3fdc5f';
+    hctx.fillText('console below — cheats or JS injection before you play', VW / 2, VH * 0.87);
     return;
   }
   // cash / health / armor / weapon
@@ -3085,6 +3294,11 @@ function drawHUD(t) {
   hctx.fillRect(16, 60, 154, 10);
   hctx.fillStyle = '#5fd0ff';
   hctx.fillRect(18, 62, 150 * clamp(player.armor / 100, 0, 1), 6);
+  if (godMode) {
+    hctx.fillStyle = '#ffd23f';
+    hctx.font = 'bold 11px monospace';
+    hctx.fillText('GOD', 176, 55);
+  }
   hctx.font = 'bold 15px monospace';
   hctx.fillStyle = '#fff';
   if (player.car && player.car.kind === 'tank') {
@@ -3108,9 +3322,16 @@ function drawHUD(t) {
   hctx.font = '26px monospace';
   hctx.textAlign = 'right';
   const s = stars();
+  const starShow = !(s > 0 && !copSeen) || ((t * 3) | 0) % 2 === 0;   // blink while evading
   for (let i = 0; i < 5; i++) {
-    hctx.fillStyle = i < s ? '#ffd23f' : 'rgba(255,255,255,0.15)';
+    hctx.fillStyle = i < s && starShow ? '#ffd23f' : 'rgba(255,255,255,0.15)';
     hctx.fillText('★', VW - 14 - i * 28, 36);
+  }
+  // evasion countdown under the stars — only while wanted
+  if (s > 0) {
+    hctx.font = 'bold 14px monospace';
+    hctx.fillStyle = copSeen ? '#ff5050' : '#3fdc5f';
+    hctx.fillText(copSeen ? 'SPOTTED' : 'CLEAR IN ' + Math.ceil(wantedClearT) + 's', VW - 14, 58);
   }
   // messages
   hctx.textAlign = 'center';
@@ -3387,7 +3608,29 @@ if (location.hash === '#heights') {
   const h = hospitals[1];
   player.x = h.x; player.y = h.y;
 }
+if (location.hash === '#cheat') {
+  // proves the console pipeline headlessly: all four cheats + JS injection + god toggle
+  startGame();
+  runConsole('medic');
+  const hp1 = player.hp;
+  runConsole('shut up and take my money');
+  runConsole('in god we trust');
+  const g1 = godMode;
+  hurtPlayer(500);
+  const hpGod = player.hp;
+  runConsole('in god we trust');           // same code entered again turns it OFF
+  const g2 = godMode;
+  player.armor = 0;
+  hurtPlayer(30);
+  const hpMortal = player.hp;
+  runConsole('player.cash = 777');
+  console.log('CHEATDBG hp=' + hp1 + ' rpg=' + player.ammo.rpg + ' armor100=' + (g1 && hpGod === 100) + ' godOn=' + g1 + ' godOff=' + !g2 + ' dmgAfterOff=' + (hpMortal === 70) + ' cash=' + player.cash);
+  setWanted(3);                              // so the HUD countdown is visible in this view
+  paused = true;
+  syncConsole();
+}
 console.log('GTA3 BOOT OK — buildings=' + buildings.length + ' lamps=' + lamps.length + ' peds=' + peds.length + ' cars=' + cars.length);
+syncConsole();
 requestAnimationFrame(frame);
 </script>
 </body>

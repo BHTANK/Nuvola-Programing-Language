@@ -3697,14 +3697,83 @@ function buildCarMesh(c) {
     g.userData.bodyMat = bodyMat;
     return g;
   }
-  // segmented so the frame can CRUMPLE: dentCar() bends these vertices
-  const body = new THREE.Mesh(new THREE.BoxGeometry(L, 1.15, W, 7, 2, 5), bodyMat);
-  body.position.y = 1.0;
+  // the hull is NOT one tall block: a low slab up to the beltline, a hood
+  // deck, a trunk deck — and an OPEN cabin well between them, so the
+  // interior really sits IN the car instead of buried inside metal.
+  // All three metal pieces are segmented and crumple with dentCar().
+  const body = new THREE.Mesh(new THREE.BoxGeometry(L, 0.875, W, 7, 2, 5), bodyMat);
+  body.position.y = 0.8625;                  // slab top = beltline 1.30
   g.add(body);
-  const cabMat = new THREE.MeshLambertMaterial({ color: 0x141e28 });
-  const cab = new THREE.Mesh(new THREE.BoxGeometry(L * (c.kind === 'truck' ? 0.3 : 0.48), 0.95, W * 0.84, 4, 2, 3), cabMat);
-  cab.position.set(c.kind === 'truck' ? L * 0.26 : -L * 0.05, 2.0, 0);
+  const cabX = c.kind === 'truck' ? L * 0.26 : -L * 0.05;
+  const cabL = L * (c.kind === 'truck' ? 0.3 : 0.48);
+  const hoodLen = L / 2 - (cabX + cabL / 2), trunkLen = (cabX - cabL / 2) + L / 2;
+  let hood = null, trunk = null;
+  if (hoodLen > 0.2) {
+    hood = new THREE.Mesh(new THREE.BoxGeometry(hoodLen, 0.275, W, 4, 1, 4), bodyMat);
+    hood.position.set(L / 2 - hoodLen / 2, 1.4375, 0);
+    g.add(hood);
+  }
+  if (trunkLen > 0.2) {
+    trunk = new THREE.Mesh(new THREE.BoxGeometry(trunkLen, 0.275, W, 4, 1, 4), bodyMat);
+    trunk.position.set(-L / 2 + trunkLen / 2, 1.4375, 0);
+    g.add(trunk);
+  }
+  const floor9 = new THREE.Mesh(new THREE.BoxGeometry(cabL, 0.1, W * 0.8), new THREE.MeshLambertMaterial({ color: 0x191d24, emissive: 0x0b0d11 }));
+  floor9.position.set(cabX, 1.05, 0);
+  g.add(floor9);
+  // CLEAR glass from the beltline to the roof
+  const cabMat = new THREE.MeshLambertMaterial({ color: 0x9fb6c9, transparent: true, opacity: 0.32 });
+  const cab = new THREE.Mesh(new THREE.BoxGeometry(cabL, 1.2, W * 0.84, 4, 2, 3), cabMat);
+  cab.position.set(cabX, 1.9, 0);
   g.add(cab);
+  const roof = new THREE.Mesh(new THREE.BoxGeometry(cabL * 1.04, 0.09, W * 0.86), new THREE.MeshLambertMaterial({ color: 0x10151c }));
+  roof.position.set(cabX, 2.52, 0);
+  g.add(roof);
+  // interior: BUCKET seats (base + side bolsters + backrest) that read
+  // through the glass at night, a raked wheel, and a SEATED driver whose
+  // head stays under the roof (cab interior tops out at 2.475)
+  const seatMat = new THREE.MeshLambertMaterial({ color: 0x4a5563, emissive: 0x232830 });
+  const bucketAt = (bx, bz) => {
+    const grp = new THREE.Group();
+    const base = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.16, 0.5), seatMat);
+    grp.add(base);
+    for (const bs of [-1, 1]) {
+      const bol = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.14, 0.08), seatMat);
+      bol.position.set(0, 0.11, bs * 0.27);
+      grp.add(bol);
+    }
+    const back = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.58, 0.5), seatMat);
+    back.position.set(-0.3, 0.3, 0);
+    grp.add(back);
+    grp.position.set(bx, 1.18, bz);   // standing on the cabin floor
+    g.add(grp);
+    return grp;
+  };
+  g.userData.bucketL = bucketAt(cabX + cabL * 0.12, -W * 0.18);
+  bucketAt(cabX + cabL * 0.12, W * 0.18);
+  if (c.kind !== 'truck') {
+    const rb1 = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.16, W * 0.6), seatMat);
+    rb1.position.set(cabX - cabL * 0.34, 1.18, 0);
+    g.add(rb1);
+    const rb2 = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.56, W * 0.6), seatMat);
+    rb2.position.set(cabX - cabL * 0.34 - 0.3, 1.46, 0);
+    g.add(rb2);
+  }
+  const wheelM = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.06, 10), new THREE.MeshLambertMaterial({ color: 0x14161a, emissive: 0x0c0e12 }));
+  wheelM.rotation.z = 1.05;
+  wheelM.position.set(cabX + cabL * 0.44, 1.55, -W * 0.18);
+  g.add(wheelM);
+  const fig = new THREE.Group();
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.5, 0.4), new THREE.MeshLambertMaterial({ color: 0x35404d, emissive: 0x10131a }));
+  torso.position.y = 0.25;                   // butt ON the seat surface
+  fig.add(torso);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.2, 8, 6), new THREE.MeshLambertMaterial({ color: 0xd9b08c, emissive: 0x201812 }));
+  head.position.y = 0.6;                     // head top 2.06 — clear of the 2.475 roofline
+  fig.add(head);
+  fig.position.set(cabX + cabL * 0.12, 1.26, -W * 0.18);   // sitting IN the driver's bucket
+  fig.visible = false;
+  g.add(fig);
+  g.userData.driverFig = fig;
   if (c.kind === 'truck') {
     const box = new THREE.Mesh(new THREE.BoxGeometry(L * 0.55, 2.1, W * 0.95), new THREE.MeshLambertMaterial({ color: 0x5a5f66 }));
     box.position.set(-L * 0.2, 1.9, 0);
@@ -3737,6 +3806,7 @@ function buildCarMesh(c) {
   // headlights + taillights (emissive dots)
   const hlMat = new THREE.MeshBasicMaterial({ color: 0xffeeb0 });
   const tlMat = new THREE.MeshBasicMaterial({ color: 0xff2020 });
+  g.userData.trim = [];                      // bolted lamps ride the crumple field
   for (const dz of [W * 0.32, -W * 0.32]) {
     const hl = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.22, 0.32), hlMat);
     hl.position.set(L / 2 + 0.02, 1.05, dz);
@@ -3744,6 +3814,39 @@ function buildCarMesh(c) {
     const tl = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.18, 0.3), tlMat);
     tl.position.set(-L / 2 - 0.02, 1.05, dz);
     g.add(tl);
+    const hlT = { m: hl, bx: L / 2 + 0.02, by: 1.05, bz: dz, ox: 0, oy: 0, oz: 0 };
+    const tlT = { m: tl, bx: -L / 2 - 0.02, by: 1.05, bz: dz, ox: 0, oy: 0, oz: 0 };
+    g.userData.trim.push(hlT, tlT);
+    g.userData[dz > 0 ? 'lampR' : 'lampL'] = hlT;
+  }
+  // grille + chrome bumpers, front and rear — they crumple with the metal
+  const chrome = new THREE.MeshLambertMaterial({ color: 0x9aa0a8 });
+  const grille = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.3, W * 0.4), new THREE.MeshLambertMaterial({ color: 0x1c2026 }));
+  grille.position.set(L / 2 + 0.03, 1.02, 0);
+  g.add(grille);
+  g.userData.trim.push({ m: grille, bx: L / 2 + 0.03, by: 1.02, bz: 0, ox: 0, oy: 0, oz: 0 });
+  for (const bs of [1, -1]) {
+    const bmp = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.26, W * 0.95), chrome);
+    bmp.position.set(bs * (L / 2 + 0.12), 0.55, 0);
+    g.add(bmp);
+    g.userData.trim.push({ m: bmp, bx: bs * (L / 2 + 0.12), by: 0.55, bz: 0, ox: 0, oy: 0, oz: 0 });
+  }
+  // PROPER doors: a panel per flank hinged at its leading edge. The latch
+  // holds it shut; break the latch and it swings free on the two hinges;
+  // break both hinges too and it drops into the street.
+  g.userData.doors = [];
+  const doorLen = L * 0.30, doorHingeX = L * 0.32;
+  for (const side of [-1, 1]) {
+    const dg = new THREE.Group();
+    dg.position.set(doorHingeX, 0.8625, side * (W / 2 + 0.03));
+    const panel = new THREE.Mesh(new THREE.BoxGeometry(doorLen, 0.875, 0.12), bodyMat);
+    panel.position.set(-doorLen / 2, 0, 0);
+    dg.add(panel);
+    const dwin = new THREE.Mesh(new THREE.BoxGeometry(doorLen * 0.78, 0.7, 0.1), cabMat);
+    dwin.position.set(-doorLen / 2, 0.79, 0);
+    dg.add(dwin);
+    g.add(dg);
+    g.userData.doors.push({ side, grp: dg, ang: 0, vel: 0, anim: 0, latch: true, hingeA: true, hingeB: true, gone: false });
   }
   // (headlight illumination comes from the shared spotlight pool — see HEADLIGHTS)
   if (c.kind === 'cop') {
@@ -3778,6 +3881,8 @@ function buildCarMesh(c) {
   g.userData.cabMat = cabMat;
   g.userData.bodyMesh = body;
   g.userData.cabMesh = cab;
+  g.userData.hood = hood;
+  g.userData.trunk = trunk;
   return g;
 }
 // ---- crash mechanics on the frame: the metal remembers every hit ----
@@ -3840,6 +3945,11 @@ function dentCar(c, wx, wy, v) {
   const mag = Math.min(1.3, 0.14 + (v - 100) * 0.0032);
   const seed = Math.random() * 1000;                       // no two wrecks alike
   dentGeo(body, lx, lz, nx, nz, mag, L * 0.20, W * 0.26, seed);
+  const hood9 = c.mesh.userData.hood, trunk9 = c.mesh.userData.trunk;
+  if (hood9) dentGeo(hood9, lx - hood9.position.x, lz, nx, nz, mag, L * 0.20, W * 0.26, seed);
+  if (trunk9) dentGeo(trunk9, lx - trunk9.position.x, lz, nx, nz, mag, L * 0.20, W * 0.26, seed);
+  dentTrim(c, lx, lz, nx, nz, mag, L * 0.20, W * 0.26);
+  if (nz !== 0 && lx > -L * 0.1 && lx < L * 0.4) damageDoor(c, lz > 0 ? 1 : -1, mag);
   const cab = c.mesh.userData.cabMesh;
   if (cab && mag > 0.3) dentGeo(cab, lx - cab.position.x, lz - cab.position.z, nx, nz, mag * 0.5, L * 0.10, W * 0.16, seed);
 }
@@ -3864,6 +3974,73 @@ function updDropped(dt) {
     if (p.t <= 0) { scene.remove(p.mesh); droppedParts.splice(i, 1); }
   }
 }
+// bolted trim (head/tail lamps) rides the SAME crumple field as the panels
+function dentTrim(c, lx, lz, nx, nz, mag, capX, capZ) {
+  const trim = c.mesh.userData.trim;
+  if (!trim) return;
+  const R = 1.5 + mag * 2.2;
+  for (const t of trim) {
+    const d = Math.hypot(t.bx - lx, t.bz - lz);
+    if (d >= R) continue;
+    const push = mag * (1 - d / R) * (1 - d / R);
+    t.ox = clamp(t.ox + nx * push, -capX, capX);
+    t.oy = clamp(t.oy - 0.12 * push, -0.45, 0.05);
+    t.oz = clamp(t.oz + nz * push, -capZ, capZ);
+    t.m.position.set(t.bx + t.ox, t.by + t.oy, t.bz + t.oz);
+  }
+}
+// a door in motion: entry/exit animation, or free physics on a popped latch
+function updDoors(c, dt) {
+  const ds = c.mesh && c.mesh.userData.doors;
+  if (!ds) return;
+  for (const d of ds) {
+    if (d.gone) continue;
+    if (d.anim > 0) {
+      d.anim -= dt;
+      const target = d.anim > 0.25 ? 1.05 : 0;
+      d.ang += (target - d.ang) * Math.min(1, dt * 10);
+    } else if (!d.latch) {
+      // free on its hinges: cornering swings it, airflow at speed and its
+      // own weight ease it shut, it bangs off both stops
+      d.vel += (-c.latV * d.side * 0.02 - d.ang * (0.4 + Math.abs(c.speed) * 0.025)) * dt;
+      d.vel *= Math.pow(0.5, dt * 2);
+      d.ang += d.vel * dt;
+      if (d.ang < 0) { d.ang = 0; d.vel *= -0.35; }
+      if (d.ang > 1.35) { d.ang = 1.35; d.vel *= -0.35; }
+    } else d.ang += (0 - d.ang) * Math.min(1, dt * 12);
+    d.grp.rotation.y = d.ang * d.side;
+  }
+}
+function doorSwing(c, side) {
+  const ds = c.mesh && c.mesh.userData.doors;
+  if (!ds) return;
+  const d = ds[side < 0 ? 0 : 1];
+  if (!d || d.gone) return;
+  if (!d.latch) { d.vel += 3; return; }      // nothing to latch — just shoved
+  d.anim = 0.55;
+}
+// side blows work the door hardware in order: latch, hinge, hinge — gone
+function damageDoor(c, side, mag) {
+  const ds = c.mesh && c.mesh.userData.doors;
+  if (!ds || mag < 0.4) return;
+  const d = ds[side < 0 ? 0 : 1];
+  if (!d || d.gone) return;
+  if (d.latch) { d.latch = false; d.vel = 2.5; }
+  else if (d.hingeA) d.hingeA = false;
+  else if (d.hingeB) { d.hingeB = false; dropDoor(c, d); }
+}
+function dropDoor(c, d) {
+  if (d.gone) return;
+  d.gone = true;
+  const wp = new THREE.Vector3();
+  d.grp.getWorldPosition(wp);
+  c.mesh.remove(d.grp);
+  d.grp.position.set(wp.x, 0.08, wp.z);
+  d.grp.rotation.set(0.3 * (Math.random() - 0.5), -c.angle + d.side * (0.6 + Math.random()), 1.45);
+  scene.add(d.grp);
+  droppedParts.push({ mesh: d.grp, t: 30 });
+  sfx('crash', c.x, c.y, 120);
+}
 // a repair pulls the panels straight again
 function undentCar(c) {
   if (!c.mesh) return;
@@ -3872,7 +4049,14 @@ function undentCar(c) {
     if (c.ramGone) { removeCarMesh(c); attachCarMesh(c); c.ramGone = false; }   // fresh bar bolted on
     else if (c.mesh.userData.ramBar) { c.mesh.userData.ramBar.position.x = 0; c.mesh.userData.ramBar.rotation.z = 0; }
   }
-  for (const m of [c.mesh.userData.bodyMesh, c.mesh.userData.cabMesh]) {
+  const ds9 = c.mesh.userData.doors;
+  if (ds9) {
+    if (ds9.some(d => d.gone)) { removeCarMesh(c); attachCarMesh(c); }   // new door hung on the frame
+    else for (const d of ds9) { d.latch = true; d.hingeA = true; d.hingeB = true; d.ang = 0; d.vel = 0; d.anim = 0; d.grp.rotation.y = 0; }
+  }
+  const tr9 = c.mesh.userData.trim;
+  if (tr9) for (const t of tr9) { t.ox = 0; t.oy = 0; t.oz = 0; t.m.position.set(t.bx, t.by, t.bz); }
+  for (const m of [c.mesh.userData.bodyMesh, c.mesh.userData.cabMesh, c.mesh.userData.hood, c.mesh.userData.trunk]) {
     if (!m || !m.geometry.userData.orig) continue;
     m.geometry.attributes.position.array.set(m.geometry.userData.orig);
     m.geometry.userData.disp.fill(0);
@@ -5049,6 +5233,7 @@ function updCutscene(dt) {
 }
 // ---------------------------------------------------------------- police chopper
 let chopper = null;
+let chopperCdT = 0;                          // downed bird: 20s before HQ sends another
 let lastSeenX = 0, lastSeenY = 0;
 const CH_MAX = 140;   // px/s — slower than road pursuit, but corners mean nothing to it
 function tileHeight(x, y) {
@@ -5145,6 +5330,7 @@ function removeChopper() {
 }
 function chopperDown(by) {
   if (!chopper || chopper.dead) return;
+  chopperCdT = 20;
   chopper.dead = true;
   chopper.dmgBy = by || null;
   chopper.vAlt = -2;
@@ -5231,6 +5417,7 @@ function updChopper(dt) {
 // ---------------------------------------------------------------- army gunship (6 stars)
 // the pray-for-your-life bird: two chin miniguns + two wing rocket pods
 let gunship = null;
+let gunshipCdT = 0;                          // downed gunship: 10s before the army re-deploys
 const GS_MAX = 170;
 function buildGunshipMesh() {
   const g = new THREE.Group();
@@ -5345,6 +5532,7 @@ function removeGunship() {
 }
 function gunshipDown(by) {
   if (!gunship || gunship.dead) return;
+  gunshipCdT = 10;
   gunship.dead = true;
   gunship.dmgBy = by || null;
   gunship.vAlt = -2;
@@ -6141,6 +6329,7 @@ function tryEnterExit() {
       const ex = c.x + Math.cos(c.angle + side * Math.PI / 2) * (c.w / 2 + 12);
       const ey = c.y + Math.sin(c.angle + side * Math.PI / 2) * (c.w / 2 + 12);
       if (!solidAtPx(ex, ey)) {
+        doorSwing(c, side);
         player.x = ex; player.y = ey;
         player.angle = c.angle;
         c.driver = null;
@@ -6159,6 +6348,7 @@ function tryEnterExit() {
 }
 // boarding: jack the driver if there is one, take the wheel, wear the heat
 function enterCar(bc) {
+  doorSwing(bc, -1);                         // in through the driver's door
   if (bc.driver === 'ai') {
     if (bc.kind === 'cop') {
       // jacking a patrol cruiser ejects an officer, not a civilian
@@ -6238,7 +6428,7 @@ function ensureCops(dt) {
   if (tanks < tankQ) spawnArmyTank();
   // the bird: on station at 3+ stars, sent home below that
   if (s >= 3) {
-    if (!chopper) spawnChopper();
+    if (!chopper) { if (chopperCdT <= 0) spawnChopper(); }
     else if (chopper.leaving && !chopper.dead) chopper.leaving = false;
   } else if (chopper && !chopper.dead && !chopper.leaving) {
     chopper.leaving = true;
@@ -6247,7 +6437,7 @@ function ensureCops(dt) {
   }
   // six stars: the army gunship joins the hunt
   if (s >= 6) {
-    if (!gunship) spawnGunship();
+    if (!gunship) { if (gunshipCdT <= 0) spawnGunship(); }
     else if (gunship.leaving && !gunship.dead) gunship.leaving = false;
   } else if (gunship && !gunship.dead && !gunship.leaving) {
     gunship.leaving = true;
@@ -7363,6 +7553,8 @@ function update(dt) {
   player.fireT -= dt;
   player.hurtT -= dt;
   tankGraceT -= dt;
+  chopperCdT -= dt;
+  gunshipCdT -= dt;
   if (player.jumpH) {
     player.jumpH += player.jumpV * dt;
     player.jumpV -= 18 * dt;
@@ -7391,9 +7583,10 @@ function update(dt) {
     else if (pc.speed > 6) pc.revCamT = Math.max(0, (pc.revCamT || 0) - dt * 2.6);
     if (pc.revCamT > 0.02) {
       mouseYaw += angDiff(mouseYaw, pc.angle + Math.PI * pc.revCamT) * Math.min(1, dt * 4);
-    } else if (Math.abs(pc.speed) > 8 && performance.now() - lastMouseMove > 250) {
+    } else if (Math.abs(pc.speed) > 8 && performance.now() - lastMouseMove > (pc.kind === 'tank' ? 3000 : 250)) {
       // rolling: the camera comes home 0.25s after the player stops moving
-      // it. Parked: fully free — it stays wherever the player put it.
+      // it — a TANK holds the gunner's line for a full 3s (shooting behind
+      // you is legal). Parked: fully free, it stays wherever you put it.
       mouseYaw += angDiff(mouseYaw, pc.angle) * Math.min(1, dt * 2);
     }
     if (pc.hp < 15 && !godMode) {
@@ -7832,6 +8025,8 @@ function syncScene(dt, t) {
     if (c.dead) continue;
     c.mesh.position.set(c.x * RS, 0, c.y * RS);
     c.mesh.rotation.y = -c.angle;
+    updDoors(c, dt);
+    if (c.mesh.userData.driverFig) c.mesh.userData.driverFig.visible = !!c.driver && !c.dead;
     // wheels: fronts steer with the input, all four roll with road speed.
     // AI drivers turn by writing c.angle directly, so estimate their steer
     // from the frame-to-frame heading change.
@@ -7978,10 +8173,17 @@ function syncScene(dt, t) {
       for (const side of [-1, 1]) {
         const s = pair[side < 0 ? 0 : 1];
         s.intensity = 1.15;
-        const lx = c.x * RS + cs2 * fwd - sn2 * side * lampW;
-        const lz = c.y * RS + sn2 * fwd + cs2 * side * lampW;
-        s.position.set(lx, lampY, lz);
-        s.target.position.set(lx + cs2 * 30, 0, lz + sn2 * 30);
+        // a crumpled lamp keeps its beam: anchor at the DEFORMED position
+        // and tilt the aim by how far the metal bent it
+        const tr = c.mesh.userData[side < 0 ? 'lampL' : 'lampR'];
+        const ox = tr ? tr.ox : 0, oy = tr ? tr.oy : 0, oz = tr ? tr.oz : 0;
+        const lat = side * lampW + oz;
+        const lx = c.x * RS + cs2 * (fwd + ox) - sn2 * lat;
+        const lz = c.y * RS + sn2 * (fwd + ox) + cs2 * lat;
+        s.position.set(lx, lampY + oy, lz);
+        const tilt = Math.atan2(lat, fwd + ox) - Math.atan2(side * lampW, fwd);
+        const aimA = Math.atan2(sn2, cs2) + tilt;
+        s.target.position.set(lx + Math.cos(aimA) * 30, 0, lz + Math.sin(aimA) * 30);
       }
     }
   }
@@ -9628,7 +9830,22 @@ if (location.hash === '#camfree') {
   const parkedFree = Math.abs(mouseYaw - 2.5) < 0.02;
   for (let i = 0; i < 90; i++) { fc.speed = 60; update(1 / 60); }
   const homes = Math.abs(angDiff(mouseYaw, fc.angle)) < 1.0;
-  console.log('CAMDBG parkedFree=' + parkedFree + ' yawAfterParked=' + mouseYaw.toFixed(2) + ' rollingHomes=' + homes);
+  fc.dead = true;
+  const tk = mkCar(player.x, player.y, 0, 'tank', 'player');
+  tk.keep = true;
+  attachCarMesh(tk); cars.push(tk);
+  player.car = tk;
+  mouseYaw = 2.5;
+  lastMouseMove = performance.now() - 1000;          // only 1s idle: gunner holds
+  for (let i = 0; i < 60; i++) { tk.speed = 60; update(1 / 60); }
+  const tankHolds = Math.abs(mouseYaw - 2.5) < 0.05;
+  lastMouseMove = performance.now() - 4000;          // 4s idle: comes home
+  for (let i = 0; i < 90; i++) { tk.speed = 60; update(1 / 60); }
+  const tankHomes = Math.abs(angDiff(mouseYaw, tk.angle)) < 1.0;
+  mouseYaw = 2.5;
+  for (let i = 0; i < 60; i++) { tk.speed = 0; update(1 / 60); }
+  const tankParkedFree = Math.abs(mouseYaw - 2.5) < 0.02;
+  console.log('CAMDBG parkedFree=' + parkedFree + ' rollingHomes=' + homes + ' tankHolds1s=' + tankHolds + ' tankHomes4s=' + tankHomes + ' tankParkedFree=' + tankParkedFree);
 }
 if (location.hash === '#cheatmark') {
   startGame();
@@ -9681,6 +9898,106 @@ if (location.hash === '#tank5') {
   addHeat(2);
   const canStillEarnSix = stars() === 6;
   console.log('TANK5DBG atFive=' + atFive + ' graceHolds=' + graceHolds + ' sixAfterGrace=' + canStillEarnSix);
+}
+if (location.hash === '#helocd') {
+  // 2 shells drop the police bird then 20s of quiet; 3 shells drop the
+  // gunship then 10s — proven with real shell airbursts through updShells
+  startGame();
+  godMode = true;
+  const shellAt = tgt => { shells.push({ x: tgt.x, y: tgt.y, vx: 0, vy: 0, life: 0.5, src: null, pby: true, done: false, h: tgt.alt, vh: 0, mesh: null }); updShells(1 / 60); };
+  setWanted(3);
+  ensureCops(2);
+  const chSpawn = !!chopper && chopper.hp === 300;
+  shellAt(chopper);
+  const chAliveAfter1 = !chopper.dead;
+  shellAt(chopper);
+  const chDeadAfter2 = chopper.dead && Math.abs(chopperCdT - 20) < 0.1;
+  removeChopper();
+  ensureCops(2);
+  const chHeld = !chopper;
+  chopperCdT = 0;
+  ensureCops(2);
+  const chBack = !!chopper;
+  setWanted(6);
+  ensureCops(2);
+  const gsSpawn = !!gunship && gunship.hp === 450;
+  shellAt(gunship);
+  shellAt(gunship);
+  const gsAliveAfter2 = !gunship.dead;
+  shellAt(gunship);
+  const gsDeadAfter3 = gunship.dead && Math.abs(gunshipCdT - 10) < 0.1;
+  removeGunship();
+  ensureCops(2);
+  const gsHeld = !gunship;
+  gunshipCdT = 0;
+  ensureCops(2);
+  const gsBack = !!gunship;
+  console.log('HELODBG chopper300=' + chSpawn + ' survives1shell=' + chAliveAfter1 + ' diesAt2+cd20=' + chDeadAfter2 + ' held=' + chHeld + ' redeploys=' + chBack
+    + ' | gunship450=' + gsSpawn + ' survives2=' + gsAliveAfter2 + ' diesAt3+cd10=' + gsDeadAfter3 + ' held=' + gsHeld + ' redeploys=' + gsBack);
+}
+if (location.hash === '#lampdent') {
+  // crush the front-right quarter: the right lamp mesh rides the metal,
+  // the left one holds still, the assigned beam follows, repair resets
+  startGame();
+  const c = mkCar(player.x + 60, player.y, 0, 'sedan', 'player');
+  c.keep = true;
+  attachCarMesh(c); cars.push(c);
+  player.car = c;
+  const R9 = c.mesh.userData.lampR, L9 = c.mesh.userData.lampL;
+  dentCar(c, c.x + 18, c.y + 9, 260);
+  const rMoved = (Math.abs(R9.ox) + Math.abs(R9.oz)) > 0.15;
+  const lHolds = (Math.abs(L9.ox) + Math.abs(L9.oz)) < 0.01;
+  const meshFollows = Math.abs(R9.m.position.x - (R9.bx + R9.ox)) < 0.001 && Math.abs(R9.m.position.z - (R9.bz + R9.oz)) < 0.001;
+  syncScene(1 / 60);
+  const pair0 = HEADLIGHT_PAIRS[0];
+  const cs9 = Math.cos(c.angle), sn9 = Math.sin(c.angle);
+  const fwd9 = c.len * RS / 2 + 0.3, lampW9 = c.w * RS * 0.32;
+  const baseX = c.x * RS + cs9 * fwd9 - sn9 * 1 * lampW9;
+  const beamShifted = Math.abs(pair0[1].position.x - baseX) > 0.1 && pair0[1].intensity > 0;
+  undentCar(c);
+  const reset = R9.ox === 0 && Math.abs(R9.m.position.x - R9.bx) < 0.001;
+  console.log('LAMPDENTDBG rightLampMoved=' + rMoved + ' leftHolds=' + lHolds + ' meshFollows=' + meshFollows + ' beamShifted=' + beamShifted + ' repairResets=' + reset);
+}
+if (location.hash === '#doors') {
+  startGame();
+  const c = mkCar(player.x + 60, player.y, 0, 'sedan', null);
+  attachCarMesh(c); cars.push(c);
+  const ud = c.mesh.userData;
+  const parts = !!ud.doors && ud.doors.length === 2 && !!ud.driverFig && ud.trim.length >= 7;
+  const glass = ud.cabMat.transparent === true && ud.cabMat.opacity < 0.5;
+  enterCar(c);
+  const d0 = ud.doors[0];
+  const enterAnim = d0.anim > 0;
+  const figShows = (() => { syncScene(1 / 60, 0); return ud.driverFig.visible; })();
+  let maxAng = 0;
+  for (let i = 0; i < 80; i++) { updDoors(c, 1 / 60); maxAng = Math.max(maxAng, d0.ang); }
+  const swingShut = maxAng > 0.6 && d0.ang < 0.1;
+  dentCar(c, c.x + 8, c.y - 10.5, 300);      // left door region, hard
+  const latchPops = !d0.latch;
+  c.latV = 200;
+  let freeSwing = 0;
+  for (let i = 0; i < 60; i++) { updDoors(c, 1 / 60); freeSwing = Math.max(freeSwing, d0.ang); }
+  c.latV = 0;
+  const swingsFree = freeSwing > 0.25;
+  dentCar(c, c.x + 8, c.y - 10.5, 300);
+  const hingeBreaks = !d0.hingeA;
+  const before = droppedParts.length;
+  dentCar(c, c.x + 8, c.y - 10.5, 300);
+  const fallsOff = d0.gone && droppedParts.length === before + 1;
+  undentCar(c);
+  const rehung = ud !== c.mesh.userData ? c.mesh.userData.doors.every(d => !d.gone && d.latch) : false;
+  console.log('DOORDBG parts=' + parts + ' glass=' + glass + ' enterAnim=' + enterAnim + ' driverShows=' + figShows + ' swingShut=' + swingShut + ' latchPops=' + latchPops + ' freeSwings=' + swingsFree + ' hingeBreaks=' + hingeBreaks + ' fallsOff=' + fallsOff + ' repairRehangs=' + rehung);
+  const ud2 = c.mesh.userData;
+  const fg = ud2.driverFig;
+  const headTop = fg.position.y + fg.children[1].position.y + 0.2;
+  const roofBottom = 2.52 - 0.045;
+  const seatTop = 1.18 + 0.08;
+  const buttOnSeat = Math.abs(fg.position.y - seatTop) < 0.02;
+  const beltline = ud2.bodyMesh.position.y + 0.4375;
+  const cabinOpen = !!ud2.hood && !!ud2.trunk && Math.abs(beltline - 1.30) < 0.01
+    && ud2.hood.position.x - (ud2.hood.geometry.parameters.width / 2) > -1.3   // hood stays ahead of the cabin
+    && headTop > beltline;                                                     // the driver rises OUT of the well
+  console.log('SEATDBG headTop=' + headTop.toFixed(2) + ' underRoof=' + (headTop < roofBottom) + ' bucket=' + (!!ud2.bucketL && ud2.bucketL.children.length === 4) + ' buttOnSeat=' + buttOnSeat + ' cabinOpen=' + cabinOpen + ' beltline=' + beltline.toFixed(2));
 }
 if (location.hash === '#pause') {
   startGame();

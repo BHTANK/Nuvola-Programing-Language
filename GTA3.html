@@ -106,15 +106,33 @@ const PAD_PRESETS = {
   southpaw: { fire: 7, aim: 6, sprint: 0, interact: 3, handbrake: 5, weapNext: 4, radio: 12, pause: 9, dialog: 0, dive: 2, tankFire: 4 },
   legacy: { fire: 7, aim: 6, sprint: 0, interact: 3, handbrake: 5, weapNext: 4, radio: 12, pause: 9, dialog: 0, dive: 2, accel: 0, brake: 2, tankFire: 4 }
 };
-let padCfg = { preset: 'original', sens: 5, invertY: false, custom: null };
+let padCfg = { preset: 'original', sens: 5, invertY: false, custom: null, vibe: true };
+// dual-rumble haptics: strong motor = body force, weak motor = texture.
+// Repeated calls REPLACE the running effect, so continuous sources (skids,
+// flamer) just re-trigger on their own cadence.
+function rumble(strong, weak, ms) {
+  if (!padCfg.vibe || !padConnected) return;
+  const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+  for (const g of gps) {
+    if (!g || !g.connected) continue;
+    const act = g.vibrationActuator;
+    if (act && act.playEffect) {
+      try { act.playEffect('dual-rumble', { duration: ms, strongMagnitude: clamp(strong, 0, 1), weakMagnitude: clamp(weak, 0, 1) }).catch(() => {}); } catch (e) {}
+    }
+    break;
+  }
+}
 try { Object.assign(padCfg, JSON.parse(localStorage.getItem('gta3_pad') || '{}')); } catch (e) {}
 function savePadCfg() { try { localStorage.setItem('gta3_pad', JSON.stringify(padCfg)); } catch (e) {} }
 let padConnected = false, padName = '', padType = 'xbox';
 let padPrev = [];
+const padAxTrig = { lt: false, rt: false };   // latched once an axis-style trigger is seen resting at -1
 // per-frame analog state consumed by movement / driving / swimming / camera
 let padLX = 0, padLY = 0, padThrottle = 0, padBrakeV = 0;
+let padRawDebug = null;                        // live channel dump for the settings screen
 let padFire = false, padAim = false, padSprint = false, padHand = false, padDive = false, padTankFire = false;
 window.addEventListener('gamepadconnected', e => {
+  padAxTrig.lt = padAxTrig.rt = false;
   padConnected = true;
   padName = e.gamepad.id;
   padType = /dualshock|dualsense|playstation|054c|sony/i.test(padName) ? 'ps' : 'xbox';
@@ -128,12 +146,24 @@ function padBtnName(i) {
   return (padType === 'ps' ? ps : xb)[i] || ('Btn' + i);
 }
 function padMap() {
-  const m = padCfg.custom || PAD_PRESETS[padCfg.preset] || PAD_PRESETS.original;
+  // the SELECTED preset rules: a saved custom layout applies only when the
+  // preset is set to CUSTOM (it used to override everything silently)
+  const m = (padCfg.preset === 'custom' && padCfg.custom) ? padCfg.custom : PAD_PRESETS[padCfg.preset] || PAD_PRESETS.original;
   // custom layouts saved before the tank-cannon action existed default it to LB
   return m.tankFire === undefined ? Object.assign({ tankFire: 4 }, m) : m;
 }
+function padTrigLabel(which) {
+  const M = padMap();
+  const mapped = which === 'gas' ? M.accel : M.brake;
+  if (mapped !== undefined) return padBtnName(mapped);
+  const cal = padCfg.trig && (which === 'gas' ? padCfg.trig.rt : padCfg.trig.lt);
+  const base = which === 'gas' ? 'RT' : 'LT';
+  if (cal) return base + ' · calibrated ' + (cal.type === 'axis' ? 'axis A' + cal.i : 'button B' + cal.i);
+  return base + ' (analog)';
+}
 function dz(v) { return Math.abs(v) < 0.16 ? 0 : v; }
 let remapMode = null;   // { idx } while capturing a custom layout
+let trigCal = null;     // trigger calibration capture: { phase 'rt'|'lt', rest snapshots, best channel }
 function pollPad(dt) {
   padLX = padLY = padThrottle = padBrakeV = 0;
   padFire = padAim = padSprint = padHand = padDive = false;
@@ -143,11 +173,69 @@ function pollPad(dt) {
   if (!gp) return;
   padConnected = true;
   const M = padMap();
-  const btn = i => (gp.buttons[i] ? gp.buttons[i].pressed : false);
+  const rawBtn = i => (gp.buttons[i] ? gp.buttons[i].pressed : false);
   const btnV = i => (gp.buttons[i] ? gp.buttons[i].value : 0);
+  // ---- unified D-PAD: physical buttons 12-15 OR the hat encodings many
+  // Linux/generic pads use (axis 9 hat, or axes 6/7) — all merge here
+  const dp = { u: rawBtn(12), d: rawBtn(13), l: rawBtn(14), r: rawBtn(15) };
+  if (gp.axes.length > 9 && gp.axes[9] >= -1.05 && gp.axes[9] <= 1.0) {
+    const sector = Math.round((gp.axes[9] + 1) * 3.5) % 8;   // 0=up .. 7=up-left
+    dp.u = dp.u || sector === 7 || sector === 0 || sector === 1;
+    dp.r = dp.r || sector === 1 || sector === 2 || sector === 3;
+    dp.d = dp.d || sector === 3 || sector === 4 || sector === 5;
+    dp.l = dp.l || sector === 5 || sector === 6 || sector === 7;
+  }
+  if (gp.mapping !== 'standard' && gp.axes.length >= 8) {
+    if (Math.abs(gp.axes[6] || 0) > 0.5) { if (gp.axes[6] < 0) dp.l = true; else dp.r = true; }
+    if (Math.abs(gp.axes[7] || 0) > 0.5) { if (gp.axes[7] < 0) dp.u = true; else dp.d = true; }
+  }
+  const btn = i => i === 12 ? dp.u : i === 13 ? dp.d : i === 14 ? dp.l : i === 15 ? dp.r : rawBtn(i);
+  // trigger calibration: bind whatever channel actually moves — PREFERRING
+  // channels that show in-between values (an analog signature). A channel
+  // that only ever jumps rest->max is digital, and we SAY so.
+  if (trigCal) {
+    if (!trigCal.rest) {
+      trigCal.rest = { axes: gp.axes.slice(), btns: Array.from(gp.buttons, b2 => b2.value) };
+      trigCal.cand = {};
+      trigCal.t = 0;
+    }
+    trigCal.t += 1 / 60;
+    const taken = trigCal.result.rt;
+    const consider = (type2, i, v, rest) => {
+      if (taken && taken.type === type2 && taken.i === i) return;
+      const span = Math.max(0.1, Math.max(1 - rest, rest + 1));
+      const nd = Math.abs(v - rest) / span;
+      if (nd < 0.12) return;
+      const k = type2 + i;
+      const c2 = trigCal.cand[k] || (trigCal.cand[k] = { type: type2, i, rest, score: 0, mid: false });
+      if (nd > c2.score) c2.score = nd;
+      if (nd > 0.18 && nd < 0.82) c2.mid = true;   // saw a partial value: analog
+    };
+    for (let i = 0; i < gp.axes.length; i++) consider('axis', i, gp.axes[i], trigCal.rest.axes[i]);
+    for (let i = 0; i < gp.buttons.length; i++) consider('btn', i, gp.buttons[i].value, trigCal.rest.btns[i]);
+    const cands = Object.values(trigCal.cand).filter(c2 => c2.score > 0.5);
+    if (cands.length && trigCal.t > 2.2) {
+      cands.sort((a2, b2) => (b2.mid ? 1 : 0) - (a2.mid ? 1 : 0) || b2.score - a2.score);
+      const bind = cands[0];
+      trigCal.result[trigCal.phase] = { type: bind.type, i: bind.i, rest: bind.rest };
+      const quality = bind.mid ? 'analog — full travel bound' : 'DIGITAL ONLY (pad mode? see manual: X-input mode has analog triggers)';
+      if (trigCal.phase === 'rt') {
+        trigCal.phase = 'lt';
+        trigCal.rest = null;
+        msg('Right trigger: ' + quality + '. Now SLOWLY pull the LEFT trigger…', 7);
+      } else {
+        padCfg.trig = trigCal.result;
+        savePadCfg();
+        trigCal = null;
+        msg('Left trigger: ' + quality + '. Calibration saved.', 7);
+      }
+    }
+    for (let i2 = 0; i2 < 17; i2++) padPrev[i2] = btn(i2);
+    return;
+  }
   // remap capture: the next pressed button claims the current action
   if (remapMode) {
-    for (let i = 0; i < gp.buttons.length && i < 17; i++) {
+    for (let i = 0; i < 17; i++) {
       if (btn(i) && !padPrev[i]) {
         const act = PAD_ACTIONS[remapMode.idx][0];
         if (!padCfg.custom) padCfg.custom = Object.assign({}, PAD_PRESETS.original);
@@ -172,9 +260,35 @@ function pollPad(dt) {
     mouseYaw += cx2 * sens * dt * 3.2;
     mousePitch = clamp(mousePitch + cy2 * (padCfg.invertY ? -1 : 1) * sens * dt * 2.2, -1.45, 1.45);
   }
-  // analog triggers / mapped holds
-  padThrottle = M.accel !== undefined ? (btn(M.accel) ? 1 : 0) : btnV(7);
-  padBrakeV = M.brake !== undefined ? (btn(M.brake) ? 1 : 0) : btnV(6);
+  // analog triggers / mapped holds. Pads that report LT/RT as AXES (rest
+  // at -1) are latched once seen, then read proportionally from the axis.
+  if (gp.axes.length >= 6) {
+    if (gp.axes[2] <= -0.9) padAxTrig.lt = true;
+    if (gp.axes[5] <= -0.9) padAxTrig.rt = true;
+  }
+  let rawRT = btnV(7), rawLT = btnV(6);
+  if (padAxTrig.rt) rawRT = Math.max(rawRT, clamp(((gp.axes[5] || -1) + 1) / 2, 0, 1));
+  if (padAxTrig.lt) rawLT = Math.max(rawLT, clamp(((gp.axes[2] || -1) + 1) / 2, 0, 1));
+  // calibrated channels are EXCLUSIVE: a digital sibling button must never
+  // mask the analog axis via max() — the user's bound channel is the truth
+  const calVal = (c2) => {
+    if (!c2) return 0;
+    const v = c2.type === 'axis' ? (gp.axes[c2.i] || 0) : btnV(c2.i);
+    const up = 1 - c2.rest, down = c2.rest + 1;
+    if (up >= down) return clamp((v - c2.rest) / Math.max(0.05, up), 0, 1);
+    return clamp((c2.rest - v) / Math.max(0.05, down), 0, 1);
+  };
+  if (padCfg.trig) {
+    rawRT = calVal(padCfg.trig.rt);
+    rawLT = calVal(padCfg.trig.lt);
+  }
+  padRawDebug = settingsOpen ? {
+    axes: Array.from(gp.axes, v2 => +v2.toFixed(2)),
+    btns: Array.from(gp.buttons, b2 => +b2.value.toFixed(2)),
+    map: gp.mapping || 'none'
+  } : null;
+  padThrottle = M.accel !== undefined ? (btn(M.accel) ? 1 : 0) : rawRT;
+  padBrakeV = M.brake !== undefined ? (btn(M.brake) ? 1 : 0) : rawLT;
   padFire = btnV(M.fire) > 0.35;
   padTankFire = btn(M.tankFire);
   padAim = btnV(M.aim) > 0.35;
@@ -184,7 +298,7 @@ function pollPad(dt) {
   // digital edges feed the same `pressed` set the keyboard uses.
   // In menus the pad becomes a navigator: dpad = arrows, A = enter, B = back.
   const edge = (i, code) => { if (btn(i) && !padPrev[i]) pressed.add(code); };
-  if (paused || state === 'menu' || shopOpen || modShopOpen || saveHouseOpen) {
+  if (paused || state === 'menu' || shopOpen || modShopOpen || saveHouseOpen || priestOpen) {
     edge(12, 'ArrowUp'); edge(13, 'ArrowDown'); edge(14, 'ArrowLeft'); edge(15, 'ArrowRight');
     edge(0, 'Enter'); edge(1, 'Escape');
     edge(M.pause, 'KeyP');
@@ -203,10 +317,14 @@ function pollPad(dt) {
 // controller settings submenu (inside pause): presets, sensitivity, invert,
 // full custom remap with live button names for the detected pad type
 let settingsOpen = false, settingsSel = 0;
-const SETTINGS_ITEMS = ['preset', 'sens', 'invert', 'remap', 'back'];
+const SETTINGS_ITEMS = ['preset', 'sens', 'invert', 'vibe', 'remap', 'trig', 'back'];
 function updSettings() {
   if (remapMode) {
     if (pressed.has('Escape')) { remapMode = null; msg('Remap cancelled.', 5); }
+    return;
+  }
+  if (trigCal) {
+    if (pressed.has('Escape')) { trigCal = null; msg('Calibration cancelled.', 5); }
     return;                                    // pad capture happens in pollPad
   }
   if (pressed.has('ArrowUp')) settingsSel = (settingsSel + SETTINGS_ITEMS.length - 1) % SETTINGS_ITEMS.length;
@@ -224,9 +342,16 @@ function updSettings() {
   } else if (it === 'invert' && dir) {
     padCfg.invertY = !padCfg.invertY;
     savePadCfg();
+  } else if (it === 'vibe' && dir) {
+    padCfg.vibe = !padCfg.vibe;
+    savePadCfg();
+    if (padCfg.vibe) rumble(0.6, 0.6, 250);          // feel the confirmation
   } else if (it === 'remap' && pressed.has('Enter')) {
     remapMode = { idx: 0 };
     msg('Press the controller button for each action…', 6);
+  } else if (it === 'trig' && pressed.has('Enter')) {
+    trigCal = { phase: 'rt', rest: null, best: null, t: 0, result: {} };
+    msg('SLOWLY pull the RIGHT trigger all the way — take about 2 seconds…', 7);
   } else if (it === 'back' && pressed.has('Enter')) {
     settingsOpen = false;
   }
@@ -252,7 +377,7 @@ window.addEventListener('wheel', e => {
     camZoom = clamp(camZoom * (e.deltaY > 0 ? 1.1 : 0.9), 0.5, 2.4);
     return;
   }
-  if (state !== 'play' || paused || shopOpen || saveHouseOpen || modShopOpen || player.car) return;
+  if (state !== 'play' || paused || shopOpen || saveHouseOpen || modShopOpen || priestOpen || player.car) return;
   const i = WORDER.indexOf(player.weapon);
   const step = e.deltaY > 0 ? 1 : WORDER.length - 1;
   player.weapon = WORDER[(i + step) % WORDER.length];
@@ -299,10 +424,23 @@ function runConsole(raw) {
     pardonMode = !pardonMode;
     if (pardonMode) { heat = 0; wantedClearT = 0; copSeen = false; }
     out = pardonMode ? 'PRESIDENTIAL PARDON — the law cannot touch you.' : 'Pardon revoked. Behave.';
+  } else if (/^pay me \$?[\d,]+$/.test(cmd)) {
+    // "pay me 50000" — the wire clears instantly
+    const amt = parseInt(cmd.replace(/[^\d]/g, ''), 10);
+    player.cash += amt;
+    saveBest();
+    sfx('cash');
+    out = 'Wired $' + amt + '. Balance: $' + player.cash + '.';
   } else if (/^save (10|[1-9])$/.test(cmd)) {
     out = saveGame(parseInt(cmd.slice(5), 10));
   } else if (/^load (10|[1-9])$/.test(cmd)) {
     out = loadGame(parseInt(cmd.slice(5), 10));
+  } else if (cmd === 'stats') {
+    msg('CARS DESTROYED ' + STATS.carsDestroyed + ' · RUN OVER ' + STATS.pedsRunOver + ' · CIVILIANS ' + STATS.civiliansKilled + ' · COPS ' + STATS.copsKilled + ' · COMBINE ' + STATS.goonsKilled, 12);
+    msg('SHOTS ' + STATS.ammoSpent + ' · ACCURACY ' + statAccuracy() + '% · LONGEST WANTED ' + Math.round(STATS.longestWanted) + 's', 12);
+    msg('JOBS ' + STATS.missionsPassed + ' PASSED / ' + STATS.missionFails + ' FAILED · BUSTED ' + STATS.timesBusted + ' · WASTED ' + STATS.timesWasted, 12);
+    msg('FARES ' + STATS.faresCompleted + ' · EARNED $' + STATS.cashEarned + ' · DROVE ' + Math.round(STATS.distanceDriven / TILE) + ' blocks · SWAM ' + Math.round(STATS.distanceSwum / TILE), 12);
+    out = 'The ledger is on screen.';
   } else if (cmd === 'saves') {
     out = listSaves();
   } else {
@@ -327,6 +465,7 @@ function saveGame(slot) {
     x: player.x, y: player.y, hp: player.hp, armor: player.armor, cash: player.cash,
     weapon: player.weapon, ammo: player.ammo, missionsDone: missionsDone,
     bridges: [bridgesOpen[0], bridgesOpen[1], bridgesOpen[2], bridgesOpen[3]], heat: heat, god: godMode, pardon: pardonMode,
+    stats: STATS,
     garage: garageSnapshot()
   };
   try {
@@ -359,9 +498,10 @@ function loadGame(slot) {
   player.dead = false; player.rag = null;
   swim = null;
   cutscene = null;
-  settingsOpen = false; shopOpen = false; saveHouseOpen = false; modShopOpen = false;
+  settingsOpen = false; shopOpen = false; saveHouseOpen = false; modShopOpen = false; priestOpen = false;
   player.mesh.rotation.set(0, 0, 0);
   missionsDone = data.missionsDone || 0;
+  if (data.stats) for (const k in STATS) if (typeof data.stats[k] === 'number') STATS[k] = data.stats[k];
   heat = data.heat || 0; wantedClearT = 30; copSeen = false;
   disarmT = 0; disarmCool = 8;
   godMode = !!data.god;
@@ -406,7 +546,7 @@ function saveSummary(i) {
   let d = null;
   try { d = JSON.parse(localStorage.getItem('gta3_save_' + i) || 'null'); } catch (e) {}
   if (!d) return null;
-  return '$' + d.cash + ' · job ' + Math.min(20, (d.missionsDone || 0) + 1) + (d.when ? ' · ' + d.when : '');
+  return '$' + d.cash + ' · job ' + Math.min(50, (d.missionsDone || 0) + 1) + (d.when ? ' · ' + d.when.slice(5) : '');
 }
 function listSaves() {
   let n = 0;
@@ -483,10 +623,21 @@ function updMusic() {
     }
   } else if (musicEl && !musicEl.paused) musicEl.pause();
 }
+let master = null;
 function audioInit() {
   if (AC) return;
   try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; }
+  if (AC) {
+    // one master bus with a compressor: layered effects glue together
+    // instead of clipping into fuzz
+    master = AC.createDynamicsCompressor();
+    master.threshold.value = -18;
+    master.knee.value = 22;
+    master.ratio.value = 8;
+    master.connect(AC.destination);
+  }
 }
+function out() { return master || AC.destination; }
 function tone(f0, f1, dur, type, vol, when) {
   if (!AC || muted) return;
   const o = AC.createOscillator(), g = AC.createGain(), t = when || AC.currentTime;
@@ -495,55 +646,148 @@ function tone(f0, f1, dur, type, vol, when) {
   o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
   g.gain.setValueAtTime(vol, t);
   g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  o.connect(g).connect(AC.destination);
+  o.connect(g).connect(out());
   o.start(t); o.stop(t + dur + 0.02);
 }
-function noise(dur, vol, fq) {
+function noise(dur, vol, fq, type, q, fq1) {
+  // shaped noise: chooseable filter, resonance, optional filter sweep,
+  // exponential decay — the raw material of every impact and shot
   if (!AC || muted) return;
   const n = (AC.sampleRate * dur) | 0;
   const b = AC.createBuffer(1, n, AC.sampleRate);
   const d = b.getChannelData(0);
-  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
   const s = AC.createBufferSource(); s.buffer = b;
-  const f = AC.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = fq || 1200;
-  const g = AC.createGain(); g.gain.value = vol;
-  s.connect(f); f.connect(g); g.connect(AC.destination);
+  const f = AC.createBiquadFilter();
+  f.type = type || 'lowpass';
+  f.frequency.setValueAtTime(fq || 1200, AC.currentTime);
+  if (fq1) f.frequency.exponentialRampToValueAtTime(Math.max(30, fq1), AC.currentTime + dur);
+  if (q) f.Q.value = q;
+  const g = AC.createGain();
+  g.gain.setValueAtTime(vol, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+  s.connect(f); f.connect(g); g.connect(out());
   s.start();
 }
 function sfx(k) {
   if (!AC || muted) return;
-  if (k === 'pistol') { noise(0.09, 0.22, 2500); tone(190, 60, 0.07, 'square', 0.07); }
-  else if (k === 'uzi') { noise(0.05, 0.16, 3200); }
-  else if (k === 'shotgun') { noise(0.2, 0.32, 900); tone(120, 40, 0.15, 'sawtooth', 0.1); }
-  else if (k === 'boom') { noise(0.7, 0.5, 420); tone(95, 28, 0.55, 'sawtooth', 0.22); }
-  else if (k === 'crash') { noise(0.14, 0.24, 750); }
-  else if (k === 'cannon') { noise(0.22, 0.4, 700); tone(80, 30, 0.28, 'sawtooth', 0.16); }
-  else if (k === 'screech') { noise(0.14, 0.09, 2600); tone(1400, 900, 0.12, 'sawtooth', 0.02); }
-  else if (k === 'rocket') { noise(0.3, 0.28, 1500); tone(300, 90, 0.35, 'sawtooth', 0.08); }
-  else if (k === 'flame') { noise(0.18, 0.1, 500); }
-  else if (k === 'pickup') { tone(880, 1500, 0.12, 'square', 0.06); }
-  else if (k === 'cash') { tone(1200, 1900, 0.1, 'square', 0.06); }
-  else if (k === 'enter') { tone(190, 320, 0.09, 'square', 0.05); }
-  else if (k === 'hurt') { tone(150, 70, 0.12, 'sawtooth', 0.11); }
-  else if (k === 'punch') { noise(0.06, 0.2, 520); }
-  else if (k === 'mission') { tone(523, 1046, 0.28, 'square', 0.07); }
-  else if (k === 'fail') { tone(320, 110, 0.45, 'sawtooth', 0.09); }
-  else if (k === 'spray') { noise(0.4, 0.12, 2000); tone(600, 900, 0.3, 'sine', 0.04); }
-  else if (k === 'frenzy') { tone(200, 800, 0.5, 'square', 0.09); }
-  else if (k === 'buy') { tone(660, 990, 0.15, 'square', 0.06); }
+  // layered recipes: crack (highpass snap) + body (mid) + thump (sub sine)
+  if (k === 'pistol') {
+    noise(0.05, 0.3, 2800, 'highpass');            // muzzle crack
+    noise(0.12, 0.2, 420, 'bandpass', 1.2);        // report body
+    tone(150, 48, 0.09, 'sine', 0.14);             // chest thump
+  } else if (k === 'uzi') {
+    noise(0.035, 0.22, 3200, 'highpass');
+    noise(0.07, 0.13, 500, 'bandpass', 1.2);
+    tone(130, 55, 0.05, 'sine', 0.08);
+  } else if (k === 'shotgun') {
+    noise(0.05, 0.3, 2400, 'highpass');
+    noise(0.34, 0.4, 700, 'lowpass', 0, 160);      // barrel boom, sweeping down
+    tone(100, 30, 0.22, 'sine', 0.2);
+  } else if (k === 'boom') {
+    noise(0.06, 0.35, 3000, 'highpass');           // initial crack
+    noise(1.1, 0.55, 900, 'lowpass', 0, 60);       // pressure wave sweeping shut
+    tone(70, 18, 1.0, 'sine', 0.3);                // long sub rumble
+    setTimeout(() => { if (AC && !muted) noise(0.3, 0.12, 600, 'lowpass'); }, 140);   // debris
+  } else if (k === 'crash') {
+    noise(0.1, 0.28, 900, 'lowpass');              // body hit
+    tone(320 + Math.random() * 300, 90, 0.16, 'square', 0.05);   // panel clang
+    tone(520 + Math.random() * 400, 140, 0.11, 'square', 0.04);  // second partial
+    tone(90, 45, 0.12, 'sine', 0.12);              // frame thud
+  } else if (k === 'cannon') {
+    noise(0.05, 0.35, 2200, 'highpass');
+    noise(0.5, 0.45, 500, 'lowpass', 0, 80);
+    tone(55, 22, 0.5, 'sine', 0.28);
+  } else if (k === 'screech') {
+    noise(0.24, 0.1, 1150, 'bandpass', 9);         // resonant rubber squeal
+    tone(1250 + Math.random() * 150, 820, 0.22, 'sawtooth', 0.022);
+    tone(1560 + Math.random() * 150, 1020, 0.2, 'sawtooth', 0.014);
+  } else if (k === 'rocket') {
+    noise(0.4, 0.3, 1200, 'lowpass', 0, 300);      // whoosh trailing off
+    tone(280, 70, 0.4, 'sawtooth', 0.07);
+    tone(120, 40, 0.3, 'sine', 0.1);
+  } else if (k === 'flame') {
+    noise(0.22, 0.12, 700, 'bandpass', 0.8);
+  } else if (k === 'pickup') {
+    tone(880, 1320, 0.09, 'triangle', 0.07);
+    tone(1320, 1760, 0.1, 'triangle', 0.05);
+  } else if (k === 'cash') {
+    tone(1180, 1180, 0.06, 'triangle', 0.07);
+    tone(1770, 1770, 0.09, 'triangle', 0.06);
+  } else if (k === 'enter') {
+    tone(190, 330, 0.09, 'triangle', 0.06);
+  } else if (k === 'hurt') {
+    noise(0.07, 0.18, 500, 'bandpass', 1);
+    tone(140, 62, 0.13, 'sine', 0.13);
+  } else if (k === 'punch') {
+    noise(0.05, 0.24, 350, 'lowpass');
+    tone(95, 48, 0.08, 'sine', 0.14);
+  } else if (k === 'mission') {
+    tone(523, 523, 0.12, 'triangle', 0.07);
+    tone(659, 659, 0.12, 'triangle', 0.07, AC.currentTime + 0.11);
+    tone(784, 1046, 0.2, 'triangle', 0.08, AC.currentTime + 0.22);
+  } else if (k === 'fail') {
+    tone(320, 110, 0.5, 'sawtooth', 0.08);
+    tone(240, 82, 0.5, 'sawtooth', 0.05);
+  } else if (k === 'spray') {
+    noise(0.45, 0.12, 3600, 'highpass');           // aerosol hiss
+  } else if (k === 'frenzy') {
+    tone(200, 800, 0.5, 'square', 0.09);
+  } else if (k === 'buy') {
+    tone(660, 660, 0.08, 'triangle', 0.07);
+    tone(990, 990, 0.1, 'triangle', 0.06, AC.currentTime + 0.08);
+  }
 }
+let sirenOsc2 = null, sirenGainNode = null, sirenTargetGain = 0.028;
 function sirenOn() {
   if (!AC || muted || sirenOsc) return;
-  sirenOsc = AC.createOscillator(); sirenOsc.type = 'triangle'; sirenOsc.frequency.value = 720;
-  sirenLfo = AC.createOscillator(); sirenLfo.frequency.value = 0.85;
-  const lg = AC.createGain(); lg.gain.value = 190;
-  const g = AC.createGain(); g.gain.value = 0.02;
-  sirenLfo.connect(lg); lg.connect(sirenOsc.frequency);
-  sirenOsc.connect(g); g.connect(AC.destination);
-  sirenOsc.start(); sirenLfo.start();
+  // a real wail: two slightly detuned voices swept together, softened
+  sirenOsc = AC.createOscillator(); sirenOsc.type = 'triangle'; sirenOsc.frequency.value = 715;
+  sirenOsc2 = AC.createOscillator(); sirenOsc2.type = 'triangle'; sirenOsc2.frequency.value = 723;
+  sirenLfo = AC.createOscillator(); sirenLfo.frequency.value = 0.6;
+  const lg = AC.createGain(); lg.gain.value = 240;
+  const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2200;
+  sirenGainNode = AC.createGain(); sirenGainNode.gain.value = 0.001;
+  sirenLfo.connect(lg);
+  lg.connect(sirenOsc.frequency);
+  lg.connect(sirenOsc2.frequency);
+  sirenOsc.connect(lp); sirenOsc2.connect(lp);
+  lp.connect(sirenGainNode); sirenGainNode.connect(out());
+  sirenOsc.start(); sirenOsc2.start(); sirenLfo.start();
 }
 function sirenOff() {
-  if (sirenOsc) { try { sirenOsc.stop(); sirenLfo.stop(); } catch (e) {} sirenOsc = null; sirenLfo = null; }
+  if (sirenOsc) {
+    try { sirenOsc.stop(); sirenOsc2.stop(); sirenLfo.stop(); } catch (e) {}
+    sirenOsc = null; sirenOsc2 = null; sirenLfo = null; sirenGainNode = null;
+  }
+}
+// the engine under you: pitch follows speed, tank idles deeper. One
+// persistent voice, faded rather than restarted.
+let engOsc = null, engOsc2 = null, engGain = null, engLp = null;
+function updEngine() {
+  if (!AC) return;
+  const want = state === 'play' && !paused && player.car && !player.car.dead && !muted;
+  if (want && !engOsc) {
+    engOsc = AC.createOscillator(); engOsc.type = 'sawtooth';
+    engOsc2 = AC.createOscillator(); engOsc2.type = 'square';
+    engLp = AC.createBiquadFilter(); engLp.type = 'lowpass'; engLp.frequency.value = 320;
+    engGain = AC.createGain(); engGain.gain.value = 0.0001;
+    engOsc.connect(engLp); engOsc2.connect(engLp); engLp.connect(engGain); engGain.connect(out());
+    engOsc.start(); engOsc2.start();
+  }
+  if (!engOsc) return;
+  if (want) {
+    const sp = Math.abs(player.car.speed);
+    const f = (player.car.kind === 'tank' ? 26 : 42) + sp * 0.34;
+    engOsc.frequency.setTargetAtTime(f, AC.currentTime, 0.08);
+    engOsc2.frequency.setTargetAtTime(f * 0.5, AC.currentTime, 0.08);
+    engLp.frequency.setTargetAtTime(280 + sp * 2.4, AC.currentTime, 0.1);
+    engGain.gain.setTargetAtTime(player.car.kind === 'tank' ? 0.035 : 0.02, AC.currentTime, 0.15);
+  } else {
+    engGain.gain.setTargetAtTime(0.0001, AC.currentTime, 0.08);
+  }
+  // the wail rises as the cruiser closes in
+  if (sirenGainNode) sirenGainNode.gain.setTargetAtTime(sirenTargetGain, AC.currentTime, 0.2);
 }
 function updRadio() {
   if (!AC || muted || !radioOn || !player.car || state !== 'play' || paused || musicList.length) { radioT = AC ? AC.currentTime : 0; return; }
@@ -603,7 +847,7 @@ function isBridge(ix, iy) {
 }
 const buildings = [], trees = [], pickups = [], phones = [], lamps = [], pads = [], gunShops = [], foodCarts = [];
 const crosswalks = [];   // corner crossing points: { x, y, to: [far corners] }
-const props = { cranes: [], tanks: [], stacks: [], conts: [], bills: [], masts: [], ponds: [], gas: [], steeples: [], signs: [], tcranes: [], ships: [] };
+const props = { cranes: [], tanks: [], stacks: [], conts: [], bills: [], masts: [], ponds: [], gas: [], steeples: [], signs: [], tcranes: [], ships: [], churches: [] };
 let stadiumPos = null, policeStation = null, DISTRICT_MAP = null;
 let policePads = [];
 // story landmarks: your home, the new hideout, Jason, the Ledger press
@@ -613,12 +857,13 @@ const pressPts = [], precinctPts = [];
 // the Harbor Arms apartments (save icon at the door) + the hideout garage pad
 let savePoint = null, garagePad = null, saveHouseOpen = false, saveIcon = null;
 const modPads = [];                              // tune-up garage pads
-let modShopOpen = false;
+let modShopOpen = false, priestOpen = false;
 const parkSpots = [];                            // store parking bays — any spot may hold a car
 let hospitals = [], playerStart = null, armyBase = null, capitolPos = null;
+let tankRespawnT = 0;                            // counts up while the army pad sits empty
 // 0 north harbor, 1 south harbor (A<->B), 2 west causeway (A->3), 3 east causeway (B->3)
 const bridgesOpen = [false, false, false, false];
-const BRIDGE_GATES = [3, 17, 20, 20];      // missionsDone needed to open each
+const BRIDGE_GATES = [3, 17, 40, 30];      // N harbor, S harbor, WEST causeway (40), EAST causeway (30)
 function anyBridgeOpen() { return bridgesOpen[0] || bridgesOpen[1]; }
 
 function findTileNear(tx, ty, type) {
@@ -843,22 +1088,36 @@ function genCity() {
       } else if (kind === 'gas') {
         paveAll(x0, y0);
         markSolidRect(x0 + 5, y0 + 5, 2, 2);
-        buildings.push({ tx: x0 + 5, ty: y0 + 5, tw: 2, th: 2, floors: 2, tint: choice(CONC_TINTS), tex: 'conc', store: true });
+        buildings.push({ tx: x0 + 5, ty: y0 + 5, tw: 2, th: 2, floors: 2, tint: choice(CONC_TINTS), tex: 'conc', store: true, sign: 'gas' });
         props.gas.push({ x: (x0 + 2.5) * TILE, y: (y0 + 2.5) * TILE });
         props.signs.push({ x: (x0 + 0.5) * TILE, y: (y0 + 5.5) * TILE, tex: 'gas' });
       } else if (kind === 'church') {
-        markSolidRect(x0 + 2, y0 + 2, 3, 5);
-        buildings.push({ tx: x0 + 2, ty: y0 + 2, tw: 3, th: 5, floors: 2, tint: 0x6e6258, tex: 'brick', roof: true });
-        props.steeples.push({ x: (x0 + 3.5) * TILE, y: (y0 + 2.2) * TILE });
+        // a WALK-IN chapel: solid perimeter walls, open double door on the
+        // south face, walkable 2x4 nave inside — pews, altar, priest
+        const chx = x0 + 2, chy = y0 + 1;      // 4 x 6 tiles
+        for (let iy = chy; iy < chy + 6; iy++)
+          for (let ix = chx; ix < chx + 4; ix++) {
+            const edge = ix === chx || ix === chx + 3 || iy === chy || iy === chy + 5;
+            const doorGap = iy === chy + 5 && (ix === chx + 1 || ix === chx + 2);
+            if (edge && !doorGap) { tiles[idx(ix, iy)] = T_BLD; solid[idx(ix, iy)] = 1; }
+            else { tiles[idx(ix, iy)] = T_LOT; solid[idx(ix, iy)] = 0; }
+          }
+        props.churches.push({
+          tx: chx, ty: chy, tw: 4, th: 6,
+          cx: (chx + 2) * TILE, cy: (chy + 3) * TILE,
+          altarX: (chx + 2) * TILE, altarY: (chy + 1.1) * TILE,
+          doorX: (chx + 2) * TILE, doorY: (chy + 5.5) * TILE
+        });
+        props.steeples.push({ x: (chx + 2) * TILE, y: (chy - 0.4) * TILE });
         for (let iy = y0; iy < y0 + 8; iy++)
           for (let ix = x0; ix < x0 + 8; ix++)
             if (tileAt(ix, iy) === T_GRASS && rng() < 0.15) trees.push({ x: (ix + 0.5) * TILE, y: (iy + 0.5) * TILE, r: rr(10, 14) });
       } else if (kind === 'motel') {
         paveAll(x0, y0);
         markSolidRect(x0 + 1, y0 + 1, 6, 2);
-        buildings.push({ tx: x0 + 1, ty: y0 + 1, tw: 6, th: 2, floors: 2, tint: 0x6b4a3a, tex: 'brick', store: true });
+        buildings.push({ tx: x0 + 1, ty: y0 + 1, tw: 6, th: 2, floors: 2.3, tint: 0xcfc0a0, tex: 'motel', sign: 'motel' });
         markSolidRect(x0 + 1, y0 + 3, 2, 4);
-        buildings.push({ tx: x0 + 1, ty: y0 + 3, tw: 2, th: 4, floors: 2, tint: 0x6b4a3a, tex: 'brick' });
+        buildings.push({ tx: x0 + 1, ty: y0 + 3, tw: 2, th: 4, floors: 2.3, tint: 0xcfc0a0, tex: 'motel' });
         props.signs.push({ x: (x0 + 6.5) * TILE, y: (y0 + 5.5) * TILE, tex: 'motel' });
       } else if (kind === 'projects') {
         // identical housing slabs in a row
@@ -1019,6 +1278,7 @@ function genCity() {
   for (const st of props.stacks) bumpH(st.x, st.y, 36, 0);
   for (const tc of props.tcranes) bumpH(tc.x, tc.y, 32, 1);
   for (const sp of props.steeples) bumpH(sp.x, sp.y, 27, 0);
+  for (const ch of props.churches) bumpH(ch.cx, ch.cy, 19, 2);
   for (const ms of props.masts) bumpH(ms.x, ms.y, 28, 0);
   for (const ct of props.conts) bumpH(ct.x, ct.y, 15, 0);
   for (const tk of props.tanks) bumpH(tk.x, tk.y, 10, 0);
@@ -1189,11 +1449,15 @@ function mkPed(x, y, opts) {
 }
 
 // ---------------------------------------------------------------- player / weapons
+// BALANCE (2026-07-04): fists are a last resort (4 punches to drop a
+// civilian, 7 for a cop), the pistol is the honest baseline (2 / 4),
+// the uzi trades accuracy for volume, the shotgun only murders up close.
+// Enemy tiers (UNITS) stay: cop 7dmg -> swat 10 -> cia 14 -> mil 16.
 const WEAPONS = {
-  fist: { name: 'FISTS', rate: 0.4, melee: true, dmg: 25 },
-  pistol: { name: 'PISTOL', rate: 0.35, dmg: 25, spd: 750, spread: 0.05, life: 0.6, cdmg: 6, sfx: 'pistol' },
-  uzi: { name: 'UZI', rate: 0.09, dmg: 12, spd: 780, spread: 0.13, life: 0.5, cdmg: 4, sfx: 'uzi' },
-  shotgun: { name: 'SHOTGUN', rate: 0.85, dmg: 12, spd: 640, spread: 0.32, life: 0.28, cdmg: 5, pellets: 6, sfx: 'shotgun' },
+  fist: { name: 'FISTS', rate: 0.4, melee: true, dmg: 8 },
+  pistol: { name: 'PISTOL', rate: 0.35, dmg: 14, spd: 750, spread: 0.05, life: 0.6, cdmg: 5, sfx: 'pistol' },
+  uzi: { name: 'UZI', rate: 0.09, dmg: 8, spd: 780, spread: 0.13, life: 0.5, cdmg: 3, sfx: 'uzi' },
+  shotgun: { name: 'SHOTGUN', rate: 0.85, dmg: 9, spd: 640, spread: 0.32, life: 0.28, cdmg: 4, pellets: 6, sfx: 'shotgun' },
   flame: { name: 'FLAMER', rate: 0.05, flamer: true },
   grenade: { name: 'GRENADES', rate: 0.8, thrown: true },
   rpg: { name: 'ROCKETS', rate: 1.2, rocket: true }
@@ -1203,6 +1467,17 @@ const player = {
   x: 0, y: 0, angle: 0, hp: 100, armor: 0, cash: 0, car: null, weapon: 'fist',
   ammo: { pistol: 0, uzi: 0, shotgun: 0, flame: 0, grenade: 0, rpg: 0 }, fireT: 0, hurtT: 0, dead: false, mesh: null, aimHold: 0, rag: null
 };
+// the ledger of a ghost's night — read by the priest and anything else
+// that wants to judge you. Saved with the game.
+const STATS = {
+  carsDestroyed: 0, civiliansKilled: 0, copsKilled: 0, goonsKilled: 0,
+  pedsRunOver: 0, ammoSpent: 0, shotsHit: 0, missionsPassed: 0,
+  missionFails: 0, timesBusted: 0, timesWasted: 0, faresCompleted: 0,
+  cashEarned: 0, longestWanted: 0, distanceDriven: 0, distanceSwum: 0,
+  almsGiven: 0, atoned: 0
+};
+let wantedStreakT = 0;
+function statAccuracy() { return STATS.ammoSpent ? Math.round(100 * STATS.shotsHit / STATS.ammoSpent) : 0; }
 let heat = 0, wantedClearT = 0, copSeen = false, seenTick = 0, prevStars = 0, frenzy = null, aimTarget = null;
 let disarmT = 0, disarmCool = 0, armedTick = 0;   // open-carry warnings
 let best = 0;
@@ -1586,22 +1861,30 @@ function concTexture() {
   });
 }
 function storeTexture() {
-  // ground-floor band: awnings, glowing shop windows, doors, light spill
-  return mkTex(128, 32, g => {
-    g.fillStyle = '#2a2a2e'; g.fillRect(0, 0, 128, 32);
+  // ground-floor band: 8 narrow human-scale storefronts per texture —
+  // awning, glowing window with sill and mullion, door slot, light spill
+  return mkTex(256, 64, g => {
+    g.fillStyle = '#2a2a2e'; g.fillRect(0, 0, 256, 64);
     const aw = [['#7a1f1f', '#d8cfc0'], ['#1f4e6b', '#d8cfc0'], ['#3f6b2a', '#e8e0c8'], ['#6b4a1f', '#d8cfc0']];
-    for (let s = 0; s < 4; s++) {
-      const x = s * 32, [c1, c2] = aw[s];
-      for (let i = 0; i < 4; i++) { g.fillStyle = i % 2 ? c2 : c1; g.fillRect(x + 2 + i * 7, 2, 7, 6); }
+    for (let s = 0; s < 8; s++) {
+      const x = s * 32, [c1, c2] = aw[s % 4];
+      for (let i = 0; i < 4; i++) { g.fillStyle = i % 2 ? c2 : c1; g.fillRect(x + 2 + i * 7, 4, 7, 9); }
+      g.fillStyle = '#0e0f14';
+      g.fillRect(x + 2, 13, 20, 3);
       g.fillStyle = '#ffe9b0';
-      g.fillRect(x + 2, 10, 20, 16);
+      g.fillRect(x + 3, 18, 18, 32);
+      g.fillStyle = 'rgba(0,0,0,0.4)';
+      g.fillRect(x + 11, 18, 2, 32);
+      g.fillRect(x + 3, 33, 18, 2);
+      g.fillStyle = '#4a4438';
+      g.fillRect(x + 2, 50, 20, 3);
       g.fillStyle = '#15161c';
-      g.fillRect(x + 24, 10, 6, 18);
-      g.fillStyle = 'rgba(0,0,0,0.35)';
-      g.fillRect(x + 4, 14, 16, 2);
+      g.fillRect(x + 24, 14, 7, 42);
+      g.fillStyle = '#8a7a4a';
+      g.fillRect(x + 29, 34, 1, 5);
     }
     g.fillStyle = '#ffe9b0';
-    g.fillRect(0, 30, 128, 2);
+    g.fillRect(0, 60, 256, 4);
   });
 }
 function billTexture(bg, fg, l1, l2) {
@@ -1614,6 +1897,37 @@ function billTexture(bg, fg, l1, l2) {
     g.textAlign = 'center';
     g.fillText(l1, 64, 27);
     g.fillText(l2, 64, 53);
+  });
+}
+function motelTexture() {
+  // one room per 64px module: yellow door, number plate, and a BIG picture
+  // window (60% of wall height) with curtains and an AC grille below
+  return mkTex(256, 64, g => {
+    g.fillStyle = '#b0a084'; g.fillRect(0, 0, 256, 64);
+    g.fillStyle = 'rgba(0,0,0,0.18)'; g.fillRect(0, 0, 256, 4);
+    g.fillStyle = 'rgba(255,255,255,0.12)'; g.fillRect(0, 58, 256, 6);   // walkway skirt
+    for (let s = 0; s < 4; s++) {
+      const x = s * 64;
+      // the room door: muted, darker than the wall, with a number plate
+      g.fillStyle = '#7a5f2e'; g.fillRect(x + 8, 22, 10, 40);
+      g.fillStyle = 'rgba(0,0,0,0.4)'; g.fillRect(x + 8, 22, 10, 2);
+      g.fillStyle = '#d8d0be'; g.fillRect(x + 10, 26, 6, 3);
+      // the big picture window: wide glass, dark unless someone's home
+      const lit = Math.random() < 0.28;
+      g.fillStyle = '#847a64'; g.fillRect(x + 24, 18, 30, 36);   // frame
+      g.fillStyle = lit ? '#f0d090' : '#10151d';
+      g.fillRect(x + 26, 20, 26, 32);
+      g.fillStyle = lit ? 'rgba(170,130,70,0.75)' : 'rgba(180,190,210,0.14)';
+      g.fillRect(x + 26, 20, 4, 32);
+      g.fillRect(x + 48, 20, 4, 32);
+      g.fillStyle = 'rgba(0,0,0,0.35)';
+      g.fillRect(x + 38, 20, 2, 32);
+      if (!lit) { g.fillStyle = 'rgba(200,210,230,0.1)'; g.fillRect(x + 26, 20, 26, 9); }
+      // AC grille under the window
+      g.fillStyle = '#6a6154'; g.fillRect(x + 29, 56, 20, 6);
+      g.fillStyle = 'rgba(0,0,0,0.3)';
+      for (let gy = 57; gy < 61; gy += 2) g.fillRect(x + 30, gy, 18, 1);
+    }
   });
 }
 function garageTexture() {
@@ -1629,25 +1943,27 @@ function garageTexture() {
   });
 }
 function signTexture(bg, fg, text, cross) {
-  return mkTex(128, 32, g => {
-    g.fillStyle = bg; g.fillRect(0, 0, 128, 32);
+  // 256x64 so the lettering stays crisp when you stand at the door
+  return mkTex(256, 64, g => {
+    g.fillStyle = bg; g.fillRect(0, 0, 256, 64);
     g.strokeStyle = '#e8e8e8'; g.lineWidth = 2;
-    g.strokeRect(1, 1, 126, 30);
+    g.strokeRect(2, 2, 252, 60);
     if (cross) {
       g.fillStyle = '#c02020';
-      g.fillRect(8, 12, 18, 8);
-      g.fillRect(13, 7, 8, 18);
+      g.fillRect(16, 24, 36, 16);
+      g.fillRect(26, 14, 16, 36);
     }
     g.fillStyle = fg;
-    g.font = 'bold 15px monospace';
+    g.font = 'bold 30px monospace';
     g.textAlign = 'center';
-    g.fillText(text, cross ? 74 : 64, 21);
+    g.fillText(text, cross ? 148 : 128, 42);
   });
 }
 const TEXS = {
   brickA: brickTexture(false),
   brickB: brickTexture(true),
   glass: glassTexture(),
+  motel: motelTexture(),
   conc: concTexture(),
   store: storeTexture(),
   garage: garageTexture(),
@@ -1665,13 +1981,16 @@ const TEXS = {
     press: signTexture('#20242c', '#e8e4d0', 'THE LEDGER', false),
     apts: signTexture('#2a2018', '#ffd9a0', 'HARBOR ARMS', false),
     capitol: signTexture('#3a3628', '#f0ead2', 'STATE CAPITOL', false),
-    mod: signTexture('#170f2e', '#c890ff', 'TUNE-UP GARAGE', false)
+    mod: signTexture('#170f2e', '#c890ff', 'TUNE-UP GARAGE', false),
+    church: signTexture('#241c14', '#ffe9b0', 'FIRST CHAPEL', false)
   }
 };
 const roofMat = new THREE.MeshLambertMaterial({ color: 0x181b22 });
 const roofSlopeMat = new THREE.MeshLambertMaterial({ color: 0x42302c });
 const pilasterMat = new THREE.MeshLambertMaterial({ color: 0x2a2c33 });
 const doorMat = new THREE.MeshLambertMaterial({ color: 0x1c150e });
+const gableMat = new THREE.MeshLambertMaterial({ color: 0x54423a });   // painted gable boards
+const gableGeos = {};                                                  // shared per building width
 const wtTankMat = new THREE.MeshLambertMaterial({ color: 0x4a3828 });
 const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
 {
@@ -1686,10 +2005,11 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
     const W = b.tw * T2 - 0.6, D = b.th * T2 - 0.6, H = b.floors * 3.2;
     const cx = (b.tx + b.tw / 2) * T2, cz = (b.ty + b.th / 2) * T2;
     const base = b.tex === 'glass' ? TEXS.glass : b.tex === 'garage' ? TEXS.garage
+      : b.tex === 'motel' ? TEXS.motel
       : b.tex === 'brick' ? (Math.random() < 0.5 ? TEXS.brickA : TEXS.brickB) : TEXS.conc;
     const tex = base.clone();
     tex.needsUpdate = true;
-    tex.repeat.set(Math.max(1, Math.round(b.tw * 2)), b.tex === 'glass' ? Math.max(1, Math.round(b.floors / 4)) : b.floors);
+    tex.repeat.set(Math.max(1, Math.round(b.tw * 2)), b.tex === 'glass' ? Math.max(1, Math.round(b.floors / 4)) : b.tex === 'motel' ? 1 : b.floors);
     const wall = new THREE.MeshLambertMaterial({ color: b.tint, map: tex });
     const mesh = new THREE.Mesh(boxGeo, [wall, wall, roofMat, roofMat, wall, wall]);
     mesh.scale.set(W, H, D);
@@ -1698,7 +2018,7 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
     if (b.store) {
       const st = TEXS.store.clone();
       st.needsUpdate = true;
-      st.repeat.set(Math.max(1, b.tw), 1);
+      st.repeat.set(Math.max(2, b.tw * 2), 1);
       const sm = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ map: st }));
       sm.scale.set(W + 0.4, 3.3, D + 0.4);
       sm.position.set(cx, 1.65, cz);
@@ -1754,7 +2074,8 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
     }
     if (b.roof) {
       // pitched roof: two sloped slabs meeting at a ridge along the depth,
-      // ridge beam caps the seam so there is no gap at the peak
+      // ridge beam caps the seam, and triangular GABLE CAPS close both ends
+      // so the attic is never open to the street
       for (const s of [-1, 1]) {
         const slope = new THREE.Mesh(boxGeo, roofSlopeMat);
         slope.scale.set(W * 0.62, 0.35, D + 0.5);
@@ -1766,6 +2087,21 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
       ridge.scale.set(W * 0.18, 0.32, D + 0.55);
       ridge.position.set(cx, H + W * 0.3, cz);
       scene.add(ridge);
+      let gg = gableGeos[b.tw];
+      if (!gg) {
+        const tri = new THREE.Shape();
+        tri.moveTo(-W / 2 - 0.05, -0.1);
+        tri.lineTo(W / 2 + 0.05, -0.1);
+        tri.lineTo(0, W * 0.32);
+        tri.closePath();
+        gg = new THREE.ExtrudeGeometry(tri, { depth: 0.22, bevelEnabled: false });
+        gableGeos[b.tw] = gg;
+      }
+      for (const s of [-1, 1]) {
+        const cap = new THREE.Mesh(gg, gableMat);
+        cap.position.set(cx, H, cz + s * (D / 2 + 0.14) - 0.11);
+        scene.add(cap);
+      }
     }
     if (b.sign || (b.tex === 'conc' && b.floors >= 6)) {
       // corner pilasters: civic and heavy concrete buildings carry their
@@ -1779,32 +2115,190 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
     }
     if (b.sign) {
       // entry door on the first open face: framed inset, lit transom,
-      // doorstep, and a warm lamp — mission buildings have a way IN
+      // doorstep, warm lamp — and the business WEARS ITS NAME on the facade,
+      // with type-true architecture built around the entrance
       for (const [fx2, fz2] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) {
         const probeX = (b.tx + b.tw / 2 + fx2 * (b.tw / 2 + 0.6)) * TILE;
         const probeY = (b.ty + b.th / 2 + fz2 * (b.th / 2 + 0.6)) * TILE;
         if (solidAtPx(probeX, probeY)) continue;
         const dx2 = cx + fx2 * (W / 2 + 0.08), dz2 = cz + fz2 * (D / 2 + 0.08);
         const across = !!fx2;   // door plane faces along x?
+        const out = (v) => across ? fx2 * v : 0;        // offset off the wall
+        const outZ = (v) => across ? 0 : fz2 * v;
+        // doors sized to the people who use them: taller and wider than
+        // the character, transom and name stacked above
         const frame = new THREE.Mesh(boxGeo, pilasterMat);
-        frame.scale.set(across ? 0.18 : 2.3, 3.1, across ? 2.3 : 0.18);
-        frame.position.set(dx2, 1.55, dz2);
+        frame.scale.set(across ? 0.18 : 2.8, 4.8, across ? 2.8 : 0.18);
+        frame.position.set(dx2, 2.4, dz2);
         scene.add(frame);
         const door = new THREE.Mesh(boxGeo, doorMat);
-        door.scale.set(across ? 0.22 : 1.7, 2.6, across ? 1.7 : 0.22);
-        door.position.set(dx2 + (across ? fx2 * 0.05 : 0), 1.3, dz2 + (across ? 0 : fz2 * 0.05));
+        door.scale.set(across ? 0.22 : 2.15, 4.25, across ? 2.15 : 0.22);
+        door.position.set(dx2 + out(0.05), 2.12, dz2 + outZ(0.05));
         scene.add(door);
         const transom = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: 0xffdf9a }));
-        transom.scale.set(across ? 0.24 : 1.5, 0.35, across ? 1.5 : 0.24);
-        transom.position.set(dx2 + (across ? fx2 * 0.06 : 0), 2.85, dz2 + (across ? 0 : fz2 * 0.06));
+        transom.scale.set(across ? 0.24 : 1.9, 0.4, across ? 1.9 : 0.24);
+        transom.position.set(dx2 + out(0.06), 4.55, dz2 + outZ(0.06));
         scene.add(transom);
         const step = new THREE.Mesh(boxGeo, pilasterMat);
         step.scale.set(across ? 1.2 : 2.6, 0.28, across ? 2.6 : 1.2);
         step.position.set(dx2 + fx2 * 0.6, 0.14, dz2 + fz2 * 0.6);
         scene.add(step);
         const doorLamp = new THREE.Mesh(new THREE.SphereGeometry(0.16, 6, 5), new THREE.MeshBasicMaterial({ color: 0xffe9b0 }));
-        doorLamp.position.set(dx2 + fx2 * 0.35, 3.5, dz2 + fz2 * 0.35);
+        doorLamp.position.set(dx2 + fx2 * 0.35, 5.15, dz2 + fz2 * 0.35);
         scene.add(doorLamp);
+        // the name over the door, on the WALL where the street reads it
+        if (b.sign !== 'capitol' && b.sign !== 'motel') {
+          const fs = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ map: TEXS.signs[b.sign] }));
+          fs.scale.set(across ? 0.2 : 3.4, 0.85, across ? 3.4 : 0.2);
+          fs.position.set(dx2 + out(0.07), 5.45, dz2 + outZ(0.07));
+          scene.add(fs);
+        }
+        // ---- type-true architecture at the entrance
+        if (b.sign === 'police') {
+          // twin blue precinct globes flanking the steps + rooftop mast
+          for (const s of [-1, 1]) {
+            const px3 = dx2 + out(0.9) + (across ? 0 : s * 1.5);
+            const pz3 = dz2 + outZ(0.9) + (across ? s * 1.5 : 0);
+            const post = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 1.8, 6), pilasterMat);
+            post.position.set(px3, 0.9, pz3);
+            scene.add(post);
+            const globe = new THREE.Mesh(new THREE.SphereGeometry(0.17, 8, 6), new THREE.MeshBasicMaterial({ color: 0x4f86ff }));
+            globe.position.set(px3, 1.95, pz3);
+            scene.add(globe);
+          }
+          const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 5, 5), pilasterMat);
+          mast.position.set(cx, H + 2.5, cz);
+          scene.add(mast);
+        } else if (b.sign === 'hospital') {
+          // EMERGENCY drive-up canopy on posts + rooftop helipad H
+          const can = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0xe8e8e4 }));
+          can.scale.set(across ? 3.4 : 6.4, 0.3, across ? 6.4 : 3.4);
+          can.position.set(dx2 + out(1.9), 4.6, dz2 + outZ(1.9));
+          scene.add(can);
+          const band = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: 0xc02020 }));
+          band.scale.set(across ? 0.2 : 6.4, 0.5, across ? 6.4 : 0.2);
+          band.position.set(dx2 + out(3.45), 4.6, dz2 + outZ(3.45));
+          scene.add(band);
+          for (const s of [-1, 1]) {
+            const post = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 4.5, 6), pilasterMat);
+            post.position.set(dx2 + out(3.3) + (across ? 0 : s * 2.9), 2.25, dz2 + outZ(3.3) + (across ? s * 2.9 : 0));
+            scene.add(post);
+          }
+          const padMat2 = new THREE.MeshLambertMaterial({ color: 0xf0f0ec });
+          for (const [sx3, sz3, w3, d3] of [[-0.9, 0, 0.42, 2.6], [0.9, 0, 0.42, 2.6], [0, 0, 1.5, 0.42]]) {
+            const bar = new THREE.Mesh(boxGeo, padMat2);
+            bar.scale.set(w3, 0.14, d3);
+            bar.position.set(cx + sx3, H + 0.1, cz + sz3);
+            scene.add(bar);
+          }
+        } else if (b.sign === 'mall') {
+          // glass entrance atrium rising past the roofline
+          const atr = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x1c3a58, transparent: true, opacity: 0.85 }));
+          atr.scale.set(across ? 1.6 : 7.5, H + 2.4, across ? 7.5 : 1.6);
+          atr.position.set(dx2 + out(0.7), (H + 2.4) / 2, dz2 + outZ(0.7));
+          scene.add(atr);
+          const trim2 = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: 0xffd9a0 }));
+          trim2.scale.set(across ? 1.7 : 7.7, 0.25, across ? 7.7 : 1.7);
+          trim2.position.set(dx2 + out(0.7), H + 2.5, dz2 + outZ(0.7));
+          scene.add(trim2);
+        } else if (b.sign === 'motel') {
+          // roadside single-story kit: covered walkway on posts, concrete
+          // apron, shallow shingle roof with a cupola, rooftop MOTEL frame
+          const canM = new THREE.MeshLambertMaterial({ color: 0x7a6a52 });
+          const can2 = new THREE.Mesh(boxGeo, canM);
+          can2.scale.set(across ? 3 : W + 1, 0.22, across ? D + 1 : 3);
+          can2.position.set(dx2 + out(1.4), 5.1, dz2 + outZ(1.4));
+          scene.add(can2);
+          const nPosts = Math.max(3, Math.floor((across ? D : W) / 6));
+          for (let pi2 = 0; pi2 < nPosts; pi2++) {
+            const t3 = (pi2 + 0.5) / nPosts - 0.5;
+            const post = new THREE.Mesh(boxGeo, canM);
+            post.scale.set(0.24, 5, 0.24);
+            post.position.set(
+              across ? dx2 + out(2.6) : cx + t3 * (W - 1),
+              2.5,
+              across ? cz + t3 * (D - 1) : dz2 + outZ(2.6));
+            scene.add(post);
+          }
+          const apron = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x9a958c }));
+          apron.scale.set(across ? 3.2 : W + 1.2, 0.14, across ? D + 1.2 : 3.2);
+          apron.position.set(dx2 + out(1.5), 0.07, dz2 + outZ(1.5));
+          scene.add(apron);
+          // shallow pitched roof + cupola vent
+          for (const s of [-1, 1]) {
+            const slope = new THREE.Mesh(boxGeo, roofSlopeMat);
+            slope.scale.set(across ? W * 0.6 : W * 0.56, 0.3, across ? D * 0.56 : D + 1.2);
+            if (across) slope.rotation.x = s * 0.3; else slope.rotation.z = s * 0.3;
+            if (across) slope.position.set(cx, H + 0.9, cz - s * D * 0.22);
+            else slope.position.set(cx - s * W * 0.22, H + 0.9, cz);
+            scene.add(slope);
+          }
+          const cup = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0xd8d0be }));
+          cup.scale.set(1.3, 1.2, 1.3);
+          cup.position.set(cx, H + 2.2, cz);
+          scene.add(cup);
+          const cupCap = new THREE.Mesh(new THREE.ConeGeometry(1.15, 0.9, 4), roofSlopeMat);
+          cupCap.position.set(cx, H + 3.2, cz);
+          cupCap.rotation.y = Math.PI / 4;
+          scene.add(cupCap);
+          // the rooftop MOTEL frame sign
+          for (const s of [-1, 1]) {
+            const leg = new THREE.Mesh(boxGeo, pilasterMat);
+            leg.scale.set(across ? 0.16 : 0.16, 2.6, 0.16);
+            leg.position.set(
+              across ? cx : cx + s * 2.8,
+              H + 1.6,
+              across ? cz + s * 2.8 : cz);
+            scene.add(leg);
+          }
+          const roofSign = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ map: TEXS.signs.motel }));
+          roofSign.scale.set(across ? 0.25 : 6.5, 1.6, across ? 6.5 : 0.25);
+          roofSign.position.set(cx, H + 3.3, cz);
+          scene.add(roofSign);
+        } else if (b.sign === 'church') {
+          // arch over the door + a glowing rose window on the gable
+          const arch = new THREE.Mesh(new THREE.CylinderGeometry(1.25, 1.25, 0.28, 10, 1, false, 0, Math.PI), new THREE.MeshLambertMaterial({ color: 0x584a40 }));
+          arch.rotation.x = Math.PI / 2;
+          arch.rotation.y = across ? 0 : Math.PI / 2;
+          arch.position.set(dx2 + out(0.06), 3.15, dz2 + outZ(0.06));
+          scene.add(arch);
+          const rose = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.85, 0.18, 12), new THREE.MeshBasicMaterial({ color: 0xd8a44f }));
+          rose.rotation.x = Math.PI / 2;
+          rose.rotation.z = across ? Math.PI / 2 : 0;
+          rose.position.set(dx2 + out(0.04), H - 0.6, dz2 + outZ(0.04));
+          scene.add(rose);
+        } else if (b.sign === 'press') {
+          // loading dock with a roller door, paper rolls, printing roof vents
+          const dock = new THREE.Mesh(boxGeo, pilasterMat);
+          dock.scale.set(across ? 2.2 : 5, 0.9, across ? 5 : 2.2);
+          dock.position.set(dx2 + out(1.2) + (across ? 0 : 4), 0.45, dz2 + outZ(1.2) + (across ? 4 : 0));
+          scene.add(dock);
+          const roller = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x5c5f66 }));
+          roller.scale.set(across ? 0.2 : 3.4, 2.6, across ? 3.4 : 0.2);
+          roller.position.set(dx2 + out(0.04) + (across ? 0 : 4), 2.2, dz2 + outZ(0.04) + (across ? 4 : 0));
+          scene.add(roller);
+          const rollMat2 = new THREE.MeshLambertMaterial({ color: 0xd8d4c8 });
+          for (const rr2 of [-1, 0.2]) {
+            const roll = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 1.3, 8), rollMat2);
+            roll.rotation.z = Math.PI / 2;
+            roll.position.set(dx2 + out(2.4) + (across ? 0 : 4 + rr2), 0.55, dz2 + outZ(2.4) + (across ? 4 + rr2 : 0));
+            scene.add(roll);
+          }
+          for (let vi = 0; vi < 3; vi++) {
+            const vent = new THREE.Mesh(boxGeo, pilasterMat);
+            vent.scale.set(1, 0.9, 1.6);
+            vent.position.set(cx - W * 0.3 + vi * W * 0.3, H + 0.45, cz - D * 0.2);
+            scene.add(vent);
+          }
+        } else if (b.sign === 'apts') {
+          // fabric awning over the stoop
+          const awn = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x2e4a34 }));
+          awn.scale.set(across ? 1.6 : 2.6, 0.14, across ? 2.6 : 1.6);
+          awn.rotation.z = across ? fx2 * 0.28 : 0;
+          awn.rotation.x = across ? 0 : -fz2 * 0.28;
+          awn.position.set(dx2 + out(0.75), 3.25, dz2 + outZ(0.75));
+          scene.add(awn);
+        }
         break;
       }
     }
@@ -2110,36 +2604,150 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
     for (const gs of gunShops) {
       const gx = gs.x * RS, gz = gs.y * RS;
       const back = new THREE.Mesh(kioskBox, wallM);
-      back.scale.set(7.6, 3.4, 0.3);
-      back.position.set(gx, 1.7, gz - 2.5);
+      back.scale.set(7.6, 4.7, 0.3);
+      back.position.set(gx, 2.35, gz - 2.5);
       scene.add(back);
       for (const s of [-1, 1]) {
         const side = new THREE.Mesh(kioskBox, wallM);
-        side.scale.set(0.3, 3.4, 5.2);
-        side.position.set(gx + s * 3.7, 1.7, gz);
+        side.scale.set(0.3, 4.7, 5.2);
+        side.position.set(gx + s * 3.7, 2.35, gz);
         scene.add(side);
       }
       const roof = new THREE.Mesh(kioskBox, wallM);
       roof.scale.set(8.2, 0.3, 5.8);
-      roof.position.set(gx, 3.55, gz);
+      roof.position.set(gx, 4.85, gz);
       scene.add(roof);
       const mat2 = new THREE.Mesh(kioskBox, matM);
       mat2.scale.set(7.6, 0.08, 5.2);
       mat2.position.set(gx, 0.04, gz);
       scene.add(mat2);
       const counter = new THREE.Mesh(kioskBox, counterM);
-      counter.scale.set(6.2, 1.1, 0.9);
-      counter.position.set(gx, 0.55, gz + 0.9);
+      counter.scale.set(6.2, 1.35, 0.9);
+      counter.position.set(gx, 0.67, gz + 0.9);
       scene.add(counter);
       // the wall rack
       let rx2 = gx - 2.1;
       for (const wk of ['pistol', 'shotgun', 'uzi']) {
         const wm = buildWeaponMesh(wk);
         wm.scale.set(1.5, 1.5, 1.5);
-        wm.position.set(rx2, 2.2, gz - 2.25);
+        wm.position.set(rx2, 3.1, gz - 2.25);
         scene.add(wm);
         rx2 += 2.1;
       }
+    }
+  }
+  // walk-in chapels: real interiors — perimeter walls with an open double
+  // door, pews, altar, cross, candlelight. The congregation prays inside.
+  {
+    const chBox = new THREE.BoxGeometry(1, 1, 1);
+    const wallM = new THREE.MeshLambertMaterial({ color: 0x6e6258, side: THREE.DoubleSide });
+    const woodM = new THREE.MeshLambertMaterial({ color: 0x4a3524 });
+    const carpetM = new THREE.MeshLambertMaterial({ color: 0x5a1e22 });
+    const stoneM = new THREE.MeshLambertMaterial({ color: 0x8a8278 });
+    const T3 = TILE * RS;
+    for (const ch of props.churches) {
+      const x0r = ch.tx * T3, z0r = ch.ty * T3;
+      const Wr = ch.tw * T3, Dr = ch.th * T3;        // 48 x 72
+      const cxr = x0r + Wr / 2, czr = z0r + Dr / 2;
+      const Hc = 7;
+      const wall = (w2, h2, d2, px2, py2, pz2) => {
+        const m = new THREE.Mesh(chBox, wallM);
+        m.scale.set(w2, h2, d2);
+        m.position.set(px2, py2, pz2);
+        scene.add(m);
+      };
+      wall(Wr, Hc, 1, cxr, Hc / 2, z0r + 0.5);                       // north
+      wall(1, Hc, Dr, x0r + 0.5, Hc / 2, czr);                       // west
+      wall(1, Hc, Dr, x0r + Wr - 0.5, Hc / 2, czr);                  // east
+      wall(T3, Hc, 1, x0r + T3 / 2, Hc / 2, z0r + Dr - 0.5);         // south, left of door
+      wall(T3, Hc, 1, x0r + Wr - T3 / 2, Hc / 2, z0r + Dr - 0.5);    // south, right of door
+      wall(2 * T3, Hc - 4.7, 1, cxr, 4.7 + (Hc - 4.7) / 2, z0r + Dr - 0.5);   // lintel over the doors
+      const ceil2 = new THREE.Mesh(chBox, wallM);
+      ceil2.scale.set(Wr, 0.35, Dr);
+      ceil2.position.set(cxr, Hc + 0.2, czr);
+      scene.add(ceil2);
+      // steep nave roof + gable caps
+      for (const s of [-1, 1]) {
+        const slope = new THREE.Mesh(chBox, roofSlopeMat);
+        slope.scale.set(Wr * 0.6, 0.4, Dr + 0.6);
+        slope.rotation.z = s * 0.48;
+        slope.position.set(cxr - s * Wr * 0.22, Hc + 5.4, czr);
+        scene.add(slope);
+      }
+      const ridge = new THREE.Mesh(chBox, roofSlopeMat);
+      ridge.scale.set(Wr * 0.16, 0.4, Dr + 0.65);
+      ridge.position.set(cxr, Hc + 11, czr);
+      scene.add(ridge);
+      const tri = new THREE.Shape();
+      tri.moveTo(-Wr / 2 - 0.1, 0);
+      tri.lineTo(Wr / 2 + 0.1, 0);
+      tri.lineTo(0, 11.3);
+      tri.closePath();
+      const gg2 = new THREE.ExtrudeGeometry(tri, { depth: 0.25, bevelEnabled: false });
+      for (const s of [-1, 1]) {
+        const cap = new THREE.Mesh(gg2, gableMat);
+        cap.position.set(cxr, Hc + 0.15, czr + s * (Dr / 2 + 0.15) - 0.12);
+        scene.add(cap);
+      }
+      // interior: carpet aisle, pews, altar riser + table, cross, candles
+      const carpet = new THREE.Mesh(chBox, carpetM);
+      carpet.scale.set(6, 0.08, Dr - 4);
+      carpet.position.set(cxr, 0.05, czr + 1);
+      scene.add(carpet);
+      for (let r = 0; r < 3; r++) {
+        for (const s of [-1, 1]) {
+          const pew = new THREE.Mesh(chBox, woodM);
+          pew.scale.set(8, 1, 2);
+          pew.position.set(cxr + s * 8.2, 0.5, z0r + Dr * 0.42 + r * 8);
+          scene.add(pew);
+          const back = new THREE.Mesh(chBox, woodM);
+          back.scale.set(8, 1.1, 0.35);
+          back.position.set(cxr + s * 8.2, 1.4, z0r + Dr * 0.42 + r * 8 + 0.95);
+          scene.add(back);
+        }
+      }
+      const riser = new THREE.Mesh(chBox, stoneM);
+      riser.scale.set(Wr - 6, 0.55, 9);
+      riser.position.set(cxr, 0.27, z0r + 6.5);
+      scene.add(riser);
+      const altar = new THREE.Mesh(chBox, woodM);
+      altar.scale.set(6.5, 2, 2.6);
+      altar.position.set(cxr, 1.55, z0r + 6.5);
+      scene.add(altar);
+      const crossM2 = new THREE.MeshBasicMaterial({ color: 0xffe9b0 });
+      const cv = new THREE.Mesh(chBox, crossM2);
+      cv.scale.set(0.4, 3.6, 0.3);
+      cv.position.set(cxr, 4.2, z0r + 1.25);
+      scene.add(cv);
+      const chz = new THREE.Mesh(chBox, crossM2);
+      chz.scale.set(2, 0.4, 0.3);
+      chz.position.set(cxr, 4.9, z0r + 1.25);
+      scene.add(chz);
+      for (const s of [-1, 1]) {
+        const stand = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.2, 2.6, 6), woodM);
+        stand.position.set(cxr + s * 6.5, 1.3, z0r + 7.5);
+        scene.add(stand);
+        const flame = new THREE.Mesh(new THREE.SphereGeometry(0.22, 6, 5), new THREE.MeshBasicMaterial({ color: 0xffc966 }));
+        flame.position.set(cxr + s * 6.5, 2.85, z0r + 7.5);
+        scene.add(flame);
+      }
+      const glow = new THREE.PointLight(0xffd9a0, 1.1, 46, 1.4);
+      glow.position.set(cxr, 4.6, czr);
+      scene.add(glow);
+      // facade over the open doors: arch, FIRST CHAPEL, rose window
+      const fz = z0r + Dr + 0.12;
+      const arch = new THREE.Mesh(new THREE.CylinderGeometry(1.9, 1.9, 0.35, 12, 1, false, 0, Math.PI), stoneM);
+      arch.rotation.x = Math.PI / 2;
+      arch.position.set(cxr, 4.7, fz);
+      scene.add(arch);
+      const fsign = new THREE.Mesh(chBox, new THREE.MeshBasicMaterial({ map: TEXS.signs.church }));
+      fsign.scale.set(4, 0.9, 0.22);
+      fsign.position.set(cxr, 6.35, fz);
+      scene.add(fsign);
+      const rose = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 1.5, 0.22, 14), new THREE.MeshBasicMaterial({ color: 0xd8a44f }));
+      rose.rotation.x = Math.PI / 2;
+      rose.position.set(cxr, Hc + 4.5, czr + Dr / 2 + 0.05);
+      scene.add(rose);
     }
   }
   // free-standing lit signs (motel / gas)
@@ -2666,6 +3274,18 @@ function buildCarMesh(c) {
   }
   // (headlight illumination comes from the shared spotlight pool — see HEADLIGHTS)
   if (c.kind === 'cop') {
+    // the push bar: black ram frame ahead of the front bumper
+    const ramMat = new THREE.MeshLambertMaterial({ color: 0x14161a });
+    for (const s of [-1, 1]) {
+      const up = new THREE.Mesh(new THREE.BoxGeometry(0.5, 1.1, 0.18), ramMat);
+      up.position.set(L / 2 + 0.35, 0.85, s * W * 0.2);
+      g.add(up);
+    }
+    for (const hy of [0.5, 1.1]) {
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.2, W * 0.62), ramMat);
+      bar.position.set(L / 2 + 0.42, hy, 0);
+      g.add(bar);
+    }
     const r = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.28, 0.5), new THREE.MeshBasicMaterial({ color: 0xff3030 }));
     r.position.set(0, 2.6, W * 0.18);
     const bl = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.28, 0.5), new THREE.MeshBasicMaterial({ color: 0x3060ff }));
@@ -2821,6 +3441,26 @@ function ragPose(m, rag, t) {
 function attachPedMesh(p) {
   const headCol = p.cop ? (UNITS[p.unit] || UNITS.cop).head : 0xe0b090;
   p.mesh = buildPedMesh(p.shirt, headCol);
+  if (p.shopkeep) {
+    // the house minigun, out of sight under the counter until provoked
+    const ud2 = p.mesh.userData;
+    const mg = new THREE.Group();
+    const mgBody = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.28, 0.8, 8), new THREE.MeshLambertMaterial({ color: 0x26282e }));
+    mgBody.rotation.z = Math.PI / 2;
+    mg.add(mgBody);
+    const mgBarrelMat = new THREE.MeshLambertMaterial({ color: 0x44464e });
+    for (const [oy2, oz2] of [[0.12, 0], [-0.07, 0.1], [-0.07, -0.1]]) {
+      const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1.1, 6), mgBarrelMat);
+      bar.rotation.z = Math.PI / 2;
+      bar.position.set(0.7, oy2, oz2);
+      mg.add(bar);
+    }
+    mg.position.set(0.12, -1.05, 0);
+    mg.rotation.z = -1.35;
+    mg.visible = false;
+    ud2.armR.add(mg);
+    ud2.minigun = mg;
+  }
   if (p.cop) {
     const ud = p.mesh.userData;
     // hip holster — worn whenever the pistol isn't drawn
@@ -3056,7 +3696,7 @@ function carDamage(c, amt, by) {
 }
 function scare(x, y, r) {
   for (const p of peds) {
-    if (p.cop || p.guard || p.goon || p.vip || p.shopkeep || p.fare || p.dead) continue;
+    if (p.cop || p.guard || p.goon || p.vip || p.shopkeep || p.fare || p.priest || p.prayer || p.dead) continue;
     if (dist(p.x, p.y, x, y) < r) {
       p.state = 'flee';
       p.fleeT = rndf(3, 5.5);
@@ -3067,6 +3707,8 @@ function scare(x, y, r) {
 }
 function explodeAt(x, y, by) {
   sfx('boom');
+  const dP = dist(player.x, player.y, x, y);
+  if (dP < 420) rumble(clamp(1.1 - dP / 420, 0.2, 1), clamp(1 - dP / 420, 0.2, 0.9), 380);
   scare(x, y, 450);
   boomFx(x, y);
   for (const p of peds) {
@@ -3085,6 +3727,7 @@ function explodeAt(x, y, by) {
 function explodeCar(c) {
   if (c.dead) return;
   c.dead = true;
+  if (c.dmgBy === 'p') STATS.carsDestroyed++;
   const wasIn = player.car === c;
   explodeAt(c.x, c.y, c.dmgBy);
   if (wasIn) { player.car = null; player.x = c.x; player.y = c.y; hurtPlayer(200); }
@@ -3181,10 +3824,35 @@ function stepPlayerCar(c, dt) {
   const right = key('KeyD') || key('ArrowRight');
   const hand = key('Space') || padHand;
   const kmax = CAR_KINDS[c.kind].max * modF(c, 'eng') * (c.hp < 35 ? 0.6 : 1);
-  if (thr > 0.03) c.speed += 210 * thr * dt;
-  if (brk > 0.03) c.speed -= 280 * brk * dt;
-  if (thr <= 0.03 && brk <= 0.03) c.speed *= Math.pow(0.45, dt);
+  // the trigger IS the throttle, 0..100 literal: everything the controller
+  // registers maps to force AND cruise speed (2% noise floor normalized out)
+  const thrN = clamp((thr - 0.02) / 0.96, 0, 1);
+  const brkN = clamp((brk - 0.02) / 0.96, 0, 1);
+  // gear-change beat: crossing zero under power holds the car still for
+  // half a second before it pulls away in the OPPOSITE direction
+  c.dirPause = Math.max(0, (c.dirPause || 0) - dt);
+  const s0 = c.speed;
+  // the throttle point: partial pull = proportional cruise target
+  const cap = thrN > 0 && thrN < 0.98 ? kmax * Math.max(0.12, thrN) : kmax;
+  if (thrN > 0 && c.speed < cap) c.speed = Math.min(cap, c.speed + 210 * thrN * dt);
+  if (brkN > 0) c.speed -= 280 * brkN * dt;
+  if (thrN <= 0 && brkN <= 0) {
+    // throttle released: the car COASTS — light aero drag plus rolling
+    // resistance, not an anchor. Brakes and handbrake do the stopping.
+    c.speed *= Math.pow(0.9, dt);
+    c.speed -= Math.sign(c.speed) * Math.min(Math.abs(c.speed), 7 * dt);
+  }
   if (hand) c.speed *= Math.pow(0.3, dt);
+  // easing the trigger back settles DOWN to the new cruise point smoothly
+  // (engine braking), never an instant clamp
+  if (thrN > 0 && c.speed > cap) c.speed = Math.max(cap, c.speed * Math.pow(0.62, dt));
+  if (s0 !== 0 && c.speed * s0 < 0) {
+    // sign flipped under input this frame: stop dead, hold the beat
+    c.speed = 0;
+    c.dirPause = 0.5;
+  } else if (c.dirPause > 0 && Math.abs(s0) < 1) {
+    c.speed = 0;                              // holding at rest until the gear takes
+  }
   c.speed = clamp(c.speed, -95, kmax);
   const steer = (right ? 1 : 0) - (left ? 1 : 0) || clamp(padLX * 1.25, -1, 1);
   const dA = steer * 2.6 * (hand ? 1.5 : 1) * (c.kind === 'tank' ? 0.55 : 1) * clamp(c.speed / 140, -1, 1) * dt;
@@ -3192,11 +3860,13 @@ function stepPlayerCar(c, dt) {
   c.steerVis = steer * 0.42;                     // wheels track the wheel, even at a standstill
   tireGrip(c, dt, hand ? 0.35 : 1);              // handbrake cuts grip: controlled slides
   moveCar(c, dt);
+  STATS.distanceDriven += Math.abs(c.speed) * dt;
   // skid feedback: screech + rubber on the road
   if (c.skidding && Math.abs(c.speed) + Math.abs(c.latV) > 80) {
     c.skidT -= dt;
     if (c.skidT <= 0) {
       c.skidT = 0.09;
+      rumble(0.12, clamp(Math.abs(c.latV) / 250, 0.25, 0.6), 140);   // tires talking through the wheel
       sfx('screech');
       const cs = Math.cos(c.angle), sn = Math.sin(c.angle);
       const L2 = c.len * 0.32, W2 = c.w * 0.32;
@@ -3245,6 +3915,27 @@ function updTraffic(c, dt) {
   }
 }
 function updCopCar(c, dt) {
+  c.ramT = (c.ramT || 0) - dt;
+  c.pitT = (c.pitT || 0) - dt;
+  // PIT MANEUVER: at 2+ stars, a cruiser that reaches your rear quarter at
+  // speed steers in and kicks the back end out — trained, cooldown-limited
+  if (!c.quarry && player.car && !player.car.dead && stars() >= 2 && c.pitT <= 0 && Math.abs(c.speed) > 90 && Math.abs(player.car.speed) > 70) {
+    const pc2 = player.car;
+    const ca2 = Math.cos(pc2.angle), sa2 = Math.sin(pc2.angle);
+    const lx2 = (c.x - pc2.x) * ca2 + (c.y - pc2.y) * sa2;
+    const ly2 = -(c.x - pc2.x) * sa2 + (c.y - pc2.y) * ca2;
+    if (lx2 < -pc2.len * 0.15 && lx2 > -pc2.len * 0.9 && Math.abs(ly2) > pc2.w * 0.35 && Math.abs(ly2) < pc2.w * 1.35) {
+      c.pitT = 6;
+      const side = Math.sign(ly2) || 1;
+      pc2.latV += -side * 150;                 // rear steps out, away from the cruiser
+      pc2.speed *= 0.8;
+      c.speed *= 0.85;
+      rumble(0.65, 0.65, 320);
+      sfx('screech');
+      msg('PIT — they clipped your rear quarter!', 5);
+      if (window._pitdbg) console.log('PITDBG executed side=' + side + ' latV=' + Math.round(pc2.latV));
+    }
+  }
   let t = focus();
   if (c.quarry) {
     if (c.quarry.dead || !c.quarry.outlaw) c.quarry = null;
@@ -3260,7 +3951,7 @@ function updCopCar(c, dt) {
   if (c.revT > 0) {
     c.revT -= dt;
     c.speed = Math.max(c.speed - 200 * dt, -80);
-  } else if (d > 55) {
+  } else if (d > (c.quarry ? 55 : combatMission() ? 300 : 55)) {   // cruisers park outside an active firefight
     c.speed = Math.min(c.speed + 170 * dt, CAR_KINDS.cop.max);
     if (Math.abs(c.speed) < 18) { c.stuck += dt; if (c.stuck > 1.2) { c.revT = 0.8; c.stuck = 0; } }
     else c.stuck = 0;
@@ -3435,6 +4126,8 @@ function updTaxi(dt) {
     }
   } else if (dist(player.car.x, player.car.y, F.dx, F.dy) < 60 && Math.abs(player.car.speed) < 12) {
     player.cash += F.pay;
+    STATS.faresCompleted++;
+    STATS.cashEarned += F.pay;
     saveBest();
     msg('Fare paid $' + F.pay + '. "' + pick(CHATTER.fareThanks) + '"', 7);
     sfx('cash');
@@ -3502,6 +4195,7 @@ function updSwim(dt) {
   if (Math.abs(player.wvx) + Math.abs(player.wvy) > 1) {
     if (canSwimTo(player.x + player.wvx * dt, player.y)) player.x += player.wvx * dt;
     if (canSwimTo(player.x, player.y + player.wvy * dt)) player.y += player.wvy * dt;
+    STATS.distanceSwum += Math.hypot(player.wvx, player.wvy) * dt;
   }
   // vertical: Space kicks down, swimming while looking down goes down,
   // idle buoyancy drifts you back to the surface
@@ -3638,6 +4332,18 @@ const CHATTER = {
     'Keep the change.',
     'Smooth ride, ghost.',
     'You drive like the devil. I love it.'
+  ],
+  priest: [
+    'Peace, wanderer. The chapel is open to all.',
+    'Even a ghost casts a shadow in candlelight.',
+    'The Combine owns the streets. Not this floor.',
+    'Come to trade sins for mercy?'
+  ],
+  prayer: [
+    'Amen.',
+    '...deliver us from the Combine...',
+    '...watch over the docks tonight...',
+    '...and forgive the ghost his debts...'
   ]
 };
 function pick(arr) { return arr[(Math.random() * arr.length) | 0]; }
@@ -3650,7 +4356,7 @@ function say(p, text, life) {
 function sayNear(x, y, r, pool, life) {
   let bp = null, bd = r;
   for (const p of peds) {
-    if (p.dead || p.rag || p.cop || p.guard || p.goon || p.vip || p.shopkeep || (p.voxT || 0) > 0) continue;
+    if (p.dead || p.rag || p.cop || p.guard || p.goon || p.vip || p.shopkeep || p.priest || p.prayer || (p.voxT || 0) > 0) continue;
     const d = dist(p.x, p.y, x, y);
     if (d < bd) { bd = d; bp = p; }
   }
@@ -3668,7 +4374,7 @@ function updChatter(dt) {
   chatT = rndf(3.5, 7);
   const cands = [];
   for (const p of peds) {
-    if (p.dead || p.rag || p.vip || p.guard || p.goon || p.shopkeep || (p.voxT || 0) > 0 || p.state === 'flee') continue;
+    if (p.dead || p.rag || p.vip || p.guard || p.goon || p.shopkeep || p.priest || p.prayer || (p.voxT || 0) > 0 || p.state === 'flee') continue;
     const d = dist(p.x, p.y, player.x, player.y);
     if (d < 520) cands.push({ p, d });
   }
@@ -4184,10 +4890,31 @@ function carCollisions() {
         if (Math.abs(tank.speed) > 40) carDamage(vict, 400, tank.driver === 'player' ? 'p' : null);
       }
       const impact = Math.abs(a.speed) + Math.abs(b.speed);
+      // RAM BARS: a pursuing cruiser that lands its nose on your car deals
+      // push-bar damage and shoves you along its facing — and shrugs it off
+      if (!at && !bt && stars() >= 1 && player.car && impact > 90) {
+        const copC = a.driver === 'cop' && b === player.car ? a : (b.driver === 'cop' && a === player.car ? b : null);
+        if (copC && copC.ramT === undefined) copC.ramT = 0;
+        if (copC && copC.ramT <= 0) {
+          // nose-first? the contact must sit ahead of the cruiser
+          const ca = Math.cos(copC.angle), sa = Math.sin(copC.angle);
+          const lx2 = (player.car.x - copC.x) * ca + (player.car.y - copC.y) * sa;
+          if (lx2 > copC.len * 0.25 && Math.abs(copC.speed) > 60) {
+            copC.ramT = 1.2;
+            carDamage(player.car, 10 + Math.abs(copC.speed) * 0.05, null);
+            rumble(0.8, 0.5, 300);
+            player.car.speed += copC.speed * 0.22;             // the shove
+            player.car.latV += (Math.random() < 0.5 ? -1 : 1) * 26;
+            sfx('crash');
+            sparks((copC.x + player.car.x) / 2, (copC.y + player.car.y) / 2);
+          }
+        }
+      }
       if (impact > 150 && !at && !bt) {
         const by = a.driver === 'player' || b.driver === 'player' ? 'p' : null;
         carDamage(a, impact * 0.045, by);
         carDamage(b, impact * 0.045, by);
+        if (a === player.car || b === player.car) rumble(clamp(impact / 350, 0.3, 1), 0.5, 260);
         sfx('crash');
         sparks((a.x + b.x) / 2, (a.y + b.y) / 2);
         if (by && (a.kind === 'cop' || b.kind === 'cop')) addHeat(0.3);
@@ -4355,16 +5082,18 @@ function updPed(p, dt) {
     if (!p.patrol) {
       const d = dist(p.x, p.y, player.x, player.y);
       const s = stars();
+      const cordon = combatMission();          // active firefight: hold the perimeter
       p.angle = Math.atan2(player.y - p.y, player.x - p.x);
       if (!player.car) {
-        moveCircle(p, Math.cos(p.angle) * p.spd * dt, Math.sin(p.angle) * p.spd * dt);
-        // 5+ stars: nobody reads you your rights anymore — kill only
-        if (d < 22 && s >= 1 && s < 5) { p.bustT += dt; if (p.bustT > 0.4) { busted(); return; } }
+        if (!cordon || d > 170) moveCircle(p, Math.cos(p.angle) * p.spd * dt, Math.sin(p.angle) * p.spd * dt);
+        // 5+ stars: nobody reads you your rights anymore — kill only.
+        // Mid-firefight: no cuffs either; they wait outside the scene.
+        if (d < 22 && s >= 1 && s < 5 && !cordon) { p.bustT += dt; if (p.bustT > 0.4) { busted(); return; } }
         else p.bustT = 0;
         // one star: surrender early (stand still and take the cuffs) or the
         // nightstick comes out when they catch you
         p.swingT = (p.swingT || 0) - dt;
-        if (s === 1 && d < 20 && p.swingT <= 0) {
+        if (s === 1 && d < 20 && !cordon && p.swingT <= 0) {
           p.swingT = 0.9;
           hurtPlayer(8);
           bloodFx(player.x, player.y);
@@ -4384,10 +5113,43 @@ function updPed(p, dt) {
     return;
   }
   if (p.shopkeep) {
-    // the gun man works his counter: faces the customer, makes small talk
     const d = dist(p.x, p.y, player.x, player.y);
+    if (p.enraged) {
+      // shoot at the armorer and the house minigun comes out — unlimited
+      // lead down range until you are dead or gone
+      if (player.dead || d > 550) {
+        p.enraged = false;
+        if (window._mgdbg) console.log('MGDBG calmed in-frame at d=' + Math.round(d));
+      } else {
+        p.angle = Math.atan2(player.y - p.y, player.x - p.x);
+        p.mgT = (p.mgT || 0) - dt;
+        if (p.mgT <= 0 && d < 520 && hasLOS(p.x, p.y, player.x, player.y)) {
+          p.mgT = 0.055;
+          const ang = p.angle + rndf(-0.09, 0.09);
+          spawnBullet(p.x + Math.cos(ang) * 14, p.y + Math.sin(ang) * 14, Math.cos(ang) * 820, Math.sin(ang) * 820, 0.6, 6, 2, 'c');
+          p.mgSfx = (p.mgSfx || 0) + 1;
+          if (p.mgSfx % 3 === 0) sfx('uzi');
+          addPart(p.x + Math.cos(ang) * 16, p.y + Math.sin(ang) * 16, 2.6, 0, 0, 0, 0.05, 0xffe9a0, 1.8, true);
+        }
+        return;
+      }
+    }
+    // the gun man works his counter: faces the customer, makes small talk
     if (d < 120 && !player.dead) p.angle = Math.atan2(player.y - p.y, player.x - p.x);
     if (d < 80 && (p.voxT || 0) <= 0) say(p, pick(CHATTER.shopkeep), 3);
+    return;
+  }
+  if (p.priest) {
+    // the Father holds his altar; turns to whoever walks the aisle
+    const d = dist(p.x, p.y, player.x, player.y);
+    if (d < 140 && !player.dead) p.angle = Math.atan2(player.y - p.y, player.x - p.x);
+    else p.angle = Math.PI / 2;
+    if (d < 70 && (p.voxT || 0) <= 0) say(p, pick(CHATTER.priest), 3.4);
+    return;
+  }
+  if (p.prayer) {
+    // heads bowed, hands folded — the murmur of the faithful
+    if ((p.voxT || 0) <= 0 && Math.random() < 0.3) say(p, pick(CHATTER.prayer), 2.6);
     return;
   }
   if (p.vip) {
@@ -4500,10 +5262,16 @@ function killPed(p, byPlayer) {
   p.dead = true;
   bloodFx(p.x, p.y);
   if (byPlayer) {
+    if (p.cop) STATS.copsKilled++;
+    else if (p.guard || p.target || p.goon) STATS.goonsKilled++;
+    else STATS.civiliansKilled++;
+  }
+  if (byPlayer) {
     if (frenzy) frenzy.kills++;
     if (mission && mission.type === 'goons' && p.goon) mission.count++;
     if (p.cop) addHeat(1.2);
-    else if (p.guard || p.target || p.goon) addHeat(0.3);
+    // mission hostiles are the Combine's problem, not the city's — no heat
+    else if (p.guard || p.target || p.goon) { /* the job IS the fight */ }
     else addHeat(0.6);
     if (!p.cop && Math.random() < 0.35) {
       const pk = { x: p.x, y: p.y, type: 'cash', val: ri(20, 90), active: true, t: 0, temp: true };
@@ -4518,6 +5286,7 @@ function hurtPlayer(dmg) {
   if (player.dead) return;
   if (godMode) return;                     // in god we trust
   if (cutscene) return;                    // the director's cut is bulletproof
+  rumble(clamp(dmg / 35, 0.2, 1), 0.4, 220);
   const ab = Math.min(player.armor, dmg);
   player.armor -= ab;
   player.hp -= (dmg - ab);
@@ -4549,8 +5318,14 @@ function computeAim() {
   } else aimRing.visible = false;
 }
 // gunfire near a cop, or inside any officer's sight line, is a crime
+// during a combat job the law knows better than to wade into a Combine
+// firefight — no gunfire heat, no brandishing warnings, no arrests, and the
+// responders hold a cordon instead of walking into the crossfire
+function combatMission() {
+  return !!mission && (mission.type === 'goons' || mission.type === 'hit');
+}
 function gunfireWitnessed() {
-  if (stars() > 0 || pardonMode) return;
+  if (stars() > 0 || pardonMode || combatMission()) return;
   let seen = policeCanSee();
   if (!seen) {
     for (const p of peds) {
@@ -4566,9 +5341,11 @@ function gunfireWitnessed() {
 function fireWeapon() {
   const W = WEAPONS[player.weapon];
   if (player.fireT > 0) return;
+  if (!W.melee) STATS.ammoSpent++;           // every trigger pull goes in the ledger
   const aimAng = aimTarget ? Math.atan2(aimTarget.y - player.y, aimTarget.x - player.x) : mouseYaw;
   if (W.melee) {
     player.fireT = W.rate;
+    rumble(0.25, 0.05, 70);
     sfx('punch');
     scare(player.x, player.y, 90);
     for (const p of peds) {
@@ -4587,6 +5364,7 @@ function fireWeapon() {
   if (W.flamer) {
     player.fireT = W.rate;
     player.ammo.flame--;
+    rumble(0.08, 0.3, 90);
     for (let i = 0; i < 2; i++) {
       const ang = aimAng + rndf(-0.16, 0.16);
       const f = { x: player.x + Math.cos(player.angle) * 16, y: player.y + Math.sin(player.angle) * 16, vx: Math.cos(ang) * 230, vy: Math.sin(ang) * 230, life: 0.35, sprite: null };
@@ -4601,6 +5379,7 @@ function fireWeapon() {
   if (W.thrown) {
     player.fireT = W.rate;
     player.ammo.grenade--;
+    rumble(0.2, 0.15, 100);
     grenades.push({ x: player.x + Math.cos(aimAng) * 14, y: player.y + Math.sin(aimAng) * 14, vx: Math.cos(aimAng) * 260, vy: Math.sin(aimAng) * 260, fuse: 1.1, done: false, mesh: grabMesh(grenadeMeshes) });
     sfx('punch');
     gunfireWitnessed();
@@ -4609,6 +5388,7 @@ function fireWeapon() {
   if (W.rocket) {
     player.fireT = W.rate;
     player.ammo.rpg--;
+    rumble(0.7, 0.4, 220);
     fireRocket(player.x, player.y, aimAng, aimTarget ? 0 : Math.tan(-mousePitch) * 430 * RS);
     scare(player.x, player.y, 280);
     gunfireWitnessed();
@@ -4616,6 +5396,7 @@ function fireWeapon() {
   }
   player.ammo[player.weapon]--;
   player.fireT = W.rate;
+  rumble(W.pellets ? 0.6 : player.weapon === 'uzi' ? 0.12 : 0.3, W.pellets ? 0.3 : 0.1, W.pellets ? 140 : 70);
   const n = W.pellets || 1;
   // shots follow the crosshair's vertical angle too (locked targets aim level)
   const vh0 = aimTarget ? 0 : Math.tan(-mousePitch) * W.spd * RS;
@@ -4672,7 +5453,9 @@ function updGrenades(dt) {
 function tryEnterExit() {
   if (player.car) {
     const c = player.car;
-    for (const side of [1, -1]) {
+    // step out the DRIVER'S side (left) — the right door only if the left
+    // is blocked against a wall
+    for (const side of [-1, 1]) {
       const ex = c.x + Math.cos(c.angle + side * Math.PI / 2) * (c.w / 2 + 12);
       const ey = c.y + Math.sin(c.angle + side * Math.PI / 2) * (c.w / 2 + 12);
       if (!solidAtPx(ex, ey)) {
@@ -4801,7 +5584,17 @@ function ensureCops(dt) {
       if (stationCars < 2 && Math.random() < 0.2) spawnStationCar();
     }
   }
-  if (!muted && (anyQuarry || (cruis > 0 && s >= 2))) sirenOn(); else sirenOff();
+  // sirens you can actually HEAR: only cruisers within earshot count, and
+  // the wail's volume follows the nearest one (fixes the stuck far-away siren)
+  let sirenD = 1e9;
+  for (const c of cars) {
+    if (c.dead || c.driver !== 'cop' || c.kind === 'tank') continue;
+    if (!c.quarry && s < 2) continue;                    // only chasing cruisers sing
+    const d3 = dist(c.x, c.y, player.x, player.y);
+    if (d3 < sirenD) sirenD = d3;
+  }
+  if (!muted && sirenD < 950) { sirenOn(); sirenTargetGain = clamp(1 - sirenD / 950, 0.1, 1) * 0.028; }
+  else sirenOff();
 }
 
 // ---------------------------------------------------------------- shops
@@ -4826,7 +5619,7 @@ function modItems() {
     if (c.hp < carMaxHp(c)) items.push({ key: '4', name: 'Full repair', cost: 150, act: () => { c.hp = carMaxHp(c); } });
   }
   items.push({
-    key: '5', name: 'Rental: tuned street whip (ditch it anywhere)', cost: 300, act: () => {
+    key: '5', name: 'Rental: tuned street whip', cost: 300, act: () => {
       const mp2 = nearestModPad();
       const rc = mkCar(mp2.x + 60, mp2.y, 0, 'sport', null);
       rc.mods = { eng: 2, grip: 2, arm: 1 };
@@ -4851,6 +5644,38 @@ function tryModShop() {
   menuSel = 0;
   sfx('enter');
   return true;
+}
+
+// ---- the chapel favors: what the Father can do depends on the state you
+// arrive in — and what your ledger says about you
+function priestItems() {
+  const items = [];
+  if (player.hp < 100) items.push({ key: '1', name: 'Confession — mend body and soul (full health)', cost: 50, act: () => { player.hp = 100; } });
+  if (stars() > 0) items.push({ key: '2', name: 'Sanctuary — the hunted rest here (clear ' + stars() + ' star' + (stars() > 1 ? 's' : '') + ')', cost: 100 * stars(), act: () => { heat = 0; wantedClearT = 0; copSeen = false; removeChopper(); removeGunship(); } });
+  if (player.armor < 100) items.push({ key: '3', name: 'Guardian\'s blessing (full armor)', cost: 120, act: () => { player.armor = 100; } });
+  const unatoned = STATS.civiliansKilled + STATS.pedsRunOver - STATS.atoned;
+  if (unatoned > 0) items.push({ key: '4', name: 'Atonement — ' + unatoned + ' innocent soul' + (unatoned > 1 ? 's' : '') + ' on your ledger', cost: 25 * unatoned, act: () => { STATS.atoned = STATS.civiliansKilled + STATS.pedsRunOver; player.hp = 100; player.armor = Math.max(player.armor, 50); msg('FATHER: "They are remembered. Walk lighter."', 8); } });
+  items.push({ key: '5', name: 'Alms for the parish', cost: 100, act: () => { STATS.almsGiven++; msg('FATHER: "The parish thanks you."', 6); } });
+  return items;
+}
+function tryPriest() {
+  if (player.car) return false;
+  for (const p of peds) {
+    if (!p.priest || p.dead) continue;
+    if (dist(p.x, p.y, player.x, player.y) < 44) {
+      priestOpen = true;
+      menuSel = 0;
+      const souls = STATS.civiliansKilled + STATS.pedsRunOver;
+      const line = souls > 5 ? 'The innocent follow you in, ghost.'
+        : STATS.copsKilled > 5 ? 'Even badge-men have mothers.'
+        : STATS.timesWasted > 3 ? 'Death keeps spitting you back. There is a reason.'
+        : 'Peace, wanderer. What do you need?';
+      say(p, line, 5);
+      sfx('enter');
+      return true;
+    }
+  }
+  return false;
 }
 function trySaveHouse() {
   if (player.car || !savePoint) return false;
@@ -4924,22 +5749,144 @@ const STORY = [
   // the arc continues in the same voice: Jason's network grows, the paper
   // thread pays off, the Combine keeps answering back
   { t: 'Jason knows a guy', brief: 'A dockworker keeps lists of what the Combine ships at night. Meet him. Come back safe.', type: 'meeting', reward: 120 },
-  { t: 'Stop the presses', brief: 'The morning edition is wall-to-wall lies about you. Take the delivery car off the street.', type: 'wheels', reward: 250 },
+  {
+    t: 'Stop the presses', brief: 'The morning edition is wall-to-wall lies about you. Take the delivery car off the street.', type: 'wheels', reward: 250,
+    chain: [
+      { type: 'rush', n: 4, timer: 75, brief: 'Their other three vans are still rolling — hit every drop corner before dawn.' }
+    ]
+  },
   { t: 'Watch the watchers', brief: 'The Combine keeps surveillance stashes around the precinct. Find them before shift change.', type: 'search', reward: 300 },
   { t: 'The informant', brief: 'One of theirs wants out, and the mob knows it. Outrun them to the hideout.', type: 'escape', reward: 400 },
   { t: 'Dock rats', brief: 'Combine muscle on the docks. Thin them out.', type: 'goons', reward: 600 },
-  { t: 'Evidence on wheels', brief: 'A sedan full of proof. They want it gone. You want it more.', type: 'wheels', reward: 750 },
+  { t: 'Evidence on wheels', brief: 'A sedan full of proof. They want it gone. You want it more — and they WILL chase.', type: 'wheels', reward: 750, hot: 2 },
   { t: 'Two faces', brief: 'A detective on their payroll. End the arrangement.', type: 'hit', reward: 900 },
   { t: 'Wire run', brief: 'Tap 5 relay points before the line goes dead.', type: 'rush', reward: 1000 },
   { t: 'Warehouse 9', brief: 'Clear their crew out of the warehouse district.', type: 'goons', reward: 1200 },
-  { t: 'The limo', brief: 'Their under-boss rides in style. Take his ride.', type: 'wheels', reward: 1500 },
+  {
+    t: 'The limo', brief: 'Their under-boss rides in style. His escort walks the block — drop four of them first.', type: 'goons', n: 6, need: 4, timer: 80, reward: 1500,
+    chain: [
+      { type: 'wheels', brief: 'The limo is sitting scared two blocks over. Take his ride home.' }
+    ]
+  },
   { t: 'Quartermaster', brief: 'The man who arms them. Disarm him.', type: 'hit', reward: 1800 },
   { t: 'Pay day', brief: 'Intercept 5 payroll handoffs. Bankrupt their soldiers.', type: 'rush', reward: 2000 },
   { t: 'Projects purge', brief: 'They recruit in the projects. Send the recruiters home.', type: 'goons', reward: 2200 },
-  { t: 'The architect', brief: 'The developer who launders it all. Foreclose.', type: 'hit', reward: 2500 },
-  { t: 'Black ledger', brief: 'The master ledger travels by car tonight. Intercept.', type: 'wheels', reward: 3000 },
+  {
+    t: 'The architect', brief: 'The developer who launders it all. His paper trail is scattered across the district — find it first.', type: 'search', scatter: 4, reward: 2500,
+    chain: [
+      { type: 'hit', guards: 3, brief: 'He knows. He\'s rabbiting for the tower garage with his muscle. Foreclose.' }
+    ]
+  },
+  { t: 'Black ledger', brief: 'The master ledger travels by car tonight. Intercept — their whole motor pool will come for it.', type: 'wheels', reward: 3000, hot: 3 },
   { t: 'They found the hideout', brief: 'Their praetorians are at the door. Break the siege.', type: 'goons', reward: 4000 },
-  { t: 'Head of the snake', brief: 'The chairman surfaces once. Once is enough.', type: 'hit', reward: 7500 }
+  {
+    t: 'Head of the snake', brief: 'This is the night. Jason has the chairman\'s route — hear him out at the hideout.', type: 'finalMeet', reward: 7500,
+    chain: [
+      { type: 'goons', n: 10, need: 8, timer: 130, brief: 'His praetorian guard holds the block. Break them open.' },
+      { type: 'hit', guards: 4, brief: 'The chairman is in the open and running. Once is enough.' },
+      { type: 'escape', n: 3, timer: 95, brief: 'Everything they have left is coming. Disappear — get to the hideout CLEAN.' }
+    ]
+  },
+  // ---- ACT TWO (21-30): the Combine is headless, but the trucks still
+  // roll. Both cities. The trail leads through the harbor commission to a
+  // state seal — and ends with the keys to the EAST CAUSEWAY.
+  {
+    t: 'The morning after', brief: 'The chairman is dead and the trucks still roll. Jason found pages with a STATE SEAL on them.', type: 'finalMeet', reward: 1200,
+    lines: [
+      'JASON: We cut the head off and the body kept walking.',
+      'JASON: Charters, permits, escorts — every page the Combine ever signed has a state seal under it.',
+      'JASON: This goes above the docks now. Both cities. Eyes open.'
+    ]
+  },
+  { t: 'Paper says otherwise', brief: 'The Ledger sings a new tune: GHOST KILLS SAVIOR. Find who feeds them the ink now.', type: 'search', scatter: 4, reward: 1400 },
+  { t: 'The harbor commission', brief: 'A commission clerk is moving the charter ledgers by car tonight — and they know you\'re coming.', type: 'wheels', hot: 2, reward: 1600 },
+  { t: 'Old friends, new badges', brief: 'The detective you buried had a replacement by Monday. Same envelope, same handler. End the tradition.', type: 'hit', guards: 3, reward: 1800 },
+  { t: 'Committee of five', brief: 'Five commissioners, five security details, one vote to bury the inquiry. Scatter their muscle.', type: 'goons', n: 10, need: 7, timer: 110, reward: 2000 },
+  { t: 'The whistleblower', brief: 'A state auditor wants to talk and the state wants her quiet. Outrun them to the hideout.', type: 'escape', n: 3, timer: 90, reward: 2200 },
+  { t: 'Night deposits', brief: 'Five drop boxes feed the campaign fund. Empty every one before the pickup van makes its round.', type: 'rush', n: 5, timer: 80, reward: 2500 },
+  { t: 'Two cities, one wire', brief: 'Relay stashes on BOTH islands link the docks to the capitol. Walk the wire, end to end.', type: 'search', scatter: 5, reward: 2800 },
+  {
+    t: 'The fixer general', brief: 'The man who launders state contracts dines in Nuvola Heights tonight, behind four guns.', type: 'hit', guards: 4, reward: 3200,
+    chain: [
+      { type: 'escape', n: 3, timer: 90, brief: 'His detail wants payback. Lose them before the hideout.' }
+    ]
+  },
+  { t: 'Keys to the causeway', brief: 'A state engineer\'s car carries the east span control codes. Take it, and Capitol Shores opens.', type: 'wheels', hot: 3, reward: 3600 },
+  // ---- ACT THREE (31-40): first landings on Capitol Shores — the state\'s
+  // island of office parks and marble. Ends with the WEST CAUSEWAY keys.
+  {
+    t: 'First landing', brief: 'The east span is down. Jason wants a word before your first walk on state marble.', type: 'finalMeet', reward: 4000,
+    lines: [
+      'JASON: Capitol Shores. Office parks, marble, and men who never carry their own guns.',
+      'JASON: Everything the Combine did was PRACTICE for what they run from that island.',
+      'JASON: Walk soft. The bureau watches its own streets.'
+    ]
+  },
+  { t: 'The security bureau', brief: 'Bureau contractors sweep the Shores blocks in plain vans. Sweep back.', type: 'goons', n: 9, need: 7, timer: 100, reward: 4400 },
+  { t: 'Capitol mail', brief: 'Six courier stops run state paper around the island every night. Beat the route.', type: 'rush', n: 6, timer: 95, reward: 4800 },
+  { t: 'The prosecutor\'s shortlist', brief: 'Your name tops an indictment draft. Find every copy before it finds a judge.', type: 'search', scatter: 5, reward: 5200 },
+  { t: 'Witness for the state', brief: 'They made you at the landing. Lose the bureau tail before it follows you home.', type: 'escape', n: 3, timer: 85, reward: 5600 },
+  { t: 'Armored line', brief: 'A bureau armored car hauls the Shores payroll. It doesn\'t shoot back — its escort does.', type: 'wheels', hot: 3, reward: 6000 },
+  { t: 'The under-secretary', brief: 'The under-secretary signs the charters the Combine died for. Unsign him.', type: 'hit', guards: 4, reward: 6500 },
+  { t: 'Records bunker', brief: 'The state\'s private records bunker has private guards. Open the doors the hard way.', type: 'goons', n: 10, need: 8, timer: 110, reward: 7000 },
+  {
+    t: 'The judge\'s calendar', brief: 'Judge Merrin buries every case that climbs too high. His calendar says where he walks tonight.', type: 'search', scatter: 4, reward: 7500,
+    chain: [
+      { type: 'hit', guards: 3, brief: 'Found him. The honorable Judge Merrin adjourns — permanently.' }
+    ]
+  },
+  {
+    t: 'Span control', brief: 'The west span depot is under bureau lockdown. Break the lockdown, take the master keys home.', type: 'goons', n: 8, need: 6, timer: 90, reward: 8000,
+    chain: [
+      { type: 'wheels', brief: 'The depot wagon holds the west causeway keys. Drive it home — Old Port joins the loop.' }
+    ]
+  },
+  // ---- ACT FOUR (41-50): the ladder — rung by rung into the state house,
+  // ending under the marble dome.
+  {
+    t: 'The ladder', brief: 'Jason has names now. They go UP. One rung at a time, all the way to the dome.', type: 'finalMeet', reward: 8500,
+    lines: [
+      'JASON: Commissioner. Prosecutor. The chief. The whip. The governor\'s man. The GOVERNOR.',
+      'JASON: Every rung thinks the one below protects them and the one above owns them.',
+      'JASON: Climb. Don\'t look down, don\'t slow down.'
+    ]
+  },
+  { t: 'Rung one: the commissioner', brief: 'The harbor commissioner who chartered it all keeps a four-man detail. Rung one breaks.', type: 'hit', guards: 4, reward: 9000 },
+  {
+    t: 'Rung two: the prosecutor', brief: 'The prosecutor shreds what he can\'t bury. His burn-file stashes are scattered across the quarter.', type: 'search', scatter: 4, reward: 9500,
+    chain: [
+      { type: 'hit', guards: 4, brief: 'The files are yours. Now the man who kept them answers for every one.' }
+    ]
+  },
+  {
+    t: 'Rung three: the chief', brief: 'The police chief\'s personal squad wears no badges. Clear his honor guard first.', type: 'goons', n: 12, need: 9, timer: 120, reward: 10000,
+    chain: [
+      { type: 'hit', guards: 3, brief: 'The chief is running for the marina. Rung three breaks.' }
+    ]
+  },
+  { t: 'The bag run', brief: 'The ladder\'s cash rides once a week in one bag, in one car. This week it rides with you.', type: 'wheels', hot: 4, reward: 11000 },
+  { t: 'Rung four: the whip', brief: 'The senate whip counts votes the way the Combine counted crates. Five guns walk him home.', type: 'hit', guards: 5, reward: 12000 },
+  { t: 'Loose ends', brief: 'Everyone you climbed past sends what\'s left of their muscle — all of it, at once. Disappear.', type: 'escape', n: 4, timer: 100, reward: 13000 },
+  {
+    t: 'The governor\'s man', brief: 'The chief of staff carries the governor\'s real ledger in his head. Four guns, then a long drive.', type: 'hit', guards: 4, reward: 14000,
+    chain: [
+      { type: 'escape', n: 3, timer: 90, brief: 'The capitol locks down behind you. Get home CLEAN.' }
+    ]
+  },
+  { t: 'Papers of state', brief: 'The proof of everything — six stashes scattered through the capitol quarter. Collect the state\'s confession.', type: 'search', scatter: 6, reward: 16000 },
+  {
+    t: 'The governor', brief: 'The ladder ends under the marble dome. Jason has the governor\'s route. Finish it — for good.', type: 'finalMeet', reward: 25000,
+    lines: [
+      'JASON: Tonight he walks the Shores to bless the span you opened. Poetry, almost.',
+      'JASON: His guard is everything the state has left. Then him. Then the longest drive of your life.',
+      'JASON: After tonight there is no ladder, no Combine, no seal. Just a city. GO.'
+    ],
+    chain: [
+      { type: 'goons', n: 12, need: 9, timer: 130, brief: 'The governor\'s guard holds the capitol quarter. Break the cordon.' },
+      { type: 'hit', guards: 5, brief: 'The governor runs for his motorcade. Once is enough. It always was.' },
+      { type: 'escape', n: 4, timer: 100, brief: 'Every siren in three islands. Vanish — the hideout, CLEAN, one last time.' }
+    ]
+  }
 ];
 let mission = null, missionsDone = 0;
 function objectivePoint() {
@@ -4998,7 +5945,8 @@ function startMission(island) {
     const target = mkPed(s.x, s.y, { target: true, hp: 40, shirt: 0xe8e8e8 });
     attachPedMesh(target);
     peds.push(target);
-    for (let i = 0; i < 2; i++) {
+    const nGuards = (story && story.guards) || 2;
+    for (let i = 0; i < nGuards; i++) {
       const g = mkPed(s.x + rndf(-40, 40), s.y + rndf(-40, 40), { guard: true, hp: 50, shirt: 0x5a1a1a });
       attachPedMesh(g);
       g.mesh.userData.gun.visible = true;
@@ -5018,7 +5966,8 @@ function startMission(island) {
     if (!story) msg('JOB: Hit 5 checkpoints before time runs out!', 10);
   } else if (type === 'goons') {
     const targets = [];
-    for (let i = 0; i < 8; i++) {
+    const nG = (story && story.n) || 8;
+    for (let i = 0; i < nG; i++) {
       const ang = rndf(0, TAU), d = rndf(350, 650);
       const s = findSidewalkNear(Math.floor((player.x + Math.cos(ang) * d) / TILE), Math.floor((player.y + Math.sin(ang) * d) / TILE));
       const p = mkPed(s.x, s.y, { goon: true, hp: 35, shirt: 0x6a1a1a, warTarget: true });
@@ -5027,8 +5976,24 @@ function startMission(island) {
       peds.push(p);
       targets.push(p);
     }
-    mission = { type: 'goons', targets, count: 0, need: 6, timer: 90, reward, title };
+    mission = { type: 'goons', targets, count: 0, need: (story && story.need) || 6, timer: (story && story.timer) || 90, reward, title };
     if (!story) msg('JOB: A crew is moving on this block. Drop 6 of them!', 10);
+  } else if (type === 'finalMeet') {
+    // the last sit-down: Jason at the hideout, then the longest night begins
+    const person = mkPed(hideoutPos.x + 20, hideoutPos.y, { vip: true, hp: 60, shirt: 0x2a4a6a });
+    attachPedMesh(person);
+    peds.push(person);
+    mission = {
+      type: 'meeting', stage: 0, person, home: hideoutPos, noReturn: true, met: false,
+      lines: (story && story.lines) || [
+        'JASON: Tonight he surfaces. One route, one window, no second chance.',
+        'JASON: His praetorians hold the block. Then it\'s him. Then it\'s every gun they have left.',
+        'JASON: Finish this and the city wakes up free. Go.'
+      ],
+      whoName: 'Jason', homeName: 'the hideout',
+      hotLine: 'You brought heat to the LAST safe roof in this city. Breathe. Focus.',
+      reward, title
+    };
   } else if (type === 'meeting') {
     // sit-downs with the resistance: Jason first, then his dockworker contact
     const first = missionsDone === 0;
@@ -5057,11 +6022,13 @@ function startMission(island) {
       reward, title
     };
   } else if (type === 'search') {
-    // poke around a marked institution on foot — low profile, watchmen on the beat
-    const src = (missionsDone === 1 ? pressPts : precinctPts);
+    // poke around a marked institution on foot — low profile, watchmen on the
+    // beat. A 'scatter' search spreads the trail across the whole district.
+    const src = (story && story.scatter) ? [] : (missionsDone === 1 ? pressPts : precinctPts);
     const pts = src.map(p2 => ({ x: p2.x, y: p2.y, got: false }));
-    while (pts.length < 3) {           // safety: never start an unwinnable search
-      const rp = roadPoint(player.x, player.y, 500, 900, isl);
+    const wantN = (story && story.scatter) || 3;
+    while (pts.length < wantN) {       // safety: never start an unwinnable search
+      const rp = roadPoint(player.x, player.y, 450, 950, isl);
       pts.push({ x: rp.x, y: rp.y, got: false });
     }
     for (let i = 0; i < 2; i++) {
@@ -5088,40 +6055,153 @@ function startMission(island) {
     }
     mission = { type: 'escape', chasers, home: hideoutPos, timer: 80, warnT: 0, reward, title };
   }
+  // staged jobs carry their remaining objectives; hot jobs carry the tail
+  if (mission && story) {
+    if (story.chain) {
+      mission.chain = story.chain.slice();
+      mission.stageNo = 1;
+      mission.stageTotal = 1 + story.chain.length;
+      console.log('CHNDBG stage 1/' + mission.stageTotal + ' type=' + mission.type);
+    }
+    if (story.hot) mission.hot = story.hot;
+  }
+}
+// staged jobs: the payout only comes when the LAST objective falls —
+// everything before that rolls straight into the next stage
+function advanceStage(d) {
+  const keep = { reward: mission.reward, title: mission.title, chain: mission.chain, stageTotal: mission.stageTotal, stageNo: (mission.stageNo || 1) + 1 };
+  clearGuards();
+  sfx('mission');
+  msg('OBJECTIVE COMPLETE — ' + d.brief, 11);
+  const isl = anyBridgeOpen() ? undefined : islandOfPx(player.x, player.y);
+  if (d.type === 'wheels') {
+    const p = roadPoint(player.x, player.y, 600, 1200, isl);
+    const c = mkCar(p.x, p.y, 0, d.car || 'sedan', null);
+    laneSetup(c, p.ix, p.iy);
+    c.driver = null; c.keep = true; c.speed = 0;
+    c.color = 0x101014;
+    attachCarMesh(c);
+    cars.push(c);
+    const t2 = roadPoint(p.x, p.y, 1000, 2000, isl);
+    mission = Object.assign({ type: 'wheels', stage: 0, car: c, target: { x: t2.x, y: t2.y }, hot: d.hot }, keep);
+  } else if (d.type === 'rush') {
+    const pts = [];
+    let last = { x: player.x, y: player.y };
+    for (let i = 0; i < (d.n || 4); i++) {
+      const p = roadPoint(last.x, last.y, 550, 950, isl);
+      pts.push({ x: p.x, y: p.y });
+      last = p;
+    }
+    mission = Object.assign({ type: 'rush', pts, i: 0, timer: d.timer || 75 }, keep);
+  } else if (d.type === 'goons') {
+    const targets = [];
+    for (let i = 0; i < (d.n || 8); i++) {
+      const ang = rndf(0, TAU), dd = rndf(350, 650);
+      const s = findSidewalkNear(Math.floor((player.x + Math.cos(ang) * dd) / TILE), Math.floor((player.y + Math.sin(ang) * dd) / TILE));
+      const g = mkPed(s.x, s.y, { goon: true, hp: 35, shirt: 0x6a1a1a, warTarget: true });
+      attachPedMesh(g);
+      g.mesh.userData.gun.visible = true;
+      peds.push(g);
+      targets.push(g);
+    }
+    mission = Object.assign({ type: 'goons', targets, count: 0, need: d.need || 6, timer: d.timer || 90 }, keep);
+  } else if (d.type === 'hit') {
+    const p = roadPoint(player.x, player.y, 700, 1400, isl);
+    const s = findSidewalkNear(p.ix, p.iy);
+    const target = mkPed(s.x, s.y, { target: true, hp: 40, shirt: 0xe8e8e8 });
+    attachPedMesh(target);
+    peds.push(target);
+    for (let i = 0; i < (d.guards || 2); i++) {
+      const g = mkPed(s.x + rndf(-40, 40), s.y + rndf(-40, 40), { guard: true, hp: 50, shirt: 0x5a1a1a });
+      attachPedMesh(g);
+      g.mesh.userData.gun.visible = true;
+      peds.push(g);
+    }
+    mission = Object.assign({ type: 'hit', target }, keep);
+  } else if (d.type === 'escape') {
+    const chasers = [];
+    for (let i = 0; i < (d.n || 2); i++) {
+      const p = roadPoint(player.x, player.y, 400, 800, islandOfPx(player.x, player.y));
+      const c = mkCar(p.x, p.y, 0, 'sedan', 'mob');
+      laneSetup(c, p.ix, p.iy);
+      c.keep = true; c.speed = 0;
+      c.color = [0x14141a, 0x241418, 0x101820][i % 3];
+      attachCarMesh(c);
+      cars.push(c);
+      chasers.push(c);
+    }
+    mission = Object.assign({ type: 'escape', chasers, home: hideoutPos, timer: d.timer || 80, warnT: 0 }, keep);
+  }
+  console.log('CHNDBG stage ' + mission.stageNo + '/' + mission.stageTotal + ' type=' + mission.type);
+}
+// mob chasers for hot deliveries — the moment you touch the marked car
+function spawnHotChasers(n) {
+  const chasers = [];
+  for (let i = 0; i < n; i++) {
+    const p = roadPoint(player.x, player.y, 400, 800, islandOfPx(player.x, player.y));
+    const c = mkCar(p.x, p.y, 0, 'sedan', 'mob');
+    laneSetup(c, p.ix, p.iy);
+    c.keep = true; c.speed = 0;
+    c.color = [0x14141a, 0x241418, 0x101820][i % 3];
+    attachCarMesh(c);
+    cars.push(c);
+    chasers.push(c);
+  }
+  return chasers;
 }
 function completeMission() {
+  if (mission.chain && mission.chain.length) {
+    advanceStage(mission.chain.shift());
+    return;
+  }
   player.cash += mission.reward;
+  STATS.missionsPassed++;
+  STATS.cashEarned += mission.reward;
   saveBest();
   msg('MISSION PASSED! +$' + mission.reward, 10);
   sfx('mission'); sfx('cash');
   missionsDone++;
   clearGuards();
   mission = null;
+  // each crossing checks its own gate — no bridge can starve another
   if (!bridgesOpen[0] && missionsDone >= 3) {
     bridgesOpen[0] = true;
     setBarrier(0, false);
     barrierGroups[0].visible = false;
     msg('NORTH HARBOR BRIDGE IS OPEN — the Combine can\'t wall you in!', 12);
     sfx('mission');
-  } else if (!bridgesOpen[1] && missionsDone >= 17) {
+  }
+  if (!bridgesOpen[1] && missionsDone >= 17) {
     bridgesOpen[1] = true;
     setBarrier(1, false);
     barrierGroups[1].visible = false;
     msg('SOUTH BRIDGE IS OPEN — the Combine\'s grip is slipping!', 12);
     sfx('mission');
-  } else if (!bridgesOpen[2] && missionsDone >= 20) {
-    bridgesOpen[2] = true; bridgesOpen[3] = true;
-    setBarrier(2, false); setBarrier(3, false);
-    barrierGroups[2].visible = false; barrierGroups[3].visible = false;
-    msg('CAPITOL SHORES IS OPEN — both causeways are down. The state house awaits.', 14);
+  }
+  if (!bridgesOpen[3] && missionsDone >= 30) {
+    bridgesOpen[3] = true;
+    setBarrier(3, false);
+    barrierGroups[3].visible = false;
+    msg('EAST CAUSEWAY IS OPEN — Capitol Shores, straight off Nuvola Heights.', 14);
     sfx('mission');
   }
+  if (!bridgesOpen[2] && missionsDone >= 40) {
+    bridgesOpen[2] = true;
+    setBarrier(2, false);
+    barrierGroups[2].visible = false;
+    msg('WEST CAUSEWAY IS OPEN — Old Port to the Shores. The loop is complete.', 14);
+    sfx('mission');
+  }
+  if (missionsDone === 20) {
+    msg('The chairman is gone. But the trucks still roll — somebody above him is still signing the checks…', 14);
+  }
   if (missionsDone === STORY.length) {
-    msg('THE EMPIRE IS BROKEN. The city belongs to a ghost.', 15);
+    msg('THE STATE IS CLEAN. Three islands breathe free — and nobody ever knew your name.', 15);
     sfx('frenzy');
   }
 }
 function failMission(why) {
+  STATS.missionFails++;
   msg('MISSION FAILED — ' + why, 10);
   sfx('fail');
   clearGuards();
@@ -5136,9 +6216,22 @@ function updMission(dt) {
   if (mission.type === 'wheels') {
     if (mission.stage === 0 && player.car === mission.car) {
       mission.stage = 1;
-      msg('Now deliver it to the drop-off!', 10);
+      if (mission.hot) {
+        // a hot car: their motor pool lights up the moment you touch it
+        mission.chasers = spawnHotChasers(mission.hot);
+        msg('They marked the car — LOSE the tail or outrun it to the drop!', 9);
+      } else msg('Now deliver it to the drop-off!', 10);
     } else if (mission.stage === 1) {
-      if (player.car === mission.car && dist(mission.car.x, mission.car.y, mission.target.x, mission.target.y) < 70) completeMission();
+      if (player.car === mission.car && dist(mission.car.x, mission.car.y, mission.target.x, mission.target.y) < 70) {
+        if (mission.chasers) {
+          let near = 1e9;
+          for (const mc of mission.chasers) if (!mc.dead) near = Math.min(near, dist(mc.x, mc.y, mission.car.x, mission.car.y));
+          mission.warnT = (mission.warnT || 0) - dt;
+          if (near <= 350) {
+            if (mission.warnT <= 0) { msg('Shake the tail before you stop here!', 6); mission.warnT = 5; }
+          } else completeMission();
+        } else completeMission();
+      }
     }
   } else if (mission.type === 'hit') {
     if (mission.target.dead) completeMission();
@@ -5150,7 +6243,7 @@ function updMission(dt) {
       mission.i++;
       sfx('pickup');
       if (mission.i >= mission.pts.length) { completeMission(); return; }
-      msg('Checkpoint ' + mission.i + '/5');
+      msg('Checkpoint ' + mission.i + '/' + mission.pts.length);
     }
     if (mission && mission.timer <= 0) failMission('Time ran out!');
   } else if (mission.type === 'goons') {
@@ -5172,6 +6265,7 @@ function updMission(dt) {
         const m = mission;
         startCutscene(mission.person, L, () => {
           if (mission !== m || m.person.dead) return;
+          if (m.noReturn) { completeMission(); return; }   // the talk WAS the objective
           m.stage = 1;
           msg('Return to ' + m.homeName + ' — marker on the map.', 12);
           sfx('pickup');
@@ -5225,6 +6319,7 @@ let overText = '', overT = 0;
 function wasted() {
   if (player.dead) return;
   player.dead = true;
+  STATS.timesWasted++;
   cutscene = null;                           // death cuts the scene
   saveBest();
   bloodFx(player.x, player.y);
@@ -5234,6 +6329,7 @@ function wasted() {
 function busted() {
   if (player.dead || pardonMode || cutscene) return;   // no cuffs mid-scene, no arresting a pardon
   player.dead = true;
+  STATS.timesBusted++;
   saveBest();
   let nc = null, nd = 400;
   for (const p of peds) {
@@ -5284,10 +6380,26 @@ function ensureShopkeeps() {
     let has = false;
     for (const p of peds) if (p.shopkeep && !p.dead && dist(p.x, p.y, gs.x, gs.y) < 80) { has = true; break; }
     if (has) continue;
-    const sk = mkPed(gs.x, gs.y - 8, { shopkeep: true, hp: 60, shirt: 0x7a4a1a });
+    const sk = mkPed(gs.x, gs.y - 8, { shopkeep: true, hp: 220, shirt: 0x7a4a1a });
     sk.angle = Math.PI / 2;                  // facing the counter, south
     attachPedMesh(sk);
     peds.push(sk);
+  }
+  // the chapels fill: a priest at each altar, the faithful in the pews
+  for (const ch of props.churches) {
+    let hasP = false;
+    for (const p of peds) if (p.priest && !p.dead && dist(p.x, p.y, ch.cx, ch.cy) < 200) { hasP = true; break; }
+    if (hasP) continue;
+    const pr = mkPed(ch.altarX, ch.altarY + 14, { priest: true, hp: 60, shirt: 0x16161c });
+    pr.angle = Math.PI / 2;                  // faces the flock, south
+    attachPedMesh(pr);
+    peds.push(pr);
+    for (const [ox, oy] of [[-32, 34], [34, 50], [-30, 66]]) {
+      const w = mkPed(ch.cx + ox, ch.ty * TILE + oy, { prayer: true, hp: 25 });
+      w.angle = -Math.PI / 2;                // faces the altar, north
+      attachPedMesh(w);
+      peds.push(w);
+    }
   }
 }
 function startGame() {
@@ -5318,6 +6430,7 @@ function onClick() {
 function update(dt) {
   pollPad(dt);
   updMusic();
+  updEngine();
   if (state === 'menu') {
     // no game inputs on the title screen — Enter/click to play, slot key to load
     if (pressed.has('Enter')) { audioInit(); startGame(); }
@@ -5389,6 +6502,23 @@ function update(dt) {
     pressed.clear();
     return;
   }
+  if (priestOpen) {
+    const pi2 = priestItems();
+    if (pi2.length) {
+      if (pressed.has('ArrowUp')) menuSel = (menuSel + pi2.length - 1) % pi2.length;
+      if (pressed.has('ArrowDown')) menuSel = (menuSel + 1) % pi2.length;
+    }
+    for (let ii = 0; ii < pi2.length; ii++) {
+      const it = pi2[ii];
+      if (pressed.has('Digit' + it.key) || (pressed.has('Enter') && ii === Math.min(menuSel, pi2.length - 1))) {
+        if (player.cash >= it.cost) { player.cash -= it.cost; it.act(); sfx('buy'); }
+        else msg('FATHER: "The collection plate takes cash, my son."', 6);
+      }
+    }
+    if (pressed.has('KeyE') || pressed.has('Escape')) priestOpen = false;
+    pressed.clear();
+    return;
+  }
   // drive onto a tune-up pad and stop: the garage takes you in.
   // Once closed, it re-arms only after you actually LEAVE the pad.
   if (!cutscene && !paused && player.car && player.car.kind !== 'tank') {
@@ -5410,7 +6540,7 @@ function update(dt) {
     return;
   }
   // controller Back/Share (or O) jumps straight into the settings from play
-  if (pressed.has('KeyO') && !paused && state === 'play' && !shopOpen && !modShopOpen && !saveHouseOpen && !cutscene) {
+  if (pressed.has('KeyO') && !paused && state === 'play' && !shopOpen && !modShopOpen && !saveHouseOpen && !priestOpen && !cutscene) {
     paused = true;
     settingsOpen = true;
     settingsSel = 0;
@@ -5440,7 +6570,7 @@ function update(dt) {
   }
   // E priority: shops/save door, then cars (a nearby ride beats the mod menu), then mod pad, then phone
   if (pressed.has('KeyE') && !player.rag && !swim) {
-    if (!tryShops() && !trySaveHouse()) {
+    if (!tryShops() && !trySaveHouse() && !tryPriest()) {
       if (!tryEnterExit()) {
         if (!(!player.car && tryModShop())) tryPhone();
       }
@@ -5472,7 +6602,7 @@ function update(dt) {
     if (pc.kind === 'tank') {
       pc.turret += angDiff(pc.turret, mouseYaw) * Math.min(1, dt * 6);   // mouse aims the turret
       pc.fireT -= dt;
-      if ((mdown || padTankFire) && pc.fireT <= 0) { pc.fireT = 1.1; fireShell(pc, pc.turret); }   // pad: LB fires, RT is gas
+      if ((mdown || padTankFire) && pc.fireT <= 0) { pc.fireT = 1.1; rumble(0.9, 0.3, 260); fireShell(pc, pc.turret); }   // pad: LB fires, RT is gas
     }
     // reversing: the camera swings to look BEHIND the car; forward brings it home
     if (pc.speed < -12) pc.revCamT = Math.min(1, (pc.revCamT || 0) + dt * 2.2);
@@ -5579,6 +6709,7 @@ function update(dt) {
     const tank = hc.kind === 'tank';
     if (sp > 55 || (tank && sp > 20)) {
       p.hp -= tank ? 500 : sp * 0.45;
+      if (hc.driver === 'player' && p.hp <= 0) STATS.pedsRunOver++;
       p.ragBy = hc.driver === 'player';
       launchRag(p, hc);
       hc.speed *= 0.94;
@@ -5631,6 +6762,11 @@ function update(dt) {
         p.hp -= b.dmg;
         bloodFx(p.x, p.y);
         b.life = 0;
+        if (b.from === 'p') STATS.shotsHit++;
+        if (b.from === 'p' && p.shopkeep && !p.dead && !p.enraged) {
+          p.enraged = true;
+          say(p, 'WRONG SHOP, FRIEND.', 3);
+        }
         if (p.hp <= 0) killPed(p, b.from === 'p');
         else if (!p.cop && !p.guard && !p.goon) { p.state = 'flee'; p.fleeT = 4; p.angle = Math.atan2(p.y - b.y, p.x - b.x); }
         break;
@@ -5643,6 +6779,7 @@ function update(dt) {
         if (c.kind !== 'tank') carDamage(c, b.cdmg || 5, b.from === 'p' ? 'p' : null);
         sparks(b.x, b.y);
         b.life = 0;
+        if (b.from === 'p') STATS.shotsHit++;
         if (b.from === 'p' && c.kind === 'cop') addHeat(0.2);
         break;
       }
@@ -5695,7 +6832,7 @@ function update(dt) {
       // weapons respawn slow — street iron is scarce; supplies come back fast
       pk.active = false; pk.t = pk.type === 'star' ? 90 : (WEAPONS[pk.type] ? 240 : 45);
       if (pk.mesh) pk.mesh.visible = false;
-      if (pk.type === 'cash') { player.cash += pk.val; saveBest(); msg('+$' + pk.val); sfx('cash'); }
+      if (pk.type === 'cash') { player.cash += pk.val; STATS.cashEarned += pk.val; saveBest(); msg('+$' + pk.val); sfx('cash'); }
       else if (pk.type === 'health') { player.hp = Math.min(100, player.hp + 50); msg('+50 Health'); sfx('pickup'); }
       else if (pk.type === 'armor') { player.armor = Math.min(100, player.armor + 50); msg('+50 Armor'); sfx('pickup'); }
       else if (pk.type === 'pistol') { player.ammo.pistol += 12; msg('Pistol rounds +12'); sfx('pickup'); if (player.weapon === 'fist') player.weapon = 'pistol'; }
@@ -5773,6 +6910,8 @@ function update(dt) {
     else if (sNow >= 4 && prevStars < 4) msg('SWAT UNITS DEPLOYED.', 8);
   }
   prevStars = sNow;
+  if (sNow > 0) { wantedStreakT += dt; if (wantedStreakT > STATS.longestWanted) STATS.longestWanted = wantedStreakT; }
+  else wantedStreakT = 0;
   // open carry: a cop who sees a drawn weapon orders you to holster it.
   // 5 seconds to comply (fists, or conceal it in a car) or you're wanted.
   if (stars() === 0 && !pardonMode) {
@@ -5792,7 +6931,7 @@ function update(dt) {
     } else {
       disarmCool -= dt;
       armedTick -= dt;
-      if (disarmCool <= 0 && armedTick <= 0 && !player.car && player.weapon !== 'fist') {
+      if (disarmCool <= 0 && armedTick <= 0 && !player.car && player.weapon !== 'fist' && !combatMission()) {
         armedTick = 0.5;
         if (policeCanSee()) {
           disarmT = 5;
@@ -5832,11 +6971,23 @@ function update(dt) {
     if (p.cop && !p.patrol && (stars() === 0 || d > 1900)) { removePedMesh(p); peds.splice(i, 1); continue; }
     if (p.cop && p.patrol && d > 1600) { removePedMesh(p); peds.splice(i, 1); continue; }
     if (p.despawnOk && d > 800) { removePedMesh(p); peds.splice(i, 1); continue; }
-    if (!p.cop && !p.guard && !p.target && !p.warTarget && !p.goon && !p.vip && !p.shopkeep && !p.fare && d > 1400) { removePedMesh(p); peds.splice(i, 1); }
+    if (!p.cop && !p.guard && !p.target && !p.warTarget && !p.goon && !p.vip && !p.shopkeep && !p.fare && !p.priest && !p.prayer && d > 1400) { removePedMesh(p); peds.splice(i, 1); }
   }
   for (let i = cars.length - 1; i >= 0; i--) {
     const c = cars[i];
     if (c.dead) { if (c !== player.car) { removeCarMesh(c); cars.splice(i, 1); } continue; }
+    // the 2-minute rule: abandoned iron gets towed, keep-flag or not (even
+    // the tank). Mission property and the hideout garage pad are exempt.
+    if (c !== player.car && c.driver === null) {
+      const exempt =
+        (mission && (mission.car === c || (mission.chasers && mission.chasers.indexOf(c) >= 0))) ||
+        (garagePad && dist(c.x, c.y, garagePad.x, garagePad.y) < 60);
+      if (exempt) c.abandonT = 0;
+      else {
+        c.abandonT = (c.abandonT || 0) + dt;
+        if (c.abandonT > 120) { removeCarMesh(c); cars.splice(i, 1); continue; }
+      }
+    } else c.abandonT = 0;
     if (c === player.car || c.keep) continue;
     const d = dist(c.x, c.y, f.x, f.y);
     if (c.driver === 'cop' && !c.quarry && (stars() < 2 || d > 2200)) { removeCarMesh(c); cars.splice(i, 1); continue; }
@@ -5844,6 +6995,14 @@ function update(dt) {
     if (c.driver === null && d > 1800) { removeCarMesh(c); cars.splice(i, 1); continue; }
     if (c.driver === 'ai' && d > 1700) { removeCarMesh(c); cars.splice(i, 1); }
   }
+  // the army never leaves its pad empty for long: fresh tank, full health
+  if (!cars.some(c2 => c2.homeTank && !c2.dead)) {
+    tankRespawnT += dt;
+    if (tankRespawnT > 10 && (tankRespawnT > 30 || dist(player.x, player.y, armyBase.x, armyBase.y) > 600)) {
+      spawnHomeTank();
+      tankRespawnT = 0;
+    }
+  } else tankRespawnT = 0;
   for (let i = bullets.length - 1; i >= 0; i--) {
     if (bullets[i].life <= 0) {
       if (bullets[i].mesh) bullets[i].mesh.visible = false;
@@ -5909,9 +7068,16 @@ function syncScene(dt, t) {
         if (p.mesh.userData.baton) p.mesh.userData.baton.visible = !drawn && s2 === 1;
         if (p.mesh.userData.holster) p.mesh.userData.holster.visible = !drawn;
       }
-      const armedArm = p.mesh.userData.gun.visible || (p.mesh.userData.baton && p.mesh.userData.baton.visible) || p.fare;
+      if (p.shopkeep && p.mesh.userData.minigun) p.mesh.userData.minigun.visible = !!p.enraged;
+      const armedArm = p.mesh.userData.gun.visible || (p.mesh.userData.baton && p.mesh.userData.baton.visible) || (p.shopkeep && p.enraged) || p.fare;
       const bob = animateRig(p.mesh, p.x, p.y, dt, armedArm);   // fares hail with a raised arm
       if (p.cop && (p.swingT || 0) > 0.55) p.mesh.userData.armR.rotation.z = 0.5;   // the chop lands
+      if (p.prayer) {
+        // kneeling in the pew: body lowered, hands folded forward
+        p.mesh.position.y -= 0.55;
+        p.mesh.userData.armL.rotation.z = -0.6;
+        p.mesh.userData.armR.rotation.z = 0.6;
+      }
       p.mesh.position.set(p.x * RS, bob * 0.12, p.y * RS);
       p.mesh.rotation.set(0, -p.angle, 0);
     }
@@ -5927,8 +7093,10 @@ function syncScene(dt, t) {
       // prone stroke: chest at the waterline, legs kicking with the gait
       animateRig(player.mesh, player.x, player.y, dt, false);
       const bobW = swim.z < 0.4 ? Math.sin(t * 2.4) * 0.1 : 0;
-      player.mesh.position.set(player.x * RS, -0.75 - swim.z + bobW, player.y * RS);
-      player.mesh.rotation.set(1.25, -player.angle, 0);   // YZX order: yaw, then pitch prone
+      player.mesh.position.set(player.x * RS, -0.15 - swim.z + bobW, player.y * RS);   // back breaks the surface
+      // YZX order: yaw in Y, then PRONE PITCH about the side axis = Z slot
+      // (X is the facing axis — pitching there rolls the body sideways)
+      player.mesh.rotation.set(0, -player.angle, -1.25);   // negative pitch: head FORWARD, chest down
     } else {
       const bob = animateRig(player.mesh, player.x, player.y, dt, player.weapon !== 'fist');
       player.mesh.position.set(player.x * RS, bob * 0.12, player.y * RS);
@@ -6076,7 +7244,7 @@ function syncScene(dt, t) {
   const cvp = Math.cos(mousePitch), svp = Math.sin(mousePitch);
   const dirX = Math.cos(camYaw) * cvp, dirY = -svp, dirZ = Math.sin(camYaw) * cvp;
   const fx = f.x * RS, fz = f.y * RS;
-  const pivotY = player.car ? 4 : 3.2;
+  const pivotY = player.car ? 4 : swim ? 0.9 : 3.2;   // the lens rides the waterline with a swimmer
   // camera collision: pull in so we never sit inside a building
   let tMax = 1;
   const hDist = cd * cvp;
@@ -6100,14 +7268,40 @@ const CONTROLS = [
   'Mouse ................ free look + aim (click captures mouse)',
   'W A S D .............. move (camera-relative) / drive',
   'Click ................ shoot at the crosshair (soft lock)',
-  'E .................... car / phone / shop / hot dog / save door',
+  'E .................... car / phone / shop / chapel / tune-up / save door',
   'Enter ................ advance cut-scene dialog',
   'Wheel or 1-7 / Q ..... weapons      Shift ... sprint',
   'Ctrl + Wheel ......... camera distance',
   'Space handbrake   R radio   P pause   M mute   Esc frees mouse',
   'Respray shop: drive in, $200 clears your stars',
-  '20 jobs vs the Meridian Combine — bridges open after jobs 3 and 17'
+  '50 jobs vs the Combine and the State — crossings open at jobs 3 / 17 / 30 / 40'
 ];
+// clip a menu label so it can never run into the price column
+function fitText(s, maxW) {
+  if (hctx.measureText(s).width <= maxW) return s;
+  while (s.length > 1 && hctx.measureText(s + '…').width > maxW) s = s.slice(0, -1);
+  return s + '…';
+}
+// draw a menu label wrapped onto AS MANY lines as it needs — every
+// selection menu in the game keeps its text fully readable.
+// Returns the number of lines drawn so the caller can advance the cursor.
+function drawMenuLabel(text, x, y, maxW, lineH) {
+  const words = text.split(' ');
+  let line = '', rows = 0;
+  for (let i = 0; i < words.length; i++) {
+    const cand = line ? line + ' ' + words[i] : words[i];
+    if (hctx.measureText(cand).width > maxW && line) {
+      hctx.fillText(line, x, y + rows * lineH);
+      rows++;
+      line = '      ' + words[i];
+    } else line = cand;
+  }
+  if (line) {
+    hctx.fillText(line, x, y + rows * lineH);
+    rows++;
+  }
+  return rows;
+}
 // speech bubbles: project each speaker's head to the glass, nearest 8 only
 const _bubbleV = new THREE.Vector3();
 function drawBubbles() {
@@ -6131,7 +7325,7 @@ function drawBubbles() {
     if (sx < 40 || sx > VW - 40 || sy < 24 || sy > VH) continue;
     hctx.font = 'bold 12px monospace';
     const w = hctx.measureText(p.sayText).width + 14;
-    const col = p.cop ? '#7fb2ff' : (p.vip ? '#8fffb0' : (p.guard || p.goon ? '#ff8080' : '#e8e8e8'));
+    const col = p.cop ? '#7fb2ff' : (p.vip ? '#8fffb0' : (p.priest || p.prayer ? '#ffd98a' : (p.guard || p.goon ? '#ff8080' : '#e8e8e8')));
     hctx.globalAlpha = clamp(p.sayT / 0.4, 0, 1) * 0.92;
     hctx.fillStyle = 'rgba(4,6,10,0.85)';
     hctx.fillRect(sx - w / 2, sy - 30, w, 19);
@@ -6344,7 +7538,7 @@ function drawHUD(t) {
     const lines = {
       wheels: mission.stage === 0 ? 'Get the marked car' : 'Deliver the car',
       hit: 'Eliminate the target',
-      rush: 'Checkpoint ' + (mission.i + 1) + '/5',
+      rush: 'Checkpoint ' + (mission.i + 1) + '/' + (mission.pts ? mission.pts.length : 5),
       goons: 'Drop the crew: ' + mission.count + '/' + mission.need,
       meeting: mission.stage === 0 ? 'Go talk to ' + mission.whoName : 'Return to ' + mission.homeName,
       search: 'Evidence ' + mission.found + '/' + (mission.pts ? mission.pts.length : 0) + '  (on foot)',
@@ -6352,7 +7546,8 @@ function drawHUD(t) {
     };
     hctx.fillStyle = '#ffd23f';
     hctx.font = 'bold 15px monospace';
-    hctx.fillText((mission.title ? mission.title + '  —  ' : '') + lines[mission.type], VW / 2, yy + 4);
+    const stageTag = mission.stageTotal > 1 ? '  [' + mission.stageNo + '/' + mission.stageTotal + ']' : '';
+    hctx.fillText((mission.title ? mission.title + stageTag + '  —  ' : '') + lines[mission.type], VW / 2, yy + 4);
     if (mission.type === 'rush' || mission.type === 'goons' || mission.type === 'escape') {
       hctx.font = 'bold 26px monospace';
       hctx.fillStyle = mission.timer < 15 ? '#ff4040' : '#fff';
@@ -6443,7 +7638,7 @@ function drawHUD(t) {
     hctx.stroke();
   }
   // pointer-lock hint
-  if (!ptrLocked && !paused && !shopOpen && !saveHouseOpen && !modShopOpen) {
+  if (!ptrLocked && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !priestOpen) {
     hctx.textAlign = 'center';
     hctx.font = 'bold 15px monospace';
     hctx.fillStyle = '#3fdc5f';
@@ -6492,11 +7687,11 @@ function drawHUD(t) {
       const it = SHOP_ITEMS[ii];
       hctx.fillStyle = player.cash >= it.cost ? '#fff' : '#666';
       hctx.font = 'bold 15px monospace';
-      hctx.fillText((ii === menuSel ? '▶' : ' ') + '[' + it.key + '] ' + it.name, x0 + 16, iy);
+      const rows2 = drawMenuLabel((ii === menuSel ? '▶' : ' ') + '[' + it.key + '] ' + it.name, x0 + 16, iy, w - 120, 21);
       hctx.textAlign = 'right';
       hctx.fillText('$' + it.cost, x0 + w - 30, iy);
       hctx.textAlign = 'left';
-      iy += 30;
+      iy += 30 + (rows2 - 1) * 21;
     }
   }
   // the tune-up garage menu
@@ -6523,11 +7718,41 @@ function drawHUD(t) {
       const it = mi2[ii];
       hctx.fillStyle = player.cash >= it.cost ? '#fff' : '#666';
       hctx.font = 'bold 15px monospace';
-      hctx.fillText((ii === Math.min(menuSel, mi2.length - 1) ? '▶' : ' ') + '[' + it.key + '] ' + it.name, x0 + 14, iy);
+      const rows2 = drawMenuLabel((ii === Math.min(menuSel, mi2.length - 1) ? '▶' : ' ') + '[' + it.key + '] ' + it.name, x0 + 14, iy, w - 118, 21);
       hctx.textAlign = 'right';
       hctx.fillText('$' + it.cost, x0 + w - 28, iy);
       hctx.textAlign = 'left';
-      iy += 30;
+      iy += 30 + (rows2 - 1) * 21;
+    }
+  }
+  // the chapel favors
+  if (priestOpen) {
+    const w = 540, h = 370, x0 = VW / 2 - w / 2, y0 = VH / 2 - h / 2;
+    hctx.fillStyle = 'rgba(10,8,4,0.92)';
+    hctx.fillRect(x0, y0, w, h);
+    hctx.strokeStyle = '#ffd98a';
+    hctx.lineWidth = 2;
+    hctx.strokeRect(x0, y0, w, h);
+    hctx.textAlign = 'center';
+    hctx.font = 'bold 22px monospace';
+    hctx.fillStyle = '#ffd98a';
+    hctx.fillText('FIRST CHAPEL', VW / 2, y0 + 34);
+    hctx.font = '13px monospace';
+    hctx.fillStyle = '#b8a888';
+    hctx.fillText('The Father sees: ' + (STATS.civiliansKilled + STATS.pedsRunOver) + ' souls · ' + STATS.copsKilled + ' badges · ' + STATS.carsDestroyed + ' machines burned · ' + statAccuracy() + '% true aim', VW / 2, y0 + 56);
+    hctx.fillText('Cash: $' + player.cash + '   (E or Esc to leave)', VW / 2, y0 + 74);
+    hctx.textAlign = 'left';
+    let iy = y0 + 104;
+    const pi3 = priestItems();
+    for (let ii = 0; ii < pi3.length; ii++) {
+      const it = pi3[ii];
+      hctx.fillStyle = player.cash >= it.cost ? '#fff' : '#666';
+      hctx.font = 'bold 15px monospace';
+      const rows2 = drawMenuLabel((ii === Math.min(menuSel, pi3.length - 1) ? '▶' : ' ') + '[' + it.key + '] ' + it.name, x0 + 14, iy, w - 130, 21);
+      hctx.textAlign = 'right';
+      hctx.fillText('$' + it.cost, x0 + w - 24, iy);
+      hctx.textAlign = 'left';
+      iy += 32 + (rows2 - 1) * 21;
     }
   }
   // the Harbor Arms save menu
@@ -6551,8 +7776,8 @@ function drawHUD(t) {
     for (let i = 1; i <= 10; i++) {
       const sum = saveSummary(i);
       hctx.fillStyle = sum ? '#fff' : '#555';
-      hctx.fillText((i - 1 === menuSel ? '▶ ' : '  ') + 'SLOT ' + (i === 10 ? '0' : i) + ':  ' + (sum || '— empty —'), x0 + 18, iy);
-      iy += 29;
+      const rows2 = drawMenuLabel((i - 1 === menuSel ? '▶ ' : '  ') + 'SLOT ' + (i === 10 ? '0' : i) + ':  ' + (sum || '— empty —'), x0 + 18, iy, w - 40, 19);
+      iy += 29 + (rows2 - 1) * 19;
     }
   }
   if (paused) {
@@ -6572,7 +7797,9 @@ function drawHUD(t) {
         ['Layout preset', padCfg.preset.toUpperCase() + '   (← → to change)'],
         ['Look sensitivity', padCfg.sens + ' / 10'],
         ['Invert look Y', padCfg.invertY ? 'ON' : 'OFF'],
+        ['Vibration', padCfg.vibe ? 'ON' : 'OFF'],
         ['Remap all buttons', remapMode ? 'PRESS A BUTTON…' : '(Enter)'],
+        ['Calibrate triggers', trigCal ? (trigCal.phase === 'rt' ? 'SLOWLY PULL RIGHT TRIGGER…' : 'SLOWLY PULL LEFT TRIGGER…') : (padCfg.trig ? 'bound — Enter to redo' : '(Enter)')],
         ['Back', '(Enter or Esc)']
       ];
       let sy3 = VH * 0.3;
@@ -6590,13 +7817,35 @@ function drawHUD(t) {
         // current bindings table
         sy3 += 16;
         hctx.font = '13px monospace';
+        hctx.fillStyle = '#c8b880';
+        hctx.fillText('Gas / accelerate  =  ' + padTrigLabel('gas'), VW / 2, sy3);
+        sy3 += 19;
+        hctx.fillText('Brake / reverse  =  ' + padTrigLabel('brake'), VW / 2, sy3);
+        sy3 += 19;
         hctx.fillStyle = '#9aa3b8';
         for (const [act, label] of PAD_ACTIONS) {
           hctx.fillText(label + '  =  ' + padBtnName(M[act]), VW / 2, sy3);
           sy3 += 19;
         }
         hctx.fillText('Sticks: LEFT = move / steer (analog), RIGHT = camera' + (padCfg.preset === 'southpaw' ? '  [southpaw: swapped]' : ''), VW / 2, sy3 + 6);
-        hctx.fillText('Triggers: analog throttle / brake in vehicles', VW / 2, sy3 + 25);
+        // LIVE trigger force readout — squeeze and watch what the game sees
+        hctx.fillText('LIVE FORCE   GAS ' + Math.round(padThrottle * 100) + '%   ·   BRAKE ' + Math.round(padBrakeV * 100) + '%', VW / 2, sy3 + 28);
+        hctx.fillStyle = 'rgba(255,255,255,0.15)';
+        hctx.fillRect(VW / 2 - 210, sy3 + 36, 190, 9);
+        hctx.fillRect(VW / 2 + 20, sy3 + 36, 190, 9);
+        hctx.fillStyle = '#7fd07f';
+        hctx.fillRect(VW / 2 - 210, sy3 + 36, 190 * padThrottle, 9);
+        hctx.fillStyle = '#d07f7f';
+        hctx.fillRect(VW / 2 + 20, sy3 + 36, 190 * padBrakeV, 9);
+        // RAW CHANNELS: pull a trigger and watch which number actually moves.
+        // Smooth sweep = analog. Snap 0->1 = that channel is digital.
+        if (padRawDebug) {
+          hctx.font = '11px monospace';
+          hctx.fillStyle = '#8fa3b8';
+          hctx.fillText('RAW (mapping: ' + padRawDebug.map + ')  AXES  ' + padRawDebug.axes.map((v2, i3) => 'A' + i3 + ':' + v2).join(' '), VW / 2, sy3 + 60);
+          const bs = padRawDebug.btns.map((v2, i3) => v2 > 0.02 ? 'B' + i3 + ':' + v2 : null).filter(Boolean).join('  ');
+          hctx.fillText('BUTTONS  ' + (bs || '(none pressed)'), VW / 2, sy3 + 76);
+        }
       }
       return;
     }
@@ -6608,7 +7857,19 @@ function drawHUD(t) {
     let py = VH * 0.22;
     for (const l of CONTROLS) { hctx.fillText(l, VW / 2, py); py += 22; }
     py += 4;
+    // the pad's CURRENT mapping, always in sync with the selected preset
+    {
+      const M2 = padMap();
+      hctx.fillStyle = '#9f8fd0';
+      hctx.font = 'bold 14px monospace';
+      hctx.fillText('PAD [' + padCfg.preset.toUpperCase() + ']   LS move/steer · RS camera · GAS ' + padTrigLabel('gas') + ' · BRAKE ' + padTrigLabel('brake'), VW / 2, py);
+      py += 19;
+      hctx.font = '13px monospace';
+      hctx.fillText('Fire ' + padBtnName(M2.fire) + ' · Aim ' + padBtnName(M2.aim) + ' · Sprint ' + padBtnName(M2.sprint) + ' · Use ' + padBtnName(M2.interact) + ' · Handbrake ' + padBtnName(M2.handbrake) + ' · Weapon ' + padBtnName(M2.weapNext) + ' · Dive ' + padBtnName(M2.dive) + ' · Cannon ' + padBtnName(M2.tankFire), VW / 2, py);
+      py += 22;
+    }
     hctx.fillStyle = '#c890ff';
+    hctx.font = '15px monospace';
     hctx.fillText('[O] controller settings' + (padConnected ? '  (pad detected)' : '') + '        [U] add music from your PC' + (musicList.length ? '  (' + musicList.length + ' track(s) on the radio)' : ''), VW / 2, py);
     py += 24;
     // save / load panel — 10 slots
@@ -6661,10 +7922,12 @@ player.x = playerStart.x;
 player.y = playerStart.y;
 for (let i = 0; i < 16; i++) spawnPed();
 for (let i = 0; i < 10; i++) spawnTraffic();
-// the tank — parked in a Nuvola Heights lot, as always
-{
+// the tank — parked in a Nuvola Heights lot, as always. If it's ever lost
+// (abandoned, destroyed, towed), the army parks a fresh one on the same pad.
+function spawnHomeTank() {
   const tk = mkCar(armyBase.x, armyBase.y, 3, 'tank', null);
   tk.keep = true;
+  tk.homeTank = true;
   const tx0 = Math.floor(armyBase.x / TILE), ty0 = Math.floor(armyBase.y / TILE);
   placed: for (let r = 0; r < 20; r++) {
     for (let iy = ty0 - r; iy <= ty0 + r; iy++)
@@ -6678,7 +7941,9 @@ for (let i = 0; i < 10; i++) spawnTraffic();
   }
   attachCarMesh(tk);
   cars.push(tk);
+  return tk;
 }
+spawnHomeTank();
 if (location.hash === '#auto') startGame();
 if (location.hash === '#tank') {
   startGame();
@@ -6759,6 +8024,306 @@ if (location.hash === '#job3') {
     if (!mission) { console.log('MISDBG complete, missionsDone=' + missionsDone + ' cash=' + player.cash); clearInterval(iv); return; }
   }, 300);
 }
+if (location.hash === '#rumble') {
+  // haptics plumbing receipt: fake actuator logs every effect sent
+  startGame();
+  padConnected = true;
+  const calls = [];
+  navigator.getGamepads = () => [{
+    connected: true, buttons: [], axes: [], mapping: 'standard',
+    vibrationActuator: { playEffect: (type2, p2) => { calls.push('s' + p2.strongMagnitude.toFixed(2) + '/w' + p2.weakMagnitude.toFixed(2) + '/' + p2.duration + 'ms'); return Promise.resolve(); } }
+  }];
+  rumble(0.5, 0.3, 200);            // direct
+  hurtPlayer(20);                   // damage hook (0.57 strong expected)
+  padCfg.vibe = false;
+  rumble(1, 1, 100);                // must be suppressed by the toggle
+  padCfg.vibe = true;
+  console.log('RMBDBG calls=' + calls.length + ' [' + calls.join(' | ') + ']');
+}
+if (location.hash === '#trigger') {
+  // proportional throttle/brake receipt, pure synchronous physics
+  startGame();
+  const c = mkCar(player.x, player.y, 0, 'sedan', 'player');
+  c.keep = true;
+  attachCarMesh(c);
+  cars.push(c);
+  player.car = c;
+  const hold = (thr, brk, secs) => {
+    padThrottle = thr; padBrakeV = brk;
+    const x0 = c.x, y0 = c.y, a0 = c.angle;
+    for (let i = 0; i < secs * 60; i++) {
+      stepPlayerCar(c, 1 / 60);
+      c.x = x0; c.y = y0; c.angle = a0; c.latV = 0;   // treadmill: physics only
+    }
+    return Math.round(c.speed);
+  };
+  const cruise = hold(0.4, 0, 12);
+  const race = hold(1.0, 0, 12);
+  c.speed = 200;
+  const light = hold(0, 0.25, 0.5);
+  c.speed = 200;
+  const hard = hold(0, 1.0, 0.5);
+  c.speed = 200;
+  const coast3 = hold(0, 0, 3);
+  c.speed = 260;
+  const ease1 = hold(0.4, 0, 1);
+  // gear-change beat: from 60 fwd, full brake — 0.6s in we must still be
+  // HELD at zero (0.21s to stop + 0.5s pause), reversing only after that
+  c.speed = 60; c.dirPause = 0;
+  const atPause = hold(0, 1, 0.6);
+  const afterPause = hold(0, 1, 0.6);
+  padThrottle = 0; padBrakeV = 0;
+  console.log('TRIGDBG cruise40%=' + cruise + ' race100%=' + race + ' (kmax 260) | from 200: lightBrake0.5s=' + light + ' hardBrake0.5s=' + hard + ' | COAST 3s from 200=' + coast3 + ' | ease-off 260->40% after 1s=' + ease1 + ' | GEAR BEAT held@0.6s=' + atPause + ' reversing@1.2s=' + afterPause);
+}
+if (location.hash === '#pit') {
+  // PIT receipt: cruiser on the rear quarter at speed, one synchronous tick
+  startGame();
+  window._pitdbg = true;
+  godMode = true;
+  setWanted(2);
+  const pcar = mkCar(player.x + 40, player.y, 0, 'sedan', 'player');
+  pcar.keep = true;
+  pcar.speed = 120;
+  attachCarMesh(pcar);
+  cars.push(pcar);
+  player.car = pcar;
+  const cop = mkCar(pcar.x - 20, pcar.y + 12, 0, 'cop', null);   // no live AI: the probe drives it
+  attachCarMesh(cop);
+  cars.push(cop);
+  setTimeout(() => {
+    cop.x = pcar.x - 20; cop.y = pcar.y + 12; cop.angle = pcar.angle; cop.speed = 130;
+    cop.pitT = 0; cop.ramT = 0;
+    pcar.speed = 120;
+    pcar.latV = 0;
+    updCopCar(cop, 0.016);
+    console.log('PITDBG after tick latV=' + Math.round(pcar.latV) + ' pitT=' + cop.pitT.toFixed(1) + ' stars=' + stars());
+  }, 800);
+}
+if (location.hash === '#gates') {
+  // act-gate receipt: east causeway at 30, west at 40, 50 jobs total
+  startGame();
+  console.log('GATEDBG story=' + STORY.length + ' gates=' + BRIDGE_GATES.join(','));
+  missionsDone = 29;
+  mission = { type: 'rush', pts: [], i: 0, timer: 10, reward: 0, title: 'gate test' };
+  completeMission();
+  console.log('GATEDBG after job 30: east=' + bridgesOpen[3] + ' west=' + bridgesOpen[2]);
+  missionsDone = 39;
+  mission = { type: 'rush', pts: [], i: 0, timer: 10, reward: 0, title: 'gate test' };
+  completeMission();
+  console.log('GATEDBG after job 40: east=' + bridgesOpen[3] + ' west=' + bridgesOpen[2]);
+  missionsDone = 21;
+  startMission(0);
+  console.log('GATEDBG job22="' + (mission ? mission.title : 'none') + '" type=' + (mission ? mission.type : '-'));
+  failMission('gate test done');
+  missionsDone = 49;
+  startMission(0);
+  console.log('GATEDBG job50="' + (mission ? mission.title : 'none') + '" type=' + (mission ? mission.type : '-') + ' stages=' + (mission && mission.stageTotal ? mission.stageTotal : 1) + ' reward=' + (mission ? mission.reward : 0));
+  failMission('gate test done');
+}
+if (location.hash === '#balance') {
+  // weapon-economy receipt: shots-to-kill math + one LIVE punch
+  startGame();
+  const stk = (dmg, hp) => Math.ceil(hp / dmg);
+  console.log('BALDBG fist: civ=' + stk(WEAPONS.fist.dmg, 25) + ' cop=' + stk(WEAPONS.fist.dmg, 50)
+    + ' | pistol: civ=' + stk(WEAPONS.pistol.dmg, 25) + ' cop=' + stk(WEAPONS.pistol.dmg, 50)
+    + ' | uzi: civ=' + stk(WEAPONS.uzi.dmg, 25) + ' cop=' + stk(WEAPONS.uzi.dmg, 50)
+    + ' | shotgun pb: civ=' + stk(WEAPONS.shotgun.dmg * 6, 25) + ' swat=' + stk(WEAPONS.shotgun.dmg * 6, 100));
+  const p = mkPed(player.x + 20, player.y, {});
+  attachPedMesh(p);
+  peds.push(p);
+  player.angle = 0;
+  player.weapon = 'fist';
+  setTimeout(() => {
+    player.fireT = 0;
+    fireWeapon();
+    console.log('BALDBG live punch: pedAlive=' + !p.dead + ' pedHp=' + p.hp);
+  }, 800);
+}
+if (location.hash === '#minigun') {
+  // provoke the armorer: one stray round in, a wall of lead out
+  startGame();
+  window._mgdbg = true;
+  godMode = true;                            // survive the wall of lead to test the flee path
+  const gs = gunShops[0];
+  player.x = gs.x; player.y = gs.y + 120;
+  let sk = null;
+  for (const p of peds) if (p.shopkeep && dist(p.x, p.y, gs.x, gs.y) < 80) sk = p;
+  let phase = 1;
+  const iv = setInterval(() => {
+    if (!sk) { console.log('MGDBG no shopkeep found'); clearInterval(iv); return; }
+    if (phase === 1) {
+      const ang = Math.atan2(sk.y - player.y, sk.x - player.x);
+      spawnBullet(sk.x - Math.cos(ang) * 30, sk.y - Math.sin(ang) * 30, Math.cos(ang) * 900, Math.sin(ang) * 900, 0.5, 5, 0, 'p');
+      phase = 2;
+      return;
+    }
+    if (phase === 2) {
+      console.log('MGDBG enraged=' + !!sk.enraged + ' skHp=' + sk.hp + ' playerHp=' + Math.round(player.hp) + ' minigunVisible=' + (sk.mesh && sk.mesh.userData.minigun ? sk.mesh.userData.minigun.visible : '?'));
+      if (sk.enraged) {
+        player.x = gs.x + 700; player.y = gs.y + 700;
+        updPed(sk, 0.016);                   // one synchronous brain tick, no timers
+        console.log('MGDBG afterFlee enraged=' + !!sk.enraged + ' d=' + Math.round(dist(sk.x, sk.y, player.x, player.y)));
+        clearInterval(iv);
+      }
+      return;
+    }
+  }, 900);
+}
+if (location.hash === '#stats') {
+  // ledger receipt: one civilian, one burned machine, forced accuracy
+  startGame();
+  const p = mkPed(player.x + 40, player.y, {});
+  attachPedMesh(p);
+  peds.push(p);
+  killPed(p, true);
+  const c = mkCar(player.x + 80, player.y, 0, 'sedan', null);
+  attachCarMesh(c);
+  cars.push(c);
+  c.dmgBy = 'p';
+  explodeCar(c);
+  STATS.ammoSpent = 10; STATS.shotsHit = 7;
+  console.log('STATDBG civ=' + STATS.civiliansKilled + ' cars=' + STATS.carsDestroyed + ' acc=' + statAccuracy() + '%');
+  runConsole('stats');
+}
+if (location.hash === '#priest') {
+  // chapel receipt: walk in hurt and wanted, the Father offers the works
+  startGame();
+  godMode = true;
+  player.hp = 60;
+  player.cash = 1446;
+  STATS.civiliansKilled = 8;                 // makes the long Atonement row appear
+  STATS.copsKilled = 1;
+  setWanted(2);
+  const ch = props.churches[0];
+  player.x = ch.altarX;
+  player.y = ch.altarY + 42;
+  mousePitch = -0.02;
+  mouseYaw = camYaw = player.angle = -Math.PI / 2;
+  setTimeout(() => {
+    const ok = tryPriest();
+    const items = priestItems();
+    console.log('PRIDBG open=' + ok + ' items=' + items.length + ' keys=[' + items.map(i2 => i2.key).join(',') + '] stars=' + stars() + ' hp=' + player.hp);
+  }, 1200);
+}
+if (location.hash === '#sweep') {
+  // 2-minute tow rule receipt: fast-forward two clocks, watch the tow +
+  // the fresh tank arriving on the army pad at full health
+  startGame();
+  godMode = true;
+  const tk = cars.find(c2 => c2.homeTank);
+  const c = mkCar(player.x + 60, player.y, 0, 'sedan', null);
+  attachCarMesh(c);
+  cars.push(c);
+  let phase = 1;
+  const iv = setInterval(() => {
+    if (phase === 1) {
+      c.abandonT = 119.5;
+      if (tk) tk.abandonT = 119.5;        // even the TANK
+      phase = 2;
+      return;
+    }
+    if (phase === 2) {
+      const cGone = cars.indexOf(c) < 0;
+      const tkGone = cars.indexOf(tk) < 0;
+      console.log('SWEEPDBG towed car=' + cGone + ' tank=' + tkGone);
+      if (cGone && tkGone) phase = 3;
+      return;
+    }
+    const fresh = cars.find(c2 => c2.homeTank && !c2.dead);
+    if (fresh) {
+      console.log('SWEEPDBG tank respawned hp=' + fresh.hp + ' at=' + Math.round(fresh.x / TILE) + ',' + Math.round(fresh.y / TILE));
+      clearInterval(iv);
+    }
+  }, 1000);
+}
+if (location.hash.startsWith('#view-') || location.hash.startsWith('#door-')) {
+  // architecture tour: #view- from across the street, #door- at the doorstep
+  startGame();
+  godMode = true;
+  const closeUp = location.hash.startsWith('#door-');
+  const key2 = location.hash.slice(6);
+  let tx2 = null, ty2 = null, bTgt = null;
+  if (key2 === 'press' && pressBldg) bTgt = pressBldg;
+  else if (key2 === 'rowhouse') bTgt = buildings.find(bb => bb.roof);
+  else bTgt = buildings.find(bb => bb.sign === key2);
+  if (bTgt) { tx2 = bTgt.tx + bTgt.tw / 2; ty2 = bTgt.ty + bTgt.th / 2; }
+  else {
+    for (const k in DISTRICT_MAP) if (DISTRICT_MAP[k] === key2) { const cc = k.split(',').map(Number); tx2 = cc[0] + 7; ty2 = cc[1] + 7; break; }
+  }
+  if (tx2 !== null) {
+    const standOff = closeUp ? (bTgt ? bTgt.th / 2 + 2.5 : 3) : 5;
+    const s = findSidewalkNear(Math.floor(tx2), Math.floor(ty2 + standOff));
+    player.x = s.x; player.y = s.y;
+    mousePitch = closeUp ? -0.02 : -0.18;
+    camZoom = closeUp ? 1.15 : 2.4;
+    mouseYaw = camYaw = player.angle = Math.atan2(ty2 * TILE - player.y, tx2 * TILE - player.x);
+    // DEMO LIGHTS — inspection rig for architecture work. This code lives
+    // only inside the debug-hash branch: production play NEVER runs it.
+    scene.fog = null;
+    scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+    const demoD = new THREE.DirectionalLight(0xffffff, 1.0);
+    demoD.position.set(tx2 * TILE * RS + 50, 80, ty2 * TILE * RS + 90);
+    demoD.target.position.set(tx2 * TILE * RS, 4, ty2 * TILE * RS);
+    scene.add(demoD);
+    scene.add(demoD.target);
+    console.log('VIEWDBG ' + key2 + ' block=' + Math.round(tx2) + ',' + Math.round(ty2) + ' [demo lights ON]');
+  } else console.log('VIEWDBG ' + key2 + ' NOT FOUND');
+}
+if (location.hash === '#modshop') {
+  // menu-layout receipt: truck in the bay, all five rows + prices visible
+  startGame();
+  player.cash = 606;
+  const c = mkCar(player.x + 30, player.y, 0, 'truck', 'player');
+  c.keep = true;
+  attachCarMesh(c);
+  cars.push(c);
+  player.car = c;
+  modShopOpen = true;
+  menuSel = 0;
+}
+if (location.hash === '#cordon') {
+  // combat-mission police receipt: goons job active + 1 star + adjacent cop
+  // must NOT arrest; he falls back to the 170px cordon line instead
+  startGame();
+  godMode = true;
+  missionsDone = 7;              // job 8 'Dock rats' (goons)
+  startMission(0);
+  setWanted(1);
+  const cop = mkPed(player.x + 16, player.y, { cop: true, hp: 50, spd: 75, shirt: 0x20306a });
+  attachPedMesh(cop);
+  peds.push(cop);
+  let n = 0;
+  const iv = setInterval(() => {
+    n++;
+    console.log('CORDBG t' + n + ' d=' + Math.round(dist(cop.x, cop.y, player.x, player.y)) + ' state=' + state + ' mission=' + (mission ? mission.type : 'none') + ' stars=' + stars());
+    if (n >= 4) clearInterval(iv);
+  }, 1200);
+}
+if (location.hash === '#chain') {
+  // staged-mission receipt: job 5 (wheels -> rush), driven by game state
+  startGame();
+  godMode = true;
+  missionsDone = 4;
+  startMission(0);
+  const iv = setInterval(() => {
+    if (!mission) { console.log('CHNDBG complete, missionsDone=' + missionsDone + ' cash=' + player.cash); clearInterval(iv); return; }
+    if (mission.type === 'wheels') {
+      const c = mission.car;
+      if (mission.stage === 0) {
+        player.x = c.x; player.y = c.y;
+        c.driver = 'player'; c.keep = true;
+        player.car = c;
+      } else {
+        c.x = mission.target.x; c.y = mission.target.y; c.speed = 0;
+        player.x = c.x; player.y = c.y;
+      }
+    } else if (mission.type === 'rush') {
+      const pt = mission.pts[mission.i];
+      if (player.car) { player.car.x = pt.x; player.car.y = pt.y; player.car.speed = 0; }
+      player.x = pt.x; player.y = pt.y;
+    }
+  }, 900);
+}
 if (location.hash === '#baton') {
   // state-driven receipt: 1 star = baton out + swings + arrest lands;
   // after respawn, 5 stars = gun drawn, NO arrest, still alive under god
@@ -6811,13 +8376,30 @@ if (location.hash === '#island3') {
   // Capitol Shores test: causeways open, stand before the state house
   startGame();
   godMode = true;
-  missionsDone = 20;
+  missionsDone = 40;
   for (let i = 0; i < 4; i++) { bridgesOpen[i] = true; setBarrier(i, false); barrierGroups[i].visible = false; }
   const s = findSidewalkNear(70, 121);
   player.x = s.x; player.y = s.y;
   mousePitch = -0.28;
   mouseYaw = camYaw = player.angle = -Math.PI / 2;   // face north toward the capitol
   console.log('ISLDBG zone=' + zoneOf(player.x, player.y) + ' district=' + districtAt(capitolPos.x, capitolPos.y) + ' capitol=' + Math.round(capitolPos.x) + ',' + Math.round(capitolPos.y));
+}
+if (location.hash === '#exitside') {
+  startGame();
+  const c = mkCar(player.x, player.y, 0, 'sedan', 'player');   // facing east
+  c.keep = true;
+  attachCarMesh(c);
+  cars.push(c);
+  player.car = c;
+  setTimeout(() => {
+    tryEnterExit();
+    console.log('EXITDBG dy=' + Math.round(player.y - c.y) + ' (negative = LEFT of an east-facing car)');
+  }, 800);
+}
+if (location.hash === '#pause') {
+  startGame();
+  paused = true;
+  syncConsole();
 }
 if (location.hash === '#pad') {
   // controller settings receipt: open the submenu headlessly
@@ -6831,6 +8413,11 @@ if (location.hash === '#swim') {
   startGame();
   godMode = true;
   player.x = 66 * TILE; player.y = 48 * TILE;      // mid-channel, deep water
+  mousePitch = 0.55;                               // look down at the swimmer for the pose check
+  // DEMO LIGHTS (inspection only — this is a debug hash)
+  scene.fog = null;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+  setTimeout(() => console.log('SWIMDBG pose y=' + player.mesh.position.y.toFixed(2) + ' rotX=' + player.mesh.rotation.x.toFixed(2) + ' rotZ=' + player.mesh.rotation.z.toFixed(2) + ' order=' + player.mesh.rotation.order), 1000);
   setTimeout(() => { if (swim) { swim.z = 3; console.log('SWIMDBG dove z=3 breath=' + swim.breath.toFixed(1)); } }, 1500);
   setTimeout(() => { if (swim) console.log('SWIMDBG submerged z=' + swim.z.toFixed(1) + ' breath=' + swim.breath.toFixed(1)); }, 3500);
   setTimeout(() => { player.x = 56 * TILE; player.y = 48 * TILE; }, 4500);   // shore of island A
@@ -6935,6 +8522,10 @@ if (location.hash === '#cheat') {
   const hpMortal = player.hp;
   runConsole('player.cash = 777');
   console.log('CHEATDBG hp=' + hp1 + ' rpg=' + player.ammo.rpg + ' armor100=' + (g1 && hpGod === 100) + ' godOn=' + g1 + ' godOff=' + !g2 + ' dmgAfterOff=' + (hpMortal === 70) + ' cash=' + player.cash);
+  const cashBefore = player.cash;
+  runConsole('pay me 50000');
+  console.log('PAYDBG wired=' + (player.cash === cashBefore + 50000) + ' balance=' + player.cash);
+  player.cash = 777;                       // keep the save/load assertion below honest
   runConsole('save 3');
   const savedOk = !!localStorage.getItem('gta3_save_3');
   player.cash = 1;

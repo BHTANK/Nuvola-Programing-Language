@@ -63,7 +63,7 @@ function rndf(a, b) { return a + Math.random() * (b - a); }
 // ---------------------------------------------------------------- input
 const keys = {};
 const pressed = new Set();
-let mdown = false;
+let mdown = false, rdown = false;
 window.addEventListener('keydown', e => {
   if (document.activeElement === consoleEl) return;   // typing in the cheat console
   if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
@@ -90,7 +90,8 @@ window.addEventListener('mousedown', e => {
   mdown = true;
   onClick();
 });
-window.addEventListener('mouseup', e => { if (e.button === 0) mdown = false; });
+window.addEventListener('mouseup', e => { if (e.button === 0) mdown = false; if (e.button === 2) rdown = false; });
+window.addEventListener('mousedown', e => { if (e.button === 2) rdown = true; });
 window.addEventListener('contextmenu', e => e.preventDefault());
 function key(c) { return !!keys[c]; }
 // ---------------------------------------------------------------- gamepad
@@ -260,7 +261,9 @@ function pollPad(dt) {
   const mx = dz(gp.axes[sw ? 2 : 0] || 0), my = dz(gp.axes[sw ? 3 : 1] || 0);
   const cx2 = dz(gp.axes[sw ? 0 : 2] || 0), cy2 = dz(gp.axes[sw ? 1 : 3] || 0);
   padLX = mx; padLY = my;
-  if (state === 'play' && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !cutscene) {
+  if (state === 'play' && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !cutscene && !wheelOpen) {
+    // while the weapon wheel is held open the right stick ONLY aims the
+    // selector — no camera, nothing else
     const sens = padCfg.sens * 0.55;
     mouseYaw += cx2 * sens * dt * 3.2;
     mousePitch = clamp(mousePitch + cy2 * (padCfg.invertY ? -1 : 1) * sens * dt * 2.2, -1.45, 1.45);
@@ -1122,11 +1125,11 @@ function updEngine() {
   if (!engOsc) return;
   if (want) {
     const sp = Math.abs(player.car.speed);
-    const f = (player.car.kind === 'tank' ? 26 : 42) + sp * 0.34;
+    const f = player.car.kind === 'helo' ? 15 + (player.car.rotor || 0) * 26 : (player.car.kind === 'tank' ? 26 : 42) + sp * 0.34;
     engOsc.frequency.setTargetAtTime(f, AC.currentTime, 0.08);
     engOsc2.frequency.setTargetAtTime(f * 0.5, AC.currentTime, 0.08);
     engLp.frequency.setTargetAtTime(280 + sp * 2.4, AC.currentTime, 0.1);
-    engGain.gain.setTargetAtTime(player.car.kind === 'tank' ? 0.035 : 0.02, AC.currentTime, 0.15);
+    engGain.gain.setTargetAtTime(player.car.kind === 'tank' ? 0.035 : player.car.kind === 'helo' ? 0.02 + (player.car.rotor || 0) * 0.025 : 0.02, AC.currentTime, 0.15);
   } else {
     engGain.gain.setTargetAtTime(0.0001, AC.currentTime, 0.08);
   }
@@ -1193,8 +1196,73 @@ function solidAtPx(x, y) {
   }
   return false;
 }
+// ---- multi-storey parking garages: the world stays 2D for everyone else;
+// the player (on foot or driving) gets a deck index + ramp transitions.
+// gDeck null = street level outside; 0..top = inside decks (top = roof).
+const garages = [];
+function garAt(x, y) {
+  for (const g of garages) if (x >= g.x0 && x < g.x1 && y >= g.y0 && y < g.y1) return g;
+  return null;
+}
+function gWalkable(g, x, y, deck, ent) {
+  const M = 4;
+  // perimeter wall — the only gap is the entrance lane at deck 0 (south face)
+  if (x < g.x0 + M || x >= g.x1 - M || y < g.y0 + M || y >= g.y1 - M) {
+    if (!(deck === 0 && y >= g.y1 - M && x >= g.ex0 && x < g.ex1)) return false;
+  }
+  // ramp side rail: no hopping onto the slope mid-run (open at both ends)
+  if (Math.abs(x - g.rx0) < 3 && y >= g.ry0 - 2 && y < g.ry1 - 8) return false;
+  // stack-end walls, deck-tagged and placed beyond corner reach of the
+  // transition line (center-vs-corner gates deadlock a crossing car):
+  // ground floor walls off the space under the first ramp's high end,
+  // the roof walls off the open well at the last ramp's low end
+  if (x >= g.rx0 && x < g.rx1) {
+    if (deck === 0 && y >= g.ry0 - 26 && y < g.ry0 - 20) return false;
+    if (deck === g.top && y >= g.ry1 - 26 && y < g.ry1 - 20) return false;
+  }
+  // columns + parked cars (deck-tagged blockers)
+  for (const b of g.blk) {
+    if (b.deck != null && b.deck !== deck) continue;
+    const ddx = x - b.x, ddy = y - b.y;
+    if (ddx * ddx + ddy * ddy < b.r * b.r) return false;
+  }
+  return true;
+}
+function gHeightAt(ent) {
+  if (!ent || ent.gDeck == null || !ent.gGar) return 0;
+  const g = ent.gGar;
+  let h = ent.gDeck;
+  if (ent.x >= g.rx0 && ent.x < g.rx1 && ent.y >= g.ry0 && ent.y < g.ry1)
+    h += clamp((g.ry1 - ent.y) / (g.ry1 - g.ry0), 0, 1);
+  return h * FLOOR_H;
+}
+function updGarDeck(ent) {
+  const g0 = ent.gGar;
+  if (!g0) {
+    const g = garAt(ent.x, ent.y);
+    if (g) { ent.gGar = g; ent.gDeck = 0; ent.gPy = ent.y; }
+    return;
+  }
+  if (ent.x < g0.x0 || ent.x >= g0.x1 || ent.y < g0.y0 || ent.y >= g0.y1) {
+    ent.gGar = null; ent.gDeck = null; ent.gPy = null;
+    return;
+  }
+  if (ent.x >= g0.rx0 && ent.x < g0.rx1 && ent.gPy != null) {
+    if (ent.gPy >= g0.ry0 && ent.y < g0.ry0) ent.gDeck++;        // topped the ramp
+    else if (ent.gPy < g0.ry0 && ent.y >= g0.ry0) ent.gDeck--;   // heading down it
+  }
+  ent.gPy = ent.y;
+}
+// player-foot walkability that understands garage interiors
+function pWalkAt(x, y, deck, gar) {
+  const g = garAt(x, y);
+  if (g) return gWalkable(g, x, y, (gar === g && deck != null) ? deck : 0, player);
+  return !solidAtPx(x, y);
+}
 // camera-only solidity: water blocks cars, not sightlines
 function solidCamAt(x, y) {
+  // inside a garage the camera floats through the structure with the player
+  if ((player.gGar || (player.car && player.car.gGar)) && garAt(x, y)) return false;
   const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
   if (!inGrid(ix, iy)) return true;
   return solid[idx(ix, iy)] === 1 && tiles[idx(ix, iy)] !== T_WATER;
@@ -1227,7 +1295,7 @@ let savePoint = null, garagePad = null, saveHouseOpen = false, saveIcon = null;
 const modPads = [];                              // tune-up garage pads
 let modShopOpen = false, priestOpen = false;
 const parkSpots = [];                            // store parking bays — any spot may hold a car
-let hospitals = [], playerStart = null, armyBase = null, capitolPos = null;
+let hospitals = [], playerStart = null, armyBase = null, capitolPos = null, heloPad = null;
 let tankRespawnT = 0;                            // counts up while the army pad sits empty
 // 0 north harbor, 1 south harbor (A<->B), 2 west causeway (A->3), 3 east causeway (B->3)
 const bridgesOpen = [false, false, false, false];
@@ -1469,6 +1537,14 @@ function genCity() {
         paveAll(x0, y0);
         markSolidRect(x0 + 1, y0 + 1, 5, 5);
         buildings.push({ tx: x0 + 1, ty: y0 + 1, tw: 5, th: 5, floors: 5, tint: 0x62656c, tex: 'garage' });
+        const ggx = (x0 + 1) * TILE, ggy = (y0 + 1) * TILE;
+        garages.push({
+          x0: ggx, y0: ggy, x1: ggx + 5 * TILE, y1: ggy + 5 * TILE,
+          ex0: ggx + 2 * TILE + 4, ex1: ggx + 3 * TILE - 4,   // entrance lane, south face
+          rx0: ggx + 4 * TILE, rx1: ggx + 5 * TILE,           // ramp column (east)
+          ry0: ggy + TILE, ry1: ggy + 4 * TILE,               // ramp run, 3 tiles
+          top: 4, blk: []
+        });
       } else if (kind === 'gas') {
         paveAll(x0, y0);
         markSolidRect(x0 + 5, y0 + 5, 2, 2);
@@ -1737,6 +1813,7 @@ function genCity() {
   // the hideout garage: a clear lot pad by the safehouse
   garagePad = findTileNear(32, 62, T_LOT);
   armyBase = findTileNear(112, 66, T_LOT);
+  heloPad = findTileNear(36, 158, T_GRASS);   // the pad sits on base ground — the island is grass/road, it has NO lot tiles
   // ---- the MILITARY BASE perimeter: barbwire fence, solid, and it HURTS.
   const fx0 = MIL.x0 * TILE, fy0 = MIL.y0 * TILE, fx1 = (MIL.x1 + 1) * TILE, fy1 = (MIL.y1 + 1) * TILE;
   const gapL = MIL.bcol * TILE, gapR = (MIL.bcol + MIL.bwid) * TILE;
@@ -1823,7 +1900,8 @@ const CAR_KINDS = {
   truck: { hp: 160, max: 190, color: 0x7a7f85, len: 52, w: 24, grip: 430, skid: 140 },
   cop: { hp: 120, max: 300, color: 0xf0f0f4, len: 42, w: 21, grip: 820, skid: 230 },
   sport: { hp: 80, max: 340, color: 0xc81e1e, len: 38, w: 19, grip: 950, skid: 260 },
-  tank: { hp: 1000, max: 150, color: 0x4a5a3a, len: 64, w: 30, grip: 4000, skid: 9999 }
+  tank: { hp: 1000, max: 150, color: 0x4a5a3a, len: 64, w: 30, grip: 4000, skid: 9999 },
+  helo: { hp: 500, max: 250, color: 0x3c452e, len: 54, w: 14, grip: 900, skid: 9999 }
 };
 const CAR_COLORS = [0x3a5f9e, 0x8a2f2f, 0x3f7d4a, 0x7a4f8a, 0xb8b8be, 0x2f2f36, 0xa05c28, 0x4f7d8a];
 
@@ -2470,6 +2548,7 @@ const TEXS = {
   signs: {
     police: signTexture('#1a3a6e', '#ffffff', 'POLICE', false),
     office: signTexture('#0c0c10', '#ffd070', 'OFFICE', false),
+    parking: signTexture('#101418', '#ffd23f', 'PARKING', false),
     hospital: signTexture('#f0f0f0', '#202028', 'HOSPITAL', true),
     mall: signTexture('#6e1a4a', '#ffe9b0', 'NUVOLA MALL', false),
     motel: signTexture('#0c0c10', '#ff5090', 'MOTEL', false),
@@ -2508,10 +2587,93 @@ function stoopTopAt(px, py) {
   let crownIdx = 0;
   const stoopMat = new THREE.MeshLambertMaterial({ color: 0x8f887e });
   const stoopPlacements = [];
+  const garSlabMat = new THREE.MeshLambertMaterial({ color: 0x565a61 });
+  const garWallMat = new THREE.MeshLambertMaterial({ color: 0x4a4e55 });
+  const garColMat = new THREE.MeshLambertMaterial({ color: 0x62666d });
+  const garRampMat = new THREE.MeshLambertMaterial({ color: 0x50545b });
+  const garLightMat = new THREE.MeshBasicMaterial({ color: 0xfff2c8 });
+  const GAR_CAR_TINTS = [0x8a2f2f, 0x2f4d8a, 0x777d85, 0x3f6b3f, 0x6b5a3f, 0x50355e];
+  let garCarIdx = 0;
+  function buildGarage(g) {
+    const add = (mat, sx, sy, sz, px, py, pz, rx) => {
+      const m = new THREE.Mesh(boxGeo, mat);
+      m.scale.set(sx, sy, sz);
+      m.position.set(px, py, pz);
+      if (rx) m.rotation.x = rx;
+      scene.add(m);
+      return m;
+    };
+    const X0 = g.x0 * RS, X1 = g.x1 * RS, Z0 = g.y0 * RS, Z1 = g.y1 * RS;
+    const SX0 = g.rx0 * RS, SX1 = g.rx1 * RS, RY0 = g.ry0 * RS, RY1 = g.ry1 * RS;
+    const gcx = (X0 + X1) / 2, gcz = (Z0 + Z1) / 2, scx = (SX0 + SX1) / 2;
+    // deck slabs with the ramp well left open
+    for (let d = 1; d <= g.top; d++) {
+      const y = d * FLOOR_H - 0.25;
+      add(garSlabMat, SX0 - X0 - 0.6, 0.5, Z1 - Z0 - 0.6, (X0 + SX0) / 2, y, gcz);
+      add(garSlabMat, SX1 - SX0 - 0.6, 0.5, RY0 - Z0 - 0.6, scx, y, (Z0 + RY0) / 2);
+      add(garSlabMat, SX1 - SX0 - 0.6, 0.5, Z1 - RY1 - 0.6, scx, y, (RY1 + Z1) / 2);
+    }
+    // ramps (north end high) + a rail on the open side
+    const rampLen = Math.hypot(RY1 - RY0, FLOOR_H), rampAng = Math.atan2(FLOOR_H, RY1 - RY0);
+    for (let d = 0; d < g.top; d++) {
+      add(garRampMat, SX1 - SX0 - 0.6, 0.4, rampLen, scx, d * FLOOR_H + FLOOR_H / 2, (RY0 + RY1) / 2, rampAng);
+      add(garWallMat, 0.5, 1.1, rampLen, SX0 + 0.25, d * FLOOR_H + FLOOR_H / 2 + 0.7, (RY0 + RY1) / 2, rampAng);
+    }
+    // perimeter: taller street wall at ground (split at the entrance), knee
+    // parapets above
+    const EX0 = g.ex0 * RS, EX1 = g.ex1 * RS;
+    for (let d = 0; d <= g.top; d++) {
+      const h = d === 0 ? 2.6 : 1.1, y = d * FLOOR_H + h / 2 + 0.05;
+      add(garWallMat, X1 - X0 - 0.6, h, 0.6, gcx, y, Z0 + 0.6);
+      if (d === 0) {
+        add(garWallMat, EX0 - X0 - 0.6, h, 0.6, (X0 + EX0) / 2, y, Z1 - 0.6);
+        add(garWallMat, X1 - EX1 - 0.6, h, 0.6, (EX1 + X1) / 2, y, Z1 - 0.6);
+      } else {
+        add(garWallMat, X1 - X0 - 0.6, h, 0.6, gcx, y, Z1 - 0.6);
+      }
+      add(garWallMat, 0.6, h, Z1 - Z0 - 0.6, X0 + 0.6, y, gcz);
+      add(garWallMat, 0.6, h, Z1 - Z0 - 0.6, X1 - 0.6, y, gcz);
+    }
+    // columns on the interior tile grid (the ramp run stays clear)
+    for (let i = 1; i <= 4; i++) for (let j = 1; j <= 4; j++) {
+      if (i === 4 && j >= 1 && j <= 3) continue;
+      add(garColMat, 0.9, g.top * FLOOR_H + 0.4, 0.9, X0 + i * TILE * RS, (g.top * FLOOR_H + 0.4) / 2, Z0 + j * TILE * RS);
+      g.blk.push({ x: g.x0 + i * TILE, y: g.y0 + j * TILE, r: 5, deck: null });
+    }
+    // residents: parked cars on decks 1..3 along the WEST wall — clear of
+    // the ramp circulation (entrance lane, east strip, north crossover)
+    for (let d = 1; d <= 3; d++) for (const s of [0, 1]) {
+      const pxl = g.x0 + 16, pyl = g.y0 + 60 + s * 92;
+      const tint = new THREE.MeshLambertMaterial({ color: GAR_CAR_TINTS[garCarIdx++ % GAR_CAR_TINTS.length] });
+      add(tint, 4.2, 1.5, 9, pxl * RS, d * FLOOR_H + 0.95, pyl * RS);
+      add(tint, 3.6, 1.1, 4.6, pxl * RS, d * FLOOR_H + 2.1, pyl * RS);
+      g.blk.push({ x: pxl, y: pyl - 9, r: 9, deck: d });
+      g.blk.push({ x: pxl, y: pyl + 9, r: 9, deck: d });
+    }
+    // ceiling tubes under each slab
+    for (let d = 1; d <= g.top; d++) {
+      add(garLightMat, 2.6, 0.14, 1.0, gcx - 12, d * FLOOR_H - 0.6, gcz);
+      add(garLightMat, 2.6, 0.14, 1.0, gcx + 12, d * FLOOR_H - 0.6, gcz);
+    }
+    // the stack-end walls the physics enforces: solid infill under the first
+    // ramp's high end at ground level, and a guard rail across the roof well
+    add(garWallMat, SX1 - SX0 - 0.6, 4.6, 1.5, scx, 2.3, (g.ry0 - 23) * RS);
+    add(garWallMat, SX1 - SX0 - 0.6, 1.1, 1.5, scx, g.top * FLOOR_H + 0.6, (g.ry1 - 23) * RS);
+    // the name over the way in
+    const sign = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ map: TEXS.signs.parking }));
+    sign.scale.set(10, 2, 0.35);
+    sign.position.set((EX0 + EX1) / 2, 4.4, Z1 - 0.25);
+    scene.add(sign);
+    console.log('GARAGE built @' + g.x0 + ',' + g.y0 + ' decks=' + (g.top + 1) + ' blk=' + g.blk.length);
+  }
   const T2 = TILE * RS;
   for (const b of buildings) {
     const W = b.tw * T2 - 0.6, D = b.th * T2 - 0.6, H = b.floors * FLOOR_H;
     const cx = (b.tx + b.tw / 2) * T2, cz = (b.ty + b.th / 2) * T2;
+    if (b.tex === 'garage') {
+      const gg = garages.find(g => g.x0 === b.tx * TILE && g.y0 === b.ty * TILE);
+      if (gg) { buildGarage(gg); continue; }
+    }
     const base = b.tex === 'glass' ? TEXS.glass : b.tex === 'garage' ? TEXS.garage
       : b.tex === 'motel' ? TEXS.motel : b.tex === 'wood' ? TEXS.wood
       : b.tex === 'brick' ? (Math.random() < 0.5 ? TEXS.brickA : TEXS.brickB) : TEXS.conc;
@@ -3226,6 +3388,11 @@ function checkLampHits(c) {
   // gas station canopies (drive-under)
   const canopyMat = new THREE.MeshLambertMaterial({ color: 0x3a4048 });
   const canopyGlow = new THREE.MeshBasicMaterial({ color: 0xfff0c0 });
+  const pumpIslandMat = new THREE.MeshLambertMaterial({ color: 0x9a958c });
+  const pumpBodyMat = new THREE.MeshLambertMaterial({ color: 0xe8e6e0 });
+  const pumpBandMat = new THREE.MeshLambertMaterial({ color: 0xc03028 });
+  const pumpDarkMat = new THREE.MeshLambertMaterial({ color: 0x22262c });
+  const pumpDispMat = new THREE.MeshBasicMaterial({ color: 0xd6efd8 });   // lit price display
   for (const gs2 of props.gas) {
     const gx = gs2.x * RS, gz = gs2.y * RS;
     for (const [ox, oz] of [[-9, -6], [9, -6], [-9, 6], [9, 6]]) {
@@ -3239,10 +3406,56 @@ function checkLampHits(c) {
     const strip = new THREE.Mesh(new THREE.BoxGeometry(24.2, 0.3, 16.2), canopyGlow);
     strip.position.set(gx, 5.1, gz);
     scene.add(strip);
+    // real pump islands: concrete curb, two pumps each — white body, red
+    // brand band, lit price display both sides, nozzle holster + hanging hose
     for (const ox of [-5, 5]) {
-      const pump = new THREE.Mesh(new THREE.BoxGeometry(1.2, 2, 0.8), supMat);
-      pump.position.set(gx + ox, 1, gz);
-      scene.add(pump);
+      const island = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.3, 6.0), pumpIslandMat);
+      island.position.set(gx + ox, 0.15, gz);
+      scene.add(island);
+      for (const oz of [-1.7, 1.7]) {
+        const px2 = gx + ox, pz2 = gz + oz;
+        const body = new THREE.Mesh(new THREE.BoxGeometry(1.5, 2.2, 0.8), pumpBodyMat);
+        body.position.set(px2, 1.4, pz2);
+        scene.add(body);
+        const band = new THREE.Mesh(new THREE.BoxGeometry(1.54, 0.35, 0.84), pumpBandMat);
+        band.position.set(px2, 2.3, pz2);
+        scene.add(band);
+        const disp = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.5, 0.55), pumpDispMat);
+        disp.position.set(px2, 1.85, pz2);
+        scene.add(disp);
+        const cap = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.12, 0.95), pumpDarkMat);
+        cap.position.set(px2, 2.56, pz2);
+        scene.add(cap);
+        for (const sx4 of [-1, 1]) {   // a nozzle holster + hose on each fueling side
+          const hol = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.32, 0.26), pumpDarkMat);
+          hol.position.set(px2 + sx4 * 0.85, 1.35, pz2 + 0.14);
+          scene.add(hol);
+          const hose = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 1.05, 5), pumpDarkMat);
+          hose.position.set(px2 + sx4 * 0.82, 0.85, pz2 - 0.12);
+          scene.add(hose);
+        }
+        blockers.push({ x: px2 / RS, y: pz2 / RS, r: 5 });   // pump body + skin, mesh-true
+      }
+    }
+  }
+  // the army helipad: concrete circle, painted H, corner lights
+  if (heloPad) {
+    const padTex = mkTex(128, 128, g => {
+      g.fillStyle = '#4c5046'; g.fillRect(0, 0, 128, 128);
+      g.strokeStyle = '#e8d24a'; g.lineWidth = 5;
+      g.beginPath(); g.arc(64, 64, 52, 0, Math.PI * 2); g.stroke();
+      g.lineWidth = 10;
+      g.beginPath(); g.moveTo(46, 36); g.lineTo(46, 92); g.stroke();
+      g.beginPath(); g.moveTo(82, 36); g.lineTo(82, 92); g.stroke();
+      g.beginPath(); g.moveTo(46, 64); g.lineTo(82, 64); g.stroke();
+    });
+    const pad = new THREE.Mesh(new THREE.BoxGeometry(30, 0.3, 30), new THREE.MeshLambertMaterial({ map: padTex }));
+    pad.position.set(heloPad.x * RS, 0.15, heloPad.y * RS);
+    scene.add(pad);
+    for (const [px9, pz9] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      const lt = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), new THREE.MeshBasicMaterial({ color: 0xffb43a }));
+      lt.position.set(heloPad.x * RS + px9 * 14, 0.45, heloPad.y * RS + pz9 * 14);
+      scene.add(lt);
     }
   }
   // church steeple + spire + cross
@@ -4918,6 +5131,15 @@ function spawnPed() {
     const x = f.x + Math.cos(ang) * d, y = f.y + Math.sin(ang) * d;
     const s = findSidewalkNear(Math.floor(x / TILE), Math.floor(y / TILE));
     if (dist(s.x, s.y, f.x, f.y) < 550) continue;
+    if (islandAt(Math.floor(s.x / TILE), Math.floor(s.y / TILE)) === 3) {
+      // the base is walked by SOLDIERS on patrol, not civilians
+      const U = UNITS.mil;
+      const sol = mkPed(s.x, s.y, { cop: true, hp: U.hp, spd: 22, shirt: U.shirt, patrol: true, unit: 'mil' });
+      attachPedMesh(sol);
+      sol.mesh.userData.gun.visible = true;
+      peds.push(sol);
+      return;
+    }
     const p = mkPed(s.x, s.y);
     attachPedMesh(p);
     peds.push(p);
@@ -5019,14 +5241,23 @@ function spawnArmyTank() {
 function carHitsSolid(c) {
   const cs = Math.cos(c.angle), sn = Math.sin(c.angle);
   const hl = c.len / 2 - 2, hw = c.w / 2 - 1;
+  const gAware = c.gGar || c.driver === 'player';
   for (const [dx, dy] of [[hl, hw], [hl, -hw], [-hl, hw], [-hl, -hw]]) {
-    if (solidAtPx(c.x + dx * cs - dy * sn, c.y + dx * sn + dy * cs)) return true;
+    const px = c.x + dx * cs - dy * sn, py = c.y + dx * sn + dy * cs;
+    if (gAware) {
+      const g = garAt(px, py);
+      if (g) {
+        if (!gWalkable(g, px, py, (c.gGar === g && c.gDeck != null) ? c.gDeck : 0, c)) return true;
+        continue;
+      }
+    }
+    if (solidAtPx(px, py)) return true;
   }
   return false;
 }
 function carDamage(c, amt, by) {
   if (c.dead) return;
-  if (godMode && player.car === c) return;   // god mode shields the occupied vehicle
+  if (godMode && (player.car === c || (c.kind === 'helo' && c.stolen))) return;   // god shields the occupied vehicle and YOUR claimed bird — never police/army property
   c.hp -= amt;
   if (by) c.dmgBy = by;
   if (c.hp <= 0) explodeCar(c);
@@ -5229,16 +5460,16 @@ function moveCar(c, dt) {
   const dy = (Math.sin(c.angle) * c.speed + ry * c.latV) * dt;
   const px = c.x, py = c.y;
   c.x += dx; c.y += dy;
-  if (!carHitsSolid(c)) return;
+  if (!carHitsSolid(c)) { if (c.gGar || c.driver === 'player') updGarDeck(c); return; }
   // blocked: slide along the wall, losing power to friction
   const vlen = Math.hypot(dx, dy) || 1;
   if (Math.abs(dx) > 0.01) {
     c.x = px + dx; c.y = py;
-    if (!carHitsSolid(c)) { grindWall(c, Math.abs(dy) / vlen, dt); return; }
+    if (!carHitsSolid(c)) { if (c.gGar || c.driver === 'player') updGarDeck(c); grindWall(c, Math.abs(dy) / vlen, dt); return; }
   }
   if (Math.abs(dy) > 0.01) {
     c.x = px; c.y = py + dy;
-    if (!carHitsSolid(c)) { grindWall(c, Math.abs(dx) / vlen, dt); return; }
+    if (!carHitsSolid(c)) { if (c.gGar || c.driver === 'player') updGarDeck(c); grindWall(c, Math.abs(dx) / vlen, dt); return; }
   }
   // dead stop: bounce
   c.x = px; c.y = py;
@@ -5251,6 +5482,88 @@ function moveCar(c, dt) {
   }
   c.speed *= -0.3;
   c.latV *= 0.3;
+}
+function heloAimPoint() {
+  // the crosshair's ray from the camera, dropped onto the ground plane
+  const cvp = Math.cos(mousePitch), svp = Math.sin(mousePitch);
+  const dirX = Math.cos(mouseYaw) * cvp, dirY = -svp, dirZ = Math.sin(mouseYaw) * cvp;
+  const t9 = dirY < -0.05 ? Math.min(camPos.y / -dirY, 300) : 300;
+  return {
+    x: clamp((camPos.x + dirX * t9) / RS, 20, WORLD_W - 20),
+    y: clamp((camPos.z + dirZ * t9) / RS, 20, WORLD_H - 20)
+  };
+}
+function heloMuzzle(c, lx, lz) {
+  const cs = Math.cos(c.angle), sn = Math.sin(c.angle);
+  return { x: c.x + (cs * lx - sn * lz) / RS, y: c.y + (sn * lx + cs * lz) / RS };
+}
+function stepPlayerHelo(c, dt) {
+  // throttle spools the rotor, brake bleeds it — the trim HOLDS where you set it
+  const thr = key('KeyW') ? 1 : padThrottle;
+  const brk = key('KeyS') ? 1 : padBrakeV;
+  const thrN = clamp((thr - 0.02) / 0.96, 0, 1), brkN = clamp((brk - 0.02) / 0.96, 0, 1);
+  c.rotor = clamp((c.rotor || 0) + (thrN * 0.38 - brkN * 0.55) * dt, 0, 1);
+  const ground = tileHeight(c.x, c.y);
+  const floor9 = (c.alt || 0) >= ground - 0.1 ? ground : 0;   // rooftops hold the skids
+  const lift = ((c.rotor || 0) - 0.6) * 30;
+  c.vAlt = (c.vAlt || 0) + (lift - (c.vAlt || 0)) * Math.min(1, dt * 3);
+  c.alt = clamp((c.alt || 0) + c.vAlt * dt, floor9, 64);
+  if (c.alt <= floor9 + 0.01) { c.alt = floor9; if (c.vAlt < 0) c.vAlt = 0; }
+  if (c.alt < ground) c.alt = ground;                          // forgiving: pop over a wall you clip
+  const air = c.alt > floor9 + 0.4 || (c.rotor || 0) > 0.62;
+  // yaw: the nose follows where you LOOK
+  if (air) c.angle += angDiff(c.angle, mouseYaw) * Math.min(1, dt * 2.4);
+  // left stick: pitch and roll (keys: arrows pitch, A/D roll)
+  const pit = clamp(((key('ArrowUp') ? 1 : 0) - (key('ArrowDown') ? 1 : 0)) || -padLY, -1, 1);
+  const rol = clamp(((key('KeyD') ? 1 : 0) - (key('KeyA') ? 1 : 0)) || padLX, -1, 1);
+  c.tiltP = (c.tiltP || 0) + (pit - (c.tiltP || 0)) * Math.min(1, dt * 5);
+  c.tiltR = (c.tiltR || 0) + (rol - (c.tiltR || 0)) * Math.min(1, dt * 5);
+  if (c.alt > floor9 + 0.4) {
+    const fx2 = Math.cos(c.angle), fy2 = Math.sin(c.angle), rx2 = -fy2, ry2 = fx2;
+    c.vx = (c.vx || 0) + (fx2 * c.tiltP * 190 + rx2 * c.tiltR * 130) * dt;
+    c.vy = (c.vy || 0) + (fy2 * c.tiltP * 190 + ry2 * c.tiltR * 130) * dt;
+    const drag = Math.pow(0.5, dt);
+    c.vx *= drag; c.vy *= drag;
+    c.x = clamp(c.x + c.vx * dt, 60, WORLD_W - 60);
+    c.y = clamp(c.y + c.vy * dt, 60, WORLD_H - 60);
+    c.speed = Math.hypot(c.vx, c.vy);
+    STATS.distanceDriven += c.speed * dt;
+  } else {
+    c.vx = (c.vx || 0) * Math.pow(0.02, dt); c.vy = (c.vy || 0) * Math.pow(0.02, dt);
+    c.speed = 0; c.tiltP *= Math.pow(0.05, dt); c.tiltR *= Math.pow(0.05, dt);
+  }
+  // ---- weapons: RB = both chin cannons at the ground crosshair,
+  //               LB = rocket pods, one pod at a time
+  c.fireT = (c.fireT || 0) - dt; c.rockT = (c.rockT || 0) - dt;
+  c.cShots = c.cShots || 0;
+  if ((mdown || padHand) && c.fireT <= 0 && c.alt > 2) {
+    c.fireT = 0.09;
+    const tgt = heloAimPoint();
+    for (const side of [-1, 1]) {
+      const m = heloMuzzle(c, 4.6, side * 0.35);
+      addPart(m.x, m.y, c.alt + 1.1, 0, 0, 0, 0.05, 0xffe9a0, 1.6, true);
+    }
+    const jx = tgt.x + rndf(-9, 9), jy = tgt.y + rndf(-9, 9);
+    spawnBullet(jx, jy, rndf(-8, 8), rndf(-8, 8), 0.07, 9, 5, 'p', 1.2, 0);
+    spawnBullet(jx + rndf(-6, 6), jy + rndf(-6, 6), rndf(-8, 8), rndf(-8, 8), 0.07, 9, 5, 'p', 1.2, 0);
+    sparks(jx, jy);
+    if (++c.cShots % 3 === 0) sfx('uzi', c.x, c.y);
+    if (c.cShots % 5 === 0) decalAt(jx, jy, 0.5, 0x1a1a16);
+    rumble(0.12, 0.3, 90);
+    STATS.ammoSpent += 2;
+  }
+  if ((rdown || padTankFire) && c.rockT <= 0 && c.alt > 2) {
+    c.rockT = 0.55;
+    c.podSide = -(c.podSide || 1);
+    const tgt = heloAimPoint();
+    const m = heloMuzzle(c, 0.9, c.podSide * 3.2);
+    const ang = Math.atan2(tgt.y - m.y, tgt.x - m.x);
+    const D = Math.max(60, dist(m.x, m.y, tgt.x, tgt.y));
+    const tof = D / 460;
+    shells.push({ x: m.x, y: m.y, vx: Math.cos(ang) * 460, vy: Math.sin(ang) * 460, life: tof + 0.05, src: c, pby: true, done: false, h: c.alt + 1.4, vh: -(c.alt + 1.2) / tof, mesh: grabMesh(shellMeshes) });
+    sfx('rocket', m.x, m.y);
+    rumble(0.5, 0.2, 160);
+  }
 }
 function stepPlayerCar(c, dt) {
   // keyboard is digital; pad triggers are analog throttle/brake, stick steers
@@ -5439,7 +5752,7 @@ function updMobCar(c, dt) {
   if (!player.car && Math.abs(c.speed) > 100 && d < 24 && player.hurtT <= 0) { hurtPlayer(25); player.hurtT = 0.6; }
 }
 function fireShell(c, ang, elev) {
-  const s = { x: c.x + Math.cos(ang) * (c.len / 2 + 14), y: c.y + Math.sin(ang) * (c.len / 2 + 14), vx: Math.cos(ang) * 520, vy: Math.sin(ang) * 520, life: 1.1, src: c, pby: false, done: false, h: 3.5, vh: 0, mesh: grabMesh(shellMeshes) };
+  const s = { x: c.x + Math.cos(ang) * (c.len / 2 + 14), y: c.y + Math.sin(ang) * (c.len / 2 + 14), vx: Math.cos(ang) * 520, vy: Math.sin(ang) * 520, life: 1.1, src: c, pby: false, done: false, h: 3.5 + (c.empl || 0), vh: 0, mesh: grabMesh(shellMeshes) };
   if (elev) {
     // lobbed: up to 45 degrees of barrel, real gravity, longer fuse — artillery
     s.vh = Math.tan(elev) * 520 * RS;
@@ -5483,7 +5796,7 @@ function updShells(dt) {
       if (gunship.hp <= 0) gunshipDown(s.pby || (s.src && s.src.driver === 'player') ? 'p' : null);
       continue;
     }
-    let boom = s.life <= 0 || s.h <= 0.2 || (s.h < 14 && solidAtPx(s.x, s.y));
+    let boom = s.life <= 0 || s.h <= 0.2 || (solidAtPx(s.x, s.y) && s.h < Math.max(0.6, tileHeight(s.x, s.y)));   // blocked by real obstruction height, not by flat water
     let hitCar = null;
     if (!boom && s.h < 7) for (const c of cars) { if (c.dead || c === s.src) continue; if (dist(c.x, c.y, s.x, s.y) < c.len / 2) { boom = true; hitCar = c; break; } }
     if (!boom && s.h < 5) for (const p of peds) { if (!p.dead && dist(p.x, p.y, s.x, s.y) < 12) { boom = true; break; } }
@@ -5511,7 +5824,21 @@ function ensureMilGuards() {
     if (have) continue;
     const c = mkCar((gx + 0.5) * TILE, (MIL.y0 + 1.5) * TILE, 0, 'tank', 'mil');
     c.angle = north; c.turret = north; c.milGuard = true; c.keep = true;
+    c.empl = 3.2;                              // raised emplacement: barrels clear the fence
     attachCarMesh(c); cars.push(c);
+    const plat = new THREE.Mesh(new THREE.BoxGeometry(9.5, 3.2, 9.5), new THREE.MeshLambertMaterial({ color: 0x585c50 }));
+    plat.position.set((gx + 0.5) * TILE * RS, 1.6, (MIL.y0 + 1.5) * TILE * RS);
+    scene.add(plat);
+  }
+  // the attack bird waits on its pad; a destroyed one is replaced
+  let hv = null;
+  for (const c of cars) if (c.kind === 'helo' && !c.dead) hv = c;
+  if (!hv && heloPad) {
+    const h = mkCar(heloPad.x, heloPad.y, 0, 'helo', null);
+    h.angle = -Math.PI / 2; h.keep = true; h.alt = 0; h.rotor = 0; h.vx = 0; h.vy = 0;
+    h.mesh = buildGunshipMesh();
+    scene.add(h.mesh);
+    cars.push(h);
   }
 }
 function updMilGuard(c, dt) {
@@ -5637,6 +5964,8 @@ function exitSwim() {
   console.log('SWIMDBG exit');
 }
 function canSwimTo(x, y) {
+  const g = garAt(x, y);
+  if (g) return gWalkable(g, x, y, (player.gGar === g && player.gDeck != null) ? player.gDeck : 0, player);
   const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
   if (!inGrid(ix, iy)) return false;
   if (tiles[idx(ix, iy)] === T_WATER) return true;
@@ -6376,6 +6705,7 @@ function carCollisions() {
     for (let j = i + 1; j < cars.length; j++) {
       const b = cars[j];
       if (b.dead) continue;
+      if ((a.gDeck || 0) !== (b.gDeck || 0)) continue;   // different garage decks
       const d = dist(a.x, a.y, b.x, b.y);
       const rr2 = (a.len + b.len) / 4 + 4;
       if (d > rr2 || d === 0) continue;
@@ -6921,7 +7251,10 @@ function computeAim() {
 // firefight — no gunfire heat, no brandishing warnings, no arrests, and the
 // responders hold a cordon instead of walking into the crossfire
 function combatMission() {
-  return !!mission && (mission.type === 'goons' || mission.type === 'hit');
+  // the cordon: cops hold the perimeter of a sanctioned mission firefight —
+  // no witnessed-gunfire heat, no open-carry disarm, no mid-fight arrests.
+  // escort waves (armed hunters on the informant) are exactly such a fight.
+  return !!mission && (mission.type === 'goons' || mission.type === 'hit' || mission.type === 'escort');
 }
 function gunfireWitnessed() {
   stingGo();                                 // a sting waits for YOUR first shot
@@ -7085,14 +7418,16 @@ function carBodyDist(c, px, py) {
 function tryEnterExit() {
   if (player.car) {
     const c = player.car;
+    if (c.kind === 'helo' && (c.alt || 0) > tileHeight(c.x, c.y) + 2) { msg('Land it first.'); return true; }
     // step out the DRIVER'S side (left) — the right door only if the left
     // is blocked against a wall
     for (const side of [-1, 1]) {
       const ex = c.x + Math.cos(c.angle + side * Math.PI / 2) * (c.w / 2 + 12);
       const ey = c.y + Math.sin(c.angle + side * Math.PI / 2) * (c.w / 2 + 12);
-      if (!solidAtPx(ex, ey)) {
+      if (pWalkAt(ex, ey, c.gDeck, c.gGar)) {
         doorSwing(c, side);
         player.x = ex; player.y = ey;
+        player.gGar = c.gGar || null; player.gDeck = c.gGar ? c.gDeck : null; player.gPy = c.gGar ? ey : null;
         player.angle = c.angle;
         c.driver = null;
         player.car = null;
@@ -8235,6 +8570,7 @@ function nearestAction() {
   }
   for (const c of cars) {
     if (c.dead) continue;
+    if (Math.abs(gHeightAt(c) - gHeightAt(player)) > 2.6) continue;   // different garage deck
     const d = carBodyDist(c, player.x, player.y);
     if (d < 14) acts.push({ d, go: () => enterCar(c) });
   }
@@ -8606,7 +8942,7 @@ function update(dt) {
 
   if (player.car) {
     const pc = player.car;
-    stepPlayerCar(pc, dt);
+    if (pc.kind === 'helo') stepPlayerHelo(pc, dt); else stepPlayerCar(pc, dt);
     player.x = pc.x; player.y = pc.y;
     player.angle = pc.angle;
     if (pc.kind === 'tank') {
@@ -8667,6 +9003,7 @@ function update(dt) {
       if (canSwimTo(player.x + player.wvx * dt, player.y)) player.x += player.wvx * dt;
       if (canSwimTo(player.x, player.y + player.wvy * dt)) player.y += player.wvy * dt;
     }
+    updGarDeck(player);
     if (player.aimHold > 0 && !cutscene) player.angle = mouseYaw;   // face the crosshair while shooting
     computeAim();
     if ((mdown || padFire) && !cutscene) fireWeapon();
@@ -8794,7 +9131,7 @@ function update(dt) {
     b.h += b.vh * dt;
     if (b.mesh) b.mesh.position.set(b.x * RS, b.h, b.y * RS);
     if (b.h <= 0) { b.life = 0; sparks(b.x, b.y); continue; }                    // ground impact
-    if (b.h < 14 && solidAtPx(b.x, b.y)) { b.life = 0; sparks(b.x, b.y); continue; }
+    if (solidAtPx(b.x, b.y) && b.h < Math.max(0.6, tileHeight(b.x, b.y))) { b.life = 0; sparks(b.x, b.y); continue; }
     // the chopper can be shot down — aim up
     if (chopper && !chopper.dead && b.from === 'p' && Math.abs(b.h - chopper.alt) < 5 && dist(chopper.x, chopper.y, b.x, b.y) < 42) {
       chopper.hp -= b.dmg;
@@ -9076,8 +9413,18 @@ function syncScene(dt, t) {
     if (!c.mesh) continue;
     c.mesh.visible = !c.dead;
     if (c.dead) continue;
-    c.mesh.position.set(c.x * RS, 0, c.y * RS);
+    c.mesh.position.set(c.x * RS, gHeightAt(c) + (c.empl || 0), c.y * RS);
     c.mesh.rotation.y = -c.angle;
+    if (c.kind === 'helo') {
+      c.mesh.position.y = (c.alt || 0) + 2.55;
+      c.mesh.rotation.order = 'YZX';
+      c.mesh.rotation.set((c.tiltR || 0) * 0.16, -c.angle, -(c.tiltP || 0) * 0.2);
+      if (!c.driver) c.rotor = Math.max(0, (c.rotor || 0) - dt * 0.08);   // abandoned: spools down
+      c.rotorW = (c.rotorW || 0) + (0.6 + (c.rotor || 0) * 36) * dt * ((c.rotor || 0) > 0.005 ? 1 : 0);
+      const hu = c.mesh.userData;
+      if (hu.rotor) hu.rotor.rotation.y = c.rotorW;
+      if (hu.trotor) hu.trotor.rotation.z = c.rotorW * 3;
+    }
     updDoors(c, dt);
     if (c.mesh.userData.driverFig) c.mesh.userData.driverFig.visible = !!c.driver && !c.dead;
     if (c.mesh.userData.passFig) c.mesh.userData.passFig.visible = c === player.car && !c.dead && !!partner && !partner.dead && !!partner.riding;
@@ -9161,7 +9508,7 @@ function syncScene(dt, t) {
       // step elevation: climb motel stoops for real, eased so it reads as steps
       const gh = stoopTopAt(player.x, player.y);
       player.gh = (player.gh || 0) + (gh - (player.gh || 0)) * Math.min(1, dt * 10);
-      player.mesh.position.set(player.x * RS, bob * 0.12 + (player.jumpH || 0) + player.gh, player.y * RS);
+      player.mesh.position.set(player.x * RS, bob * 0.12 + (player.jumpH || 0) + player.gh + gHeightAt(player), player.y * RS);
       player.mesh.rotation.set(0, -player.angle, 0);
     }
     player.mesh.userData.gun.visible = false;
@@ -9306,14 +9653,15 @@ function syncScene(dt, t) {
   }
   const f = focus();
   camYaw = mouseYaw;                                  // mouse drives the camera directly
-  const cd = (player.car ? (player.car.kind === 'tank' ? 26 : 18) : 10.5) * camZoom;
+  const cd = (player.car ? (player.car.kind === 'tank' ? 26 : player.car.kind === 'helo' ? 32 : 18) : 10.5) * camZoom;
   // full free-look: view direction from yaw + pitch (+pitch looks down, -pitch up);
   // the camera orbits a shoulder-height pivot and LOOKS ALONG this ray, so the
   // crosshair is exactly the camera's line of sight
   const cvp = Math.cos(mousePitch), svp = Math.sin(mousePitch);
   const dirX = Math.cos(camYaw) * cvp, dirY = -svp, dirZ = Math.sin(camYaw) * cvp;
   const fx = f.x * RS, fz = f.y * RS;
-  const pivotY = player.car ? 4 : swim ? 0.9 : 3.2;   // the lens rides the waterline with a swimmer
+  const gH = gHeightAt(player.car || player) + (player.car && player.car.alt ? player.car.alt : 0);
+  const pivotY = (player.car ? 4 : swim ? 0.9 : 3.2) + gH;   // the lens rides the waterline with a swimmer — and garage decks
   // camera collision: pull in so we never sit inside a building
   let tMax = 1;
   const hDist = cd * cvp;
@@ -9323,7 +9671,7 @@ function syncScene(dt, t) {
   }
   const cdEff = cd * Math.max(0.2, tMax);
   const dx = fx - dirX * cdEff;
-  const dy = Math.max(0.5, pivotY - dirY * cdEff);    // never below the pavement
+  const dy = Math.max(0.5 + gH, pivotY - dirY * cdEff);    // never below the pavement (or the deck)
   const dz = fz - dirZ * cdEff;
   camPos.x += (dx - camPos.x) * Math.min(1, dt * 14);
   camPos.y += (dy - camPos.y) * Math.min(1, dt * 10);
@@ -9584,10 +9932,11 @@ function drawHUD(t) {
     hctx.fillStyle = ((t * 3) | 0) % 2 === 0 ? '#ff5050' : '#ffd23f';
     hctx.fillText('DISARM: ' + Math.ceil(disarmT) + 's', VW - 14, 58);
   }
-  // messages
+  // messages — when the dialog banner is up, the stack starts below it
+  // instead of overprinting the same top-center line
   hctx.textAlign = 'center';
   hctx.font = 'bold 17px monospace';
-  let yy = 30;
+  let yy = (topSay && state === 'play' && !cutscene && !paused) ? 56 : 30;
   for (const m of msgs) {
     hctx.globalAlpha = clamp(m.life, 0, 1);
     hctx.fillStyle = '#000';

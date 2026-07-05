@@ -4779,7 +4779,80 @@ function scare(x, y, r) {
     }
   }
 }
-function explodeAt(x, y, by) {
+// ---- gibs: an explosion doesn't leave a body, it leaves PIECES ----
+const gibs = [];
+const GIB_SKIN = new THREE.MeshLambertMaterial({ color: 0xd9b08c });
+const GIB_DARK = new THREE.MeshLambertMaterial({ color: 0x22262e });
+function gibBurst(x, y, shirt) {
+  bloodFx(x, y);
+  const shirtMat = new THREE.MeshLambertMaterial({ color: shirt || 0x5a3a3a });
+  const parts = [
+    new THREE.Mesh(new THREE.SphereGeometry(0.22, 6, 5), GIB_SKIN),           // the head
+    new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.4, 0.35), shirtMat),          // torso
+    new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.5, 0.16), shirtMat),         // arms
+    new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.5, 0.16), GIB_SKIN),
+    new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.55, 0.18), GIB_DARK),        // legs
+    new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.55, 0.18), GIB_DARK),
+  ];
+  for (const m of parts) {
+    const a = rndf(0, TAU);
+    scene.add(m);
+    gibs.push({
+      m, x: x + rndf(-4, 4), y: y + rndf(-4, 4), h: rndf(1.5, 3),
+      vx: Math.cos(a) * rndf(60, 220), vy: Math.sin(a) * rndf(60, 220), vh: rndf(6, 14),
+      sx: rndf(-6, 6), sy: rndf(-6, 6), t: rndf(6, 9)
+    });
+  }
+  while (gibs.length > 72) { const g0 = gibs.shift(); scene.remove(g0.m); }   // cap the carnage
+}
+function updGibs(dt) {
+  for (let i = gibs.length - 1; i >= 0; i--) {
+    const g = gibs[i];
+    g.t -= dt;
+    if (g.t <= 0) { scene.remove(g.m); gibs.splice(i, 1); continue; }
+    g.vh -= 22 * dt;
+    g.x += g.vx * dt; g.y += g.vy * dt; g.h += g.vh * dt;
+    if (g.h <= 0.12) {
+      g.h = 0.12;
+      if (g.vh < -2) { g.vh = -g.vh * 0.35; g.vx *= 0.55; g.vy *= 0.55; }   // wet bounce
+      else { g.vh = 0; const k = Math.pow(0.05, dt); g.vx *= k; g.vy *= k; g.sx *= k; g.sy *= k; }
+    }
+    g.m.position.set(g.x * RS, g.h, g.y * RS);
+    g.m.rotation.x += g.sx * dt;
+    g.m.rotation.z += g.sy * dt;
+  }
+}
+// an exploding CAR sheds its real parts the same way: doors, hood, lid,
+// wheels, bumpers — everything bolted on leaves ballistic
+function carGibBurst(c) {
+  const ud = c.mesh && c.mesh.userData;
+  if (!ud) return;
+  const wp = new THREE.Vector3();
+  const wq = new THREE.Quaternion();
+  const fling = (obj, heavy) => {
+    obj.getWorldPosition(wp);
+    obj.getWorldQuaternion(wq);
+    if (obj.parent) obj.parent.remove(obj);
+    scene.add(obj);
+    obj.position.copy(wp);
+    obj.quaternion.copy(wq);
+    const ang = Math.atan2(wp.z - c.y * RS, wp.x - c.x * RS) + rndf(-0.5, 0.5);
+    gibs.push({
+      m: obj, x: wp.x / RS, y: wp.z / RS, h: Math.max(0.6, wp.y),
+      vx: Math.cos(ang) * rndf(90, 260), vy: Math.sin(ang) * rndf(90, 260),
+      vh: rndf(8, heavy ? 14 : 18), sx: rndf(-8, 8), sy: rndf(-8, 8), t: rndf(8, 12)
+    });
+  };
+  if (ud.panels) for (const d of ud.panels) if (!d.gone) { d.gone = true; fling(d.grp, true); }
+  if (ud.wheelRolls) { for (const wr of ud.wheelRolls) if (wr.parent && wr.parent !== scene) fling(wr.parent, true); ud.wheelRolls = []; ud.wheelsF = []; }
+  if (ud.trim) { for (const t9 of ud.trim) fling(t9.m, false); ud.trim = []; }
+  while (gibs.length > 96) { const g0 = gibs.shift(); scene.remove(g0.m); }
+}
+// every blast has a RADIUS and a base DAMAGE; force and harm fall off
+// linearly with distance from the impact point, out to nothing at the edge
+function explodeAt(x, y, by, radius, dmg) {
+  const R = radius || 66;
+  const D = dmg || 160;
   sfx('boom', x, y);
   const dP = dist(player.x, player.y, x, y);
   if (dP < 420) rumble(clamp(1.1 - dP / 420, 0.2, 1), clamp(1 - dP / 420, 0.2, 0.9), 380);
@@ -4788,14 +4861,29 @@ function explodeAt(x, y, by) {
   for (const p of peds) {
     if (p.dead) continue;
     const d = dist(p.x, p.y, x, y);
-    if (d < 90) killPed(p, by === 'p');
-    else if (d < 160 && !p.rag) { p.hp -= 10; p.ragBy = by === 'p'; launchRagFrom(p, x, y, 260); }
+    const k = 1 - d / R;
+    if (k <= 0) { if (d < R * 2.2 && !p.rag) { p.ragBy = by === 'p'; launchRagFrom(p, x, y, 140); } continue; }
+    p.hp -= D * k;
+    if (p.hp <= 0) {
+      killPed(p, by === 'p');
+      if (p.dead) { gibBurst(p.x, p.y, p.shirt); if (p.mesh) p.mesh.visible = false; }
+    } else if (!p.rag) { p.ragBy = by === 'p'; launchRagFrom(p, x, y, 140 + 220 * k); }
   }
-  for (const o of cars) if (!o.dead && o.kind !== 'tank' && dist(o.x, o.y, x, y) < 95) carDamage(o, 60, by);
+  for (const o of cars) {
+    if (o.dead || o.kind === 'tank') continue;
+    const d = dist(o.x, o.y, x, y);
+    const k = 1 - d / (R * 1.4);                        // metal catches the wave a little wider
+    if (k <= 0) continue;
+    carDamage(o, D * 0.75 * k, by);
+    const a = Math.atan2(o.y - y, o.x - x);             // the shove: blast wave on the hull
+    o.speed += Math.cos(a - o.angle) * 130 * k;
+    o.latV = (o.latV || 0) + Math.sin(a - o.angle) * 130 * k;
+  }
   if (!player.car) {
     const d = dist(player.x, player.y, x, y);
-    if (d < 100) hurtPlayer(70);
-    if (d < 170 && !player.rag && !player.dead) launchRagFrom(player, x, y, 240);
+    const k = 1 - d / R;
+    if (k > 0) hurtPlayer(D * 0.6 * k);
+    if (d < R * 2 && !player.rag && !player.dead) launchRagFrom(player, x, y, 120 + 200 * Math.max(0, k));
   }
 }
 function explodeCar(c) {
@@ -4803,7 +4891,9 @@ function explodeCar(c) {
   c.dead = true;
   if (c.dmgBy === 'p') STATS.carsDestroyed++;
   const wasIn = player.car === c;
-  explodeAt(c.x, c.y, c.dmgBy);
+  explodeAt(c.x, c.y, c.dmgBy, 66, 170);
+  if (c.driver === 'ai' || c.driver === 'cop') gibBurst(c.x, c.y, c.driver === 'cop' ? 0x20306a : 0x5a3a3a);
+  carGibBurst(c);
   // the frame takes the blast: crushed in from every side, stays a wreck
   if (c.kind === 'cop') dropRamBar(c);
   const ca9 = Math.cos(c.angle), sa9 = Math.sin(c.angle);
@@ -5140,7 +5230,8 @@ function updShells(dt) {
       if (s.mesh) { s.mesh.visible = false; s.mesh = null; }
       const by = s.pby || (s.src && s.src.driver === 'player') ? 'p' : null;
       if (hitCar) carDamage(hitCar, 120, by);
-      explodeAt(s.x, s.y, by);
+      const tankShell = s.src && s.src.kind === 'tank';
+      explodeAt(s.x, s.y, by, tankShell ? 52 : 44, tankShell ? 260 : 220);
     }
     else addPart(s.x, s.y, s.h || 1.6, rndf(-8, 8), rndf(-8, 8), rndf(0, 1), 0.25, s.pby ? 0xff9040 : 0x888888, 0.8, true);
   }
@@ -5444,11 +5535,27 @@ const CHATTER = {
   ]
 };
 function pick(arr) { return arr[(Math.random() * arr.length) | 0]; }
+let topSay = null;                           // the top-of-screen dialog banner
+function speakerName(p) {
+  if (p.allyName) return p.allyName;
+  if (p.cop) return p.unit === 'swat' ? 'SWAT' : p.unit === 'cia' ? 'AGENT' : p.unit === 'mil' ? 'SOLDIER' : 'OFFICER';
+  if (p.priest) return 'FATHER';
+  if (p.shopkeep) return 'ARMORER';
+  if (p.vendor) return 'VENDOR';
+  if (p.fare) return 'FARE';
+  if (p.escortee || p.vip) return 'CONTACT';
+  if (p.goon || p.guard || p.warTarget) return 'COMBINE';
+  return '';                                 // bystanders never reach the banner
+}
 function say(p, text, life) {
   if (!p || p.dead) return;
   p.sayText = text;
   p.sayT = life || 3;
   p.voxT = rndf(14, 26);         // personal cooldown before their next remark
+  // dialog AIMED at the player (the law, the crew, the story) also lands on
+  // the top banner; street mumble between bystanders stays a bubble only
+  const who = speakerName(p);
+  if (who) topSay = { who, text, t: (life || 3) + 0.5, col: p.ally ? '#46d47a' : p.cop ? '#7fb2ff' : (p.goon || p.guard || p.warTarget) ? '#ff8080' : '#ffd98a' };
 }
 function sayNear(x, y, r, pool, life) {
   let bp = null, bd = r;
@@ -5680,7 +5787,7 @@ function updChopper(dt) {
     CH.y += CH.vy * dt;
     addPart(CH.x, CH.y, CH.alt + 1, rndf(-20, 20), rndf(-20, 20), rndf(1, 4), rndf(0.3, 0.7), Math.random() < 0.5 ? 0xff8c1a : 0x555555, rndf(1.5, 3), true);
     if (CH.alt <= 2) {
-      explodeAt(CH.x, CH.y, CH.dmgBy);
+      explodeAt(CH.x, CH.y, CH.dmgBy, 80, 200);
       removeChopper();
     }
     return;
@@ -5878,7 +5985,7 @@ function updGunship(dt) {
     GS.y += GS.vy * dt;
     addPart(GS.x, GS.y, GS.alt + 1, rndf(-20, 20), rndf(-20, 20), rndf(1, 4), rndf(0.3, 0.7), Math.random() < 0.5 ? 0xff8c1a : 0x555555, rndf(1.5, 3), true);
     if (GS.alt <= 2) {
-      explodeAt(GS.x, GS.y, GS.dmgBy);
+      explodeAt(GS.x, GS.y, GS.dmgBy, 90, 220);
       removeGunship();
     }
     return;
@@ -6347,6 +6454,16 @@ function updPed(p, dt) {
     }
     const tv = (p.huntVip && mission && mission.vip && !mission.vip.dead) ? mission.vip : player;
     const d = dist(p.x, p.y, tv.x, tv.y);
+    if (mission && mission.stealth && !p.aggro) {
+      // sentry mode: eyes FORWARD — spotted only in his front arc, close, clear line
+      if (d < 190 && inFront(p, tv.x, tv.y) && hasLOS(p.x, p.y, tv.x, tv.y)) p.aggro = true;
+      else {
+        p.thinkT = (p.thinkT || 0) - dt;
+        if (p.thinkT <= 0) { p.thinkT = rndf(1.5, 3); p.angle = rndf(0, TAU); }
+        moveCircle(p, Math.cos(p.angle) * 14 * dt, Math.sin(p.angle) * 14 * dt);
+        return;
+      }
+    }
     if (d < 420 && !(tv === player && player.dead)) {
       p.angle = Math.atan2(tv.y - p.y, tv.x - p.x);
       if (d > 130) moveCircle(p, Math.cos(p.angle) * 50 * dt, Math.sin(p.angle) * 50 * dt);
@@ -6357,9 +6474,10 @@ function updPed(p, dt) {
   if (p.guard || p.target) {
     if (p.guard && mission && (mission.type === 'hit' || mission.type === 'search')) {
       // search watchmen run a short leash — low detection, but deadly if you brush past
-      const rr = mission.type === 'search' ? 150 : 340;
+      const rr = mission.stealth ? 190 : (mission.type === 'search' ? 150 : 340);
       const d = dist(p.x, p.y, player.x, player.y);
-      if (d < rr || p.aggro) { p.aggro = true; p.angle = Math.atan2(player.y - p.y, player.x - p.x); pedShoot(p, dt); }
+      const spotted = d < rr && (!mission.stealth || (inFront(p, player.x, player.y) && hasLOS(p.x, p.y, player.x, player.y)));
+      if (spotted || p.aggro) { p.aggro = true; p.angle = Math.atan2(player.y - p.y, player.x - p.x); pedShoot(p, dt); }
     }
     if (p.target && p.state === 'flee') {
       p.fleeT -= dt;
@@ -6516,6 +6634,12 @@ function combatMission() {
 }
 function gunfireWitnessed() {
   stingGo();                                 // a sting waits for YOUR first shot
+  if (mission && mission.stealth) {
+    for (const q of peds) {
+      if (q.dead || !(q.goon || q.guard || q.warTarget || q.target)) continue;
+      if (dist(q.x, q.y, player.x, player.y) < 420) { q.aggro = true; break; }
+    }
+  }
   if (stars() > 0 || pardonMode || combatMission()) return;
   let seen = policeCanSee();
   if (!seen) {
@@ -6558,6 +6682,10 @@ function fireWeapon() {
       if (p.dead) continue;
       const d = dist(p.x, p.y, player.x, player.y);
       if (d < 40 && Math.abs(angDiff(player.angle, Math.atan2(p.y - player.y, p.x - player.x))) < 1) {
+        if (mission && mission.stealth && (p.goon || p.guard || p.target || p.warTarget) && !p.aggro && !inFront(p, player.x, player.y)) {
+          p.hp = 0;                          // from BEHIND, unseen: a silent takedown
+          msg('Silent takedown.', 3);
+        } else if (mission && mission.stealth && (p.goon || p.guard || p.target || p.warTarget)) p.aggro = true;
         p.hp -= W.dmg;
         bloodFx(p.x, p.y);
         if (p.hp <= 0) killPed(p, true); else if (!p.cop && !p.guard && !p.goon) { p.state = 'flee'; p.fleeT = 3; p.angle = Math.atan2(p.y - player.y, p.x - player.x); }
@@ -6651,7 +6779,7 @@ function updGrenades(dt) {
     if (g.fuse <= 0) {
       g.done = true;
       if (g.mesh) { g.mesh.visible = false; g.mesh = null; }
-      explodeAt(g.x, g.y, 'p');
+      explodeAt(g.x, g.y, 'p', 44, 130);
     }
   }
   for (let i = grenades.length - 1; i >= 0; i--) if (grenades[i].done) grenades.splice(i, 1);
@@ -7086,21 +7214,26 @@ const STORY = [
       'JASON: Walk soft. The bureau watches its own streets.'
     ]
   },
-  { t: 'The security bureau', brief: 'Bureau contractors sweep the Shores blocks in plain vans. Sweep back.', type: 'goons', n: 9, need: 7, timer: 100, reward: 4400 },
+  { t: 'The security bureau', brief: 'Bureau contractors sweep the Shores in plain vans. Take the street team out QUIETLY — one silent takedown at a time.', type: 'goons', n: 6, need: 6, stealth: true, reward: 4400 },
   { t: 'Capitol mail', brief: 'Six courier stops run state paper around the island every night. Beat the route.', type: 'rush', n: 6, timer: 95, reward: 4800 },
-  { t: 'The prosecutor\'s shortlist', brief: 'Your name tops an indictment draft. Find every copy before it finds a judge.', type: 'search', scatter: 5, reward: 5200 },
+  { t: 'The prosecutor\'s shortlist', brief: 'Your name tops an indictment draft. Find every copy before it finds a judge — the watchmen never learn you were there.', type: 'search', scatter: 5, stealth: true, reward: 5200 },
   { t: 'Witness for the state', brief: 'They made you at the landing. Lose the bureau tail before it follows you home.', type: 'escape', n: 3, timer: 85, reward: 5600 },
   { t: 'Armored line', brief: 'A bureau armored car hauls the Shores payroll. It doesn\'t shoot back — its escort does.', type: 'wheels', hot: 3, reward: 6000 },
-  { t: 'The under-secretary', brief: 'The under-secretary signs the charters the Combine died for. Unsign him.', type: 'hit', guards: 4, reward: 6500 },
-  { t: 'Records bunker', brief: 'The state\'s private records bunker has private guards. Open the doors the hard way.', type: 'goons', n: 10, need: 8, timer: 110, reward: 7000 },
+  { t: 'The under-secretary', brief: 'The under-secretary signs the charters the Combine died for. Walk in unseen, unsign him, walk out unheard.', type: 'hit', guards: 4, stealth: true, reward: 6500 },
   {
-    t: 'The judge\'s calendar', brief: 'Judge Merrin buries every case that climbs too high. His calendar says where he walks tonight.', type: 'search', scatter: 4, reward: 7500,
+    t: 'Records bunker', brief: 'The state\'s records bunker has private, paranoid guards. Drop the watch in silence.', type: 'goons', n: 6, need: 6, stealth: true, reward: 7000,
+    chain: [
+      { type: 'escape', n: 3, timer: 75, brief: 'The vault door trips a STATE alarm. Quiet time is over — LOSE them.' }
+    ]
+  },
+  {
+    t: 'The judge\'s calendar', brief: 'Judge Merrin buries every case that climbs too high. His calendar says where he walks — learn it without being learned.', type: 'search', scatter: 4, stealth: true, reward: 7500,
     chain: [
       { type: 'hit', guards: 3, brief: 'Found him. The honorable Judge Merrin adjourns — permanently.' }
     ]
   },
   {
-    t: 'Span control', brief: 'The west span depot is under bureau lockdown. Break the lockdown, take the master keys home.', type: 'goons', n: 8, need: 6, timer: 90, reward: 8000,
+    t: 'Span control', brief: 'The west span depot is under bureau lockdown. Slip the watch, silence it, take the keys.', type: 'goons', n: 6, need: 6, stealth: true, reward: 8000,
     chain: [
       { type: 'wheels', brief: 'The depot wagon holds the west causeway keys. Drive it home — Old Port joins the loop.' }
     ]
@@ -7137,24 +7270,36 @@ const STORY = [
       { type: 'escape', n: 3, timer: 90, brief: 'The capitol locks down behind you. Get home CLEAN.' }
     ]
   },
-  { t: 'Papers of state', brief: 'The proof of everything — six stashes scattered through the capitol quarter. Collect the state\'s confession.', type: 'search', scatter: 6, reward: 16000 },
   {
-    t: 'The governor', brief: 'The ladder ends under the marble dome. Jason has the governor\'s route. Finish it — for good.', type: 'finalMeet', reward: 25000,
-    lines: [
-      'JASON: Tonight he walks the Shores to bless the span you opened. Poetry, almost.',
-      'JASON: His guard is everything the state has left. Then him. Then the longest drive of your life.',
-      'JASON: After tonight there is no ladder, no Combine, no seal. Just a city. GO.'
+    t: 'The governor', brief: 'The ladder ends under the marble dome. Six stars the second you move — take him, survive, and LOSE them. A death trap built for two.', type: 'hit', guards: 6, reward: 25000,
+    sixStar: true,
+    partner: { name: 'MARA', shirt: 0x2a6a3a },
+    intro: [
+      'MARA: Six stars the moment we step out. Every badge, every soldier, both birds.',
+      'GHOST: The governor first. Everything else is weather.',
+      'MARA: Kill the head, outlive the body, shake the tail. Simple. Terrible — but simple.'
     ],
     chain: [
-      { type: 'goons', n: 12, need: 9, timer: 130, brief: 'The governor\'s guard holds the capitol quarter. Break the cordon.' },
-      { type: 'hit', guards: 5, brief: 'The governor runs for his motorcade. Once is enough. It always was.' },
-      { type: 'escape', n: 4, timer: 100, brief: 'Every siren in three islands. Vanish — the hideout, CLEAN, one last time.' }
+      { type: 'cooldown', brief: 'IT IS DONE. Now the hard half: stay alive and shake SIX stars.' }
+    ]
+  },
+  {
+    t: 'The last table', brief: 'It is over. Jason set a table at the hideout — the crew, the quiet, and one more truth.', type: 'finalMeet', reward: 30000,
+    partner: { name: 'MARA', shirt: 0x2a6a3a },
+    lines: [
+      'JASON: Sit. Both of you. The dome is empty and the docks are quiet for the first time in twenty years.',
+      'MARA: To the ghost. The city can\'t say your name — so we\'ll say it for the city.',
+      'JASON: Enjoy it. You earned tonight. But those pages from the governor\'s safe...',
+      'JASON: The seal on them was never the state\'s. The chain climbs HIGHER than any dome.',
+      'MARA: Then tomorrow we climb again. Tonight — we drink.'
     ]
   }
 ];
 let mission = null, missionsDone = 0;
 let partner = null;                          // the ally walking the story with you
 let pendingBlunder = 0;                      // armed by story.blunder, lands on the mission
+let pendingStealth = false;                  // armed by story.stealth, lands on the mission
+function inFront(q, x, y) { return Math.cos(q.angle) * (x - q.x) + Math.sin(q.angle) * (y - q.y) > 0; }
 function objectivePoint() {
   if (!mission) return null;
   if (mission.type === 'wheels') return mission.stage === 0 ? { x: mission.car.x, y: mission.car.y } : mission.target;
@@ -7210,6 +7355,14 @@ function startMission(island) {
       }
     }
     if (story.blunder) pendingBlunder = rndf(10, 20);
+    if (story.stealth) {
+      pendingStealth = true;
+      msg('STEALTH JOB — stay out of eyelines. Takedowns from BEHIND are silent; gunfire is not.', 12);
+    }
+    if (story.sixStar) {
+      heat = 6; wantedClearT = 30; copSeen = true;
+      msg('SIX STARS — the state answers with EVERYTHING it has. The trap is live.', 10);
+    }
   }
   if (type === 'wheels') {
     const p = roadPoint(player.x, player.y, 900, 1800, isl);
@@ -7379,6 +7532,11 @@ function advanceStage(d) {
   sfx('mission');
   msg('OBJECTIVE COMPLETE — ' + d.brief, 11);
   const isl = anyBridgeOpen() ? undefined : islandOfPx(player.x, player.y);
+  if (d.type === 'cooldown') {
+    mission = Object.assign({ type: 'cooldown' }, keep);
+    msg('Stay ALIVE and shake the heat — the job ends at ZERO stars.', 10);
+    return;
+  }
   if (d.type === 'wheels') {
     const p = roadPoint(player.x, player.y, 600, 1200, isl);
     const c = mkCar(p.x, p.y, 0, d.car || 'sedan', null);
@@ -7514,6 +7672,9 @@ function failMission(why) {
 }
 function clearGuards() {
   for (const p of peds) if (p.guard || p.target || p.warTarget || p.vip) { p.despawnOk = true; p.warTarget = false; p.vip = false; }
+  // survivors STAND DOWN when the job ends — a lingering alerted sentry
+  // must never insta-blow the next stealth attempt
+  for (const p of peds) if (p.goon || p.guard || p.target) { p.aggro = false; p.unaware = false; p.despawnOk = true; }
   for (const c of cars) if (c.driver === 'mob') { c.driver = null; c.keep = false; }
 }
 // ---------------------------------------------------------------- partners
@@ -7598,6 +7759,14 @@ function stingGo() {
 function updMission(dt) {
   if (!mission) return;
   if (pendingBlunder) { mission.blunderT = pendingBlunder; pendingBlunder = 0; }
+  if (pendingStealth) { mission.stealth = true; pendingStealth = false; }
+  // stealth law: one alerted sentry and the job is BLOWN
+  if (mission.stealth && !cutscene) {
+    for (const q of peds) {
+      if (q.dead || !(q.goon || q.guard || q.warTarget || q.target)) continue;
+      if (q.aggro) { failMission('You were MADE — the job is blown. Lay low and call again.'); return; }
+    }
+  }
   // the blunder beat: somebody slips and the night gets louder
   if (mission.blunderT !== undefined && !cutscene) {
     mission.blunderT -= dt;
@@ -7680,6 +7849,8 @@ function updMission(dt) {
         completeMission();
       }
     }
+  } else if (mission.type === 'cooldown') {
+    if (stars() === 0) completeMission();
   } else if (mission.type === 'hit') {
     if (mission.target.dead) completeMission();
   } else if (mission.type === 'rush') {
@@ -8105,6 +8276,7 @@ function update(dt) {
   tankGraceT -= dt;
   chopperCdT -= dt;
   gunshipCdT -= dt;
+  if (topSay) { topSay.t -= dt; if (topSay.t <= 0) topSay = null; }
   if (player.jumpH) {
     player.jumpH += player.jumpV * dt;
     player.jumpV -= 18 * dt;
@@ -8212,6 +8384,7 @@ function update(dt) {
   for (const c of cars) if (!c.dead && (c.driver || Math.abs(c.speed) > 40)) checkLampHits(c);
   updLamps(dt);
   updDropped(dt);
+  updGibs(dt);
   carCollisions();
   if (chopper) updChopper(dt);
   if (gunship) updGunship(dt);
@@ -9200,6 +9373,19 @@ function drawHUD(t) {
     hctx.moveTo(cx, cy - 11); hctx.lineTo(cx, cy - 4);
     hctx.moveTo(cx, cy + 4); hctx.lineTo(cx, cy + 11);
     hctx.stroke();
+  }
+  // directed dialog banner, top center — the movie's dialogue track
+  if (topSay && state === 'play' && !cutscene && !paused) {
+    hctx.font = 'bold 15px monospace';
+    const line9 = topSay.who + ':  ' + topSay.text;
+    const tw9 = hctx.measureText(line9).width;
+    hctx.fillStyle = 'rgba(6,8,12,0.72)';
+    hctx.fillRect(VW / 2 - tw9 / 2 - 14, 12, tw9 + 28, 26);
+    hctx.textAlign = 'left';
+    hctx.fillStyle = topSay.col;
+    hctx.fillText(topSay.who + ':', VW / 2 - tw9 / 2, 30);
+    hctx.fillStyle = '#e8ecf2';
+    hctx.fillText('  ' + topSay.text, VW / 2 - tw9 / 2 + hctx.measureText(topSay.who + ':').width, 30);
   }
   // the mark of shame: a branded run says so on screen, bottom-right
   if (cheated && state === 'play') {
@@ -10660,6 +10846,132 @@ if (location.hash === '#blunder') {
   const h0 = heat;
   update(1 / 60); update(1 / 60);
   console.log('BLNDDBG heatBumped=' + (heat > h0) + ' oneShot=' + (mission.blunderT === undefined));
+}
+if (location.hash === '#topsay') {
+  startGame();
+  const cop9 = mkPed(player.x + 40, player.y, { cop: true, hp: 50, shirt: 0x20306a });
+  attachPedMesh(cop9); peds.push(cop9);
+  say(cop9, 'Holster that weapon!', 3);
+  const copBanner = !!topSay && topSay.who === 'OFFICER';
+  const civ9 = mkPed(player.x - 40, player.y, {});
+  attachPedMesh(civ9); peds.push(civ9);
+  const keep9 = topSay;
+  say(civ9, 'Nice weather for a riot.', 3);
+  const civSkipped = topSay === keep9 && civ9.sayText === 'Nice weather for a riot.';
+  spawnPartner('MARA');
+  say(partner, 'On your left!', 2);
+  const allyBanner = !!topSay && topSay.who === 'MARA';
+  console.log('TOPSAYDBG copBanner=' + copBanner + ' bystanderBubbleOnly=' + civSkipped + ' allyBanner=' + allyBanner);
+}
+if (location.hash === '#stealth') {
+  startGame();
+  godMode = true;
+  missionsDone = 31;                         // The security bureau: silence the watch
+  startMission(0);
+  update(1 / 60);
+  const isStealth = mission && mission.stealth === true;
+  const g9 = mission.targets.find(t9 => !t9.dead);
+  g9.angle = 0;                              // looking east...
+  player.x = g9.x - 20; player.y = g9.y;     // ...ghost at his back
+  player.angle = 0;
+  player.weapon = 'fist'; player.fireT = 0;
+  fireWeapon();
+  const takedown = g9.dead && !!mission;     // silent: the job survives
+  const g2 = mission.targets.find(t9 => !t9.dead);
+  g2.angle = Math.atan2(player.y - g2.y, player.x - g2.x);   // he TURNS and sees you
+  player.x = g2.x + Math.cos(g2.angle) * 80; player.y = g2.y + Math.sin(g2.angle) * 80;
+  for (let i = 0; i < 12 && mission; i++) update(1 / 60);
+  const madeBySight = !mission;
+  missionsDone = 31;
+  startMission(0);
+  update(1 / 60);
+  const g3 = mission.targets.find(t9 => !t9.dead);
+  player.x = g3.x - 300; player.y = g3.y;
+  player.ammo.pistol = 10; player.weapon = 'pistol'; player.fireT = 0; aimTarget = null; mousePitch = 0;
+  fireWeapon();
+  for (let i = 0; i < 6 && mission; i++) update(1 / 60);
+  const madeByGunfire = !mission;
+  console.log('STLDBG stealthArmed=' + isStealth + ' silentTakedown=' + takedown + ' madeBySight=' + madeBySight + ' madeByGunfire=' + madeByGunfire);
+}
+if (location.hash === '#deathtrap') {
+  startGame();
+  godMode = true;
+  missionsDone = 48;                         // The governor: a death trap for two
+  startMission(0);
+  if (cutscene) endCutscene();
+  const armed = stars() === 6 && mission && mission.type === 'hit' && !!partner;
+  killPed(mission.target, true);
+  update(1 / 60);
+  const escapePhase = mission && mission.type === 'cooldown' && stars() === 6;
+  heat = 0; wantedClearT = 0;
+  update(1 / 60);
+  const survived = !mission && missionsDone === 49;
+  console.log('DTRAPDBG sixStarHit=' + armed + ' cooldownPhase=' + escapePhase + ' escapedClean=' + survived);
+}
+if (location.hash === '#finale') {
+  startGame();
+  missionsDone = 49;                         // The last table
+  startMission(0);
+  const fin = mission && mission.lines && mission.lines.length === 5 && !!partner;
+  console.log('FINDBG lastTable=' + fin + ' higherChain=' + (mission.lines[3].indexOf('HIGHER') >= 0));
+}
+if (location.hash === '#blast') {
+  startGame();
+  godMode = true;
+  const mk9 = dx => { const p = mkPed(player.x + 400 + dx, player.y, { hp: 100, shirt: 0x777777 }); attachPedMesh(p); peds.push(p); return p; };
+  const close9 = mk9(6), mid9 = mk9(26), edge9 = mk9(41), out9 = mk9(70);
+  explodeAt(player.x + 400, player.y, null, 44, 220);
+  const closeDead = close9.dead;
+  const midHurtLess = !mid9.dead ? (100 - mid9.hp) : 999;
+  const edgeBarely = !edge9.dead ? (100 - edge9.hp) : 999;
+  const outUntouched = out9.hp === 100 && !out9.rag === false || out9.hp === 100;
+  const falloff = closeDead && midHurtLess < 220 && edgeBarely < midHurtLess && out9.hp === 100;
+  const cc = mkCar(player.x + 700, player.y, 0, 'sedan', null);
+  attachCarMesh(cc); cars.push(cc);
+  const hp0 = cc.hp;
+  const sp0 = cc.speed;
+  explodeAt(player.x + 700 - 30, player.y, null, 44, 220);
+  const carHurt = cc.hp < hp0;
+  const shoved = Math.abs(cc.speed - sp0) > 20 || Math.abs(cc.latV || 0) > 20;
+  console.log('BLASTDBG closeDead=' + closeDead + ' midDmg=' + midHurtLess.toFixed(0) + ' edgeDmg=' + edgeBarely.toFixed(0) + ' falloff=' + falloff + ' carHurt=' + carHurt + ' shoved=' + shoved);
+}
+if (location.hash === '#cargibs') {
+  startGame();
+  godMode = true;
+  const c9 = mkCar(player.x + 250, player.y, 0, 'sedan', null);
+  attachCarMesh(c9); cars.push(c9);
+  const n0 = gibs.length;
+  explodeCar(c9);
+  const shed = gibs.length - n0;
+  const stripped = c9.mesh.userData.wheelRolls.length === 0 && c9.mesh.userData.trim.length === 0 && c9.mesh.userData.panels.every(d9 => d9.gone);
+  const hullStays = c9.mesh.userData.bodyMesh.parent === c9.mesh;
+  let flew = false;
+  const h1 = gibs[n0].h;
+  for (let i = 0; i < 240; i++) { updGibs(1 / 60); if (gibs.length > n0 && gibs[n0].h > h1 + 0.5) flew = true; }
+  let settled = true;
+  for (const g9 of gibs) if (g9.h > 0.2) settled = false;
+  console.log('CARGIBDBG partsShed=' + shed + ' ok=' + (shed >= 12) + ' strippedWreck=' + stripped + ' hullStays=' + hullStays + ' partsFly=' + flew + ' settle=' + settled);
+}
+if (location.hash === '#gibs') {
+  startGame();
+  godMode = true;
+  const p9 = mkPed(player.x + 200, player.y, { hp: 30, shirt: 0x8a4a2a });
+  attachPedMesh(p9); peds.push(p9);
+  explodeAt(p9.x + 10, p9.y, null);
+  const burst = p9.dead && gibs.length >= 6 && !p9.mesh.visible;
+  let flew = false, settled = true;
+  const h0 = gibs[0].h;
+  for (let i = 0; i < 240; i++) { updGibs(1 / 60); if (gibs.length && gibs[0].h > h0 + 0.5) flew = true; }
+  for (const g9 of gibs) if (g9.h > 0.2) settled = false;
+  const n0 = gibs.length;
+  const c9 = mkCar(player.x + 300, player.y, 0, 'sedan', 'ai');
+  attachCarMesh(c9); cars.push(c9);
+  explodeCar(c9);
+  const driverFlew = gibs.length >= n0 + 6;
+  for (const g9 of gibs) g9.t = 0.01;
+  updGibs(1 / 60);
+  const cleaned = gibs.length === 0;
+  console.log('GIBDBG burst=' + burst + ' partsFly=' + flew + ' settleOnStreet=' + settled + ' driverGibs=' + driverFlew + ' cleanup=' + cleaned);
 }
 if (location.hash === '#pause') {
   startGame();

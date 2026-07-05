@@ -259,6 +259,7 @@ function pollPad(dt) {
     const sens = padCfg.sens * 0.55;
     mouseYaw += cx2 * sens * dt * 3.2;
     mousePitch = clamp(mousePitch + cy2 * (padCfg.invertY ? -1 : 1) * sens * dt * 2.2, -1.45, 1.45);
+    if (cx2 || cy2) lastMouseMove = performance.now();   // stick look counts as camera movement
   }
   // analog triggers / mapped holds. Pads that report LT/RT as AXES (rest
   // at -1) are latched once seen, then read proportionally from the axis.
@@ -400,12 +401,16 @@ function syncConsole() {
 function runConsole(raw) {
   const cmd = raw.trim().toLowerCase();
   if (!cmd) return;
+  // anything beyond save/load/stats is a cheat — and every save made from
+  // that point on carries the mark
+  if (!/^(save (10|[1-9])|load (10|[1-9])|stats|saves)$/.test(cmd)) cheated = true;
   let out;
   if (cmd === 'fix car') {
     if (player.car) {
       player.car.hp = CAR_KINDS[player.car.kind].hp;
       player.car.onFireT = 0;
       player.car.burnT = 0;
+      undentCar(player.car);
       out = 'Vehicle repaired.';
     } else out = 'You are not in a vehicle.';
   } else if (cmd === 'shut up and take my money') {
@@ -435,6 +440,24 @@ function runConsole(raw) {
     out = saveGame(parseInt(cmd.slice(5), 10));
   } else if (/^load (10|[1-9])$/.test(cmd)) {
     out = loadGame(parseInt(cmd.slice(5), 10));
+  } else if (/^(setjob \d+|i suck at games times 9000\s*:\s*\d+)$/.test(cmd)) {
+    // "setjob 8" (or the long confession) — job 8 becomes your NEXT mission.
+    // Live game only; bridges re-derive from the gates so progress stays honest.
+    if (state !== 'play') out = 'Works only during active gameplay.';
+    else {
+      const n = parseInt(cmd.match(/(\d+)$/)[1], 10);
+      if (n < 1 || n > STORY.length) out = 'Pick a job 1..' + STORY.length + '.';
+      else {
+        if (mission) failMission('Timeline rewritten.');
+        missionsDone = n - 1;
+        for (let i = 0; i < 4; i++) {
+          bridgesOpen[i] = missionsDone >= BRIDGE_GATES[i];
+          setBarrier(i, !bridgesOpen[i]);
+          barrierGroups[i].visible = !bridgesOpen[i];
+        }
+        out = 'JOB ' + n + ' is next. Save a slot to keep it.';
+      }
+    }
   } else if (cmd === 'stats') {
     msg('CARS DESTROYED ' + STATS.carsDestroyed + ' · RUN OVER ' + STATS.pedsRunOver + ' · CIVILIANS ' + STATS.civiliansKilled + ' · COPS ' + STATS.copsKilled + ' · COMBINE ' + STATS.goonsKilled, 12);
     msg('SHOTS ' + STATS.ammoSpent + ' · ACCURACY ' + statAccuracy() + '% · LONGEST WANTED ' + Math.round(STATS.longestWanted) + 's', 12);
@@ -463,7 +486,7 @@ function saveGame(slot) {
   const data = {
     v: 1, when: new Date().toISOString().slice(0, 16).replace('T', ' '),
     x: player.x, y: player.y, hp: player.hp, armor: player.armor, cash: player.cash,
-    weapon: player.weapon, ammo: player.ammo, missionsDone: missionsDone,
+    weapon: player.weapon, ammo: player.ammo, missionsDone: missionsDone, cheated: cheated,
     bridges: [bridgesOpen[0], bridgesOpen[1], bridgesOpen[2], bridgesOpen[3]], heat: heat, god: godMode, pardon: pardonMode,
     stats: STATS,
     garage: garageSnapshot()
@@ -501,6 +524,7 @@ function loadGame(slot) {
   settingsOpen = false; shopOpen = false; saveHouseOpen = false; modShopOpen = false; priestOpen = false;
   player.mesh.rotation.set(0, 0, 0);
   missionsDone = data.missionsDone || 0;
+  cheated = !!data.cheated;                  // an honest save loads honest
   if (data.stats) for (const k in STATS) if (typeof data.stats[k] === 'number') STATS[k] = data.stats[k];
   heat = data.heat || 0; wantedClearT = 30; copSeen = false;
   disarmT = 0; disarmCool = 8;
@@ -546,7 +570,7 @@ function saveSummary(i) {
   let d = null;
   try { d = JSON.parse(localStorage.getItem('gta3_save_' + i) || 'null'); } catch (e) {}
   if (!d) return null;
-  return '$' + d.cash + ' · job ' + Math.min(50, (d.missionsDone || 0) + 1) + (d.when ? ' · ' + d.when.slice(5) : '');
+  return '$' + d.cash + ' · job ' + Math.min(50, (d.missionsDone || 0) + 1) + (d.when ? ' · ' + d.when.slice(5) : '') + (d.cheated ? ' · CHEATED' : '');
 }
 function listSaves() {
   let n = 0;
@@ -635,9 +659,89 @@ function audioInit() {
     master.knee.value = 22;
     master.ratio.value = 8;
     master.connect(AC.destination);
+    // surround matrix: the listener's up axis never changes; position and
+    // facing follow the player + camera every frame (see updEngine)
+    const L = AC.listener;
+    if (L.upX) { L.upX.value = 0; L.upY.value = 1; L.upZ.value = 0; }
+    buildAudioKit();
   }
 }
-function out() { return master || AC.destination; }
+// ---- the realism kit (SOUND_DESIGN_NOTES.md): built once at audio init ----
+let verbStreet = null, verbBig = null, pinkBuf = null, brownBuf = null;
+let CURVE_SOFT = null, CURVE_HARD = null, CURVE_ASYM = null;
+// Moorer reverb: exponentially decaying noise IR, independent per channel
+// (stereo width), linear fade-in kills the metallic slap, baked one-pole
+// lowpass sweep = air absorption
+function makeIR(decayTime, fadeInSec, lpStart, lpEnd) {
+  const fs = AC.sampleRate, len = Math.round(decayTime * 1.5 * fs);
+  const buf = AC.createBuffer(2, len, fs);
+  const base = Math.pow(1 / 1000, 1 / (decayTime * fs));
+  const fadeN = Math.round(fadeInSec * fs);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    let lp = 0;
+    for (let j = 0; j < len; j++) {
+      const f = lpStart + (lpEnd - lpStart) * (j / len);
+      const a = Math.min(1, 2 * Math.PI * f / fs);
+      lp += a * ((Math.random() * 2 - 1) - lp);
+      let s = lp * Math.pow(base, j);
+      if (j < fadeN) s *= j / fadeN;
+      d[j] = s;
+    }
+  }
+  return buf;
+}
+function buildAudioKit() {
+  verbStreet = AC.createConvolver(); verbStreet.buffer = makeIR(1.6, 0.02, 10000, 600); verbStreet.connect(master);
+  verbBig = AC.createConvolver(); verbBig.buffer = makeIR(2.8, 0.04, 8000, 400); verbBig.connect(master);
+  // colored noise loops: pink = Paul Kellet 7-state, brown = leaky integrator.
+  // White noise reads as synthetic hiss; natural broadband is 1/f.
+  const fs = AC.sampleRate, n = fs * 2;
+  pinkBuf = AC.createBuffer(1, n, fs); brownBuf = AC.createBuffer(1, n, fs);
+  const pd = pinkBuf.getChannelData(0), bd2 = brownBuf.getChannelData(0);
+  let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, last = 0;
+  for (let i = 0; i < n; i++) {
+    const w = Math.random() * 2 - 1;
+    b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759;
+    b2 = 0.96900 * b2 + w * 0.1538520; b3 = 0.86650 * b3 + w * 0.3104856;
+    b4 = 0.55000 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.0168980;
+    pd[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.11;
+    b6 = w * 0.115926;
+    last = (last + 0.02 * w) / 1.02;
+    bd2[i] = last * 3.5;
+  }
+  const mk = fn => { const c = new Float32Array(2048); for (let i = 0; i < 2048; i++) c[i] = fn(i * 2 / 2048 - 1); return c; };
+  CURVE_SOFT = mk(x => Math.tanh(3 * x));
+  CURVE_HARD = mk(x => Math.max(-0.3, Math.min(0.3, x)));
+  CURVE_ASYM = mk(x => Math.max(-0.1, Math.min(0.2, x)));
+}
+function shaper(curve) { const w = AC.createWaveShaper(); w.curve = curve; w.oversample = '4x'; return w; }
+// wet send off a recipe node into a shared reverb — the tail sells "real"
+function sendVerbFrom(node, amt, big, lpF) {
+  const bus9 = big ? verbBig : verbStreet;
+  if (!bus9) return;
+  const g = AC.createGain(); g.gain.value = amt;
+  if (lpF) { const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = lpF; node.connect(lp); lp.connect(g); }
+  else node.connect(g);
+  g.connect(bus9);
+}
+let sfxDest = null;                          // per-recipe panner, null = center
+function out() { return sfxDest || master || AC.destination; }
+// a sound PLACED in the world: equal-power pan from where it sits relative
+// to the listener pose. rolloffFactor 0 = no distance attenuation here,
+// every caller already mixes its own volume. Logic px scale to audio meters.
+function panAt(x, y, keep) {
+  const p = AC.createPanner();
+  p.panningModel = 'equalpower';
+  p.distanceModel = 'inverse';
+  p.rolloffFactor = 0;
+  p.positionX.value = x / TILE;
+  p.positionY.value = 0;
+  p.positionZ.value = y / TILE;
+  p.connect(master || AC.destination);
+  if (!keep) setTimeout(() => { try { p.disconnect(); } catch (e) {} }, 4000);   // one-shots end long before this
+  return p;
+}
 function tone(f0, f1, dur, type, vol, when) {
   if (!AC || muted) return;
   const o = AC.createOscillator(), g = AC.createGain(), t = when || AC.currentTime;
@@ -649,15 +753,22 @@ function tone(f0, f1, dur, type, vol, when) {
   o.connect(g).connect(out());
   o.start(t); o.stop(t + dur + 0.02);
 }
-function noise(dur, vol, fq, type, q, fq1) {
+function noise(dur, vol, fq, type, q, fq1, color) {
   // shaped noise: chooseable filter, resonance, optional filter sweep,
-  // exponential decay — the raw material of every impact and shot
+  // exponential decay — the raw material of every impact and shot.
+  // color 'pink'/'brown' pulls from the prebuilt 1/f loops (random start
+  // offset = free per-shot timbre variation)
   if (!AC || muted) return;
-  const n = (AC.sampleRate * dur) | 0;
-  const b = AC.createBuffer(1, n, AC.sampleRate);
-  const d = b.getChannelData(0);
-  for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
-  const s = AC.createBufferSource(); s.buffer = b;
+  const s = AC.createBufferSource();
+  const cbuf = color === 'pink' ? pinkBuf : color === 'brown' ? brownBuf : null;
+  if (cbuf) { s.buffer = cbuf; s.loop = true; }
+  else {
+    const n = (AC.sampleRate * dur) | 0;
+    const b = AC.createBuffer(1, n, AC.sampleRate);
+    const d = b.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    s.buffer = b;
+  }
   const f = AC.createBiquadFilter();
   f.type = type || 'lowpass';
   f.frequency.setValueAtTime(fq || 1200, AC.currentTime);
@@ -667,15 +778,94 @@ function noise(dur, vol, fq, type, q, fq1) {
   g.gain.setValueAtTime(vol, AC.currentTime);
   g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
   s.connect(f); f.connect(g); g.connect(out());
-  s.start();
+  if (s.loop) { s.start(AC.currentTime, Math.random() * 1.5); s.stop(AC.currentTime + dur + 0.05); }
+  else s.start();
 }
-function sfx(k) {
+// one gunshot, Farnell-style: an impulse CHIRP and a clipped detonation
+// noise burst pass through the SAME 5-band formant bank with zero relative
+// delay (within 20ms it fuses into one percept; the formants say "gun"),
+// then the shared street reverb supplies the tail — which is what sells it.
+function gunShot(s, chirpDur, detDur, lowGain, verbAmt, verbLp, big) {
+  const t = AC.currentTime;
+  const inG = AC.createGain();
+  const sum = AC.createGain(); sum.gain.value = 0.45;
+  const bands = [[72, 3, lowGain], [432, 7, s < 0.8 ? 2.4 : 1.2], [648, 5, 2.5], [3240, 30, 2], [4140, 20, 2]];
+  for (const [f, q, g] of bands) {
+    const bp = AC.createBiquadFilter(); bp.type = 'bandpass';
+    bp.frequency.value = f * s * (1 + rndf(-0.02, 0.02)); bp.Q.value = q;
+    const bg = AC.createGain(); bg.gain.value = g;
+    inG.connect(bp); bp.connect(bg); bg.connect(sum);
+  }
+  sum.connect(out());
+  const o = AC.createOscillator(); o.type = 'sine';
+  o.frequency.setValueAtTime(5100 * s * (1 + rndf(-0.05, 0.05)), t);
+  o.frequency.exponentialRampToValueAtTime(100, t + chirpDur);
+  const og = AC.createGain();
+  og.gain.setValueAtTime(0.8 * rndf(0.85, 1.15), t);
+  og.gain.exponentialRampToValueAtTime(0.001, t + chirpDur);
+  o.connect(og); og.connect(inG);
+  o.start(t); o.stop(t + chirpDur + 0.02);
+  const n = (AC.sampleRate * detDur) | 0;
+  const b = AC.createBuffer(1, n, AC.sampleRate);
+  const d = b.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+  const src = AC.createBufferSource(); src.buffer = b;
+  const drive = AC.createGain(); drive.gain.value = 30;
+  const cl = shaper(CURVE_HARD);
+  const env = AC.createGain();
+  env.gain.setValueAtTime(rndf(0.85, 1.15), t);
+  env.gain.exponentialRampToValueAtTime(0.001, t + detDur);
+  src.connect(drive); drive.connect(cl); cl.connect(env); env.connect(inG);
+  const direct = AC.createGain(); direct.gain.value = 0.55;   // the blast itself, unfiltered
+  env.connect(direct); direct.connect(out());
+  src.start(t);
+  sendVerbFrom(sum, verbAmt, big, verbLp);
+}
+// Farnell cascade FM "gas boom": a fast-sweeping sine slams a second
+// oscillator's frequency — wideband splat that resolves as the sweep slows
+function gasBoom(fmDur, centers, outGain) {
+  const t = AC.currentTime;
+  const o1 = AC.createOscillator(); o1.type = 'sine';
+  o1.frequency.setValueAtTime(10000, t);
+  o1.frequency.exponentialRampToValueAtTime(1, t + fmDur);
+  const fmG = AC.createGain(); fmG.gain.value = 10000;
+  const o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 0;
+  o1.connect(fmG); fmG.connect(o2.frequency);
+  const pre = AC.createGain(); pre.gain.value = 0.1;
+  o2.connect(pre);
+  const mix = AC.createGain();
+  for (const f of centers) { const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f; bp.Q.value = 1; pre.connect(bp); bp.connect(mix); }
+  const cl = shaper(CURVE_ASYM);
+  const post = AC.createGain(); post.gain.value = 5;
+  const hp = AC.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 30;
+  const og = AC.createGain();
+  og.gain.setValueAtTime(outGain, t);
+  og.gain.exponentialRampToValueAtTime(0.001, t + fmDur * 10);
+  mix.connect(cl); cl.connect(post); post.connect(hp); hp.connect(og); og.connect(out());
+  o1.start(t); o2.start(t);
+  o1.stop(t + fmDur * 10 + 0.05); o2.stop(t + fmDur * 10 + 0.05);
+}
+function sfx(k, x, y, v9) {
   if (!AC || muted) return;
+  // every recipe fires into its own bus (tap point for reverb sends),
+  // which feeds either a world panner or the master straight
+  const dest9 = x === undefined ? (master || AC.destination) : panAt(x, y);
+  sfxDest = AC.createGain();
+  sfxDest.connect(dest9);
   // layered recipes: crack (highpass snap) + body (mid) + thump (sub sine)
   if (k === 'pistol') {
     noise(0.05, 0.3, 2800, 'highpass');            // muzzle crack
     noise(0.12, 0.2, 420, 'bandpass', 1.2);        // report body
     tone(150, 48, 0.09, 'sine', 0.14);             // chest thump
+    if (Math.random() < 0.33) {                    // brass on the pavement
+      const t9 = AC.currentTime;
+      let bt = 0.32 + rndf(0, 0.3), bg = 0.05;
+      for (let i = 0; i < 3; i++) {
+        const bf = rndf(4200, 8200);               // new ring every bounce — brass, not a room
+        tone(bf, bf * 0.97, rndf(0.008, 0.016), 'triangle', bg, t9 + bt);
+        bt += 0.16 * Math.pow(0.62, i) + rndf(0, 0.05); bg *= 0.5;
+      }
+    }
   } else if (k === 'uzi') {
     noise(0.035, 0.22, 3200, 'highpass');
     noise(0.07, 0.13, 500, 'bandpass', 1.2);
@@ -688,7 +878,10 @@ function sfx(k) {
     noise(0.06, 0.35, 3000, 'highpass');           // initial crack
     noise(1.1, 0.55, 900, 'lowpass', 0, 60);       // pressure wave sweeping shut
     tone(70, 18, 1.0, 'sine', 0.3);                // long sub rumble
-    setTimeout(() => { if (AC && !muted) noise(0.3, 0.12, 600, 'lowpass'); }, 140);   // debris
+    noise(1.4, 0.4, 220, 'lowpass', 0, 70, 'brown');   // 1/f rumble bed
+    sendVerbFrom(sfxDest, 0.5, true);
+    const bd = sfxDest;                            // debris pans with the blast
+    setTimeout(() => { if (AC && !muted) { sfxDest = bd; noise(0.3, 0.12, 600, 'lowpass'); sfxDest = null; } }, 140);
   } else if (k === 'crash') {
     noise(0.1, 0.28, 900, 'lowpass');              // body hit
     tone(320 + Math.random() * 300, 90, 0.16, 'square', 0.05);   // panel clang
@@ -737,8 +930,70 @@ function sfx(k) {
     tone(660, 660, 0.08, 'triangle', 0.07);
     tone(990, 990, 0.1, 'triangle', 0.06, AC.currentTime + 0.08);
   }
+  sfxDest = null;
 }
-let sirenOsc2 = null, sirenGainNode = null, sirenTargetGain = 0.028;
+// ---- tire skid: a persistent stick-slip voice per sliding car ----
+// saw through two resonant bandpasses (squeal + 2nd harmonic) crossfaded
+// against bandpassed scrub noise; pitch and mix follow slip, a 7Hz LFO
+// flutters gain and detune, and a random walk keeps it organic
+const skidVs = new Set();
+function skidOn(c, slip) {
+  if (!AC || muted) return;
+  const t = AC.currentTime;
+  let v = c.skidV;
+  if (!v) {
+    const pan = panAt(c.x, c.y, true);
+    const osc = AC.createOscillator(); osc.type = 'sawtooth';
+    const bp1 = AC.createBiquadFilter(); bp1.type = 'bandpass'; bp1.Q.value = 12;
+    const bp2 = AC.createBiquadFilter(); bp2.type = 'bandpass'; bp2.Q.value = 6;
+    const g2 = AC.createGain(); g2.gain.value = 0.5;
+    const squeal = AC.createGain(); squeal.gain.value = 0;
+    const scrub = AC.createGain(); scrub.gain.value = 0;
+    const main = AC.createGain(); main.gain.value = 0.0001;
+    const nsrc = AC.createBufferSource();
+    const nb = AC.createBuffer(1, AC.sampleRate, AC.sampleRate);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    nsrc.buffer = nb; nsrc.loop = true;
+    const nbp = AC.createBiquadFilter(); nbp.type = 'bandpass'; nbp.frequency.value = 900; nbp.Q.value = 1;
+    osc.connect(bp1); bp1.connect(squeal);
+    osc.connect(bp2); bp2.connect(g2); g2.connect(squeal);
+    nsrc.connect(nbp); nbp.connect(scrub);
+    squeal.connect(main); scrub.connect(main);
+    main.connect(pan);
+    const lfo = AC.createOscillator(); lfo.frequency.value = 7;
+    const lg = AC.createGain(); lg.gain.value = 0.025;
+    lfo.connect(lg); lg.connect(squeal.gain);      // amplitude flutter
+    const ld = AC.createGain(); ld.gain.value = 20;
+    lfo.connect(ld); ld.connect(osc.detune);       // ±20 cent wobble
+    const f0i = 550 + 450 * slip;
+    osc.frequency.setValueAtTime(f0i * 0.8, t);    // onset chirp, not a synth pop
+    osc.frequency.exponentialRampToValueAtTime(f0i, t + 0.1);
+    osc.start(t); nsrc.start(t, Math.random()); lfo.start(t);
+    v = c.skidV = { pan, osc, bp1, bp2, squeal, scrub, main, lfo, nsrc, until: 0, car: c };
+    skidVs.add(v);
+  }
+  v.until = t + 0.25;
+  const walk = 1 + rndf(-1, 1) * (0.08 - 0.05 * slip);   // light scrub wanders, a slide locks in
+  const f0 = (550 + 450 * slip) * walk;
+  v.osc.frequency.setTargetAtTime(f0, t, 0.02);
+  v.bp1.frequency.setTargetAtTime(f0, t, 0.02);
+  v.bp2.frequency.setTargetAtTime(f0 * 2, t, 0.02);
+  const m = 0.2 + 0.5 * slip;                      // squeal->scrub equal-power crossfade
+  const amp = clamp(slip * 1.6, 0.15, 1) * 0.13;
+  v.squeal.gain.setTargetAtTime(Math.cos(m * Math.PI / 2) * amp, t, 0.03);
+  v.scrub.gain.setTargetAtTime(Math.cos((1 - m) * Math.PI / 2) * amp * 1.4, t, 0.03);
+  v.main.gain.setTargetAtTime(1, t, 0.03);
+  v.pan.positionX.setTargetAtTime(c.x / TILE, t, 0.05);
+  v.pan.positionZ.setTargetAtTime(c.y / TILE, t, 0.05);
+}
+function skidStop(v) {
+  v.main.gain.setTargetAtTime(0.0001, AC.currentTime, 0.06);
+  skidVs.delete(v);
+  if (v.car) v.car.skidV = null;
+  setTimeout(() => { try { v.osc.stop(); v.nsrc.stop(); v.lfo.stop(); v.pan.disconnect(); } catch (e) {} }, 400);
+}
+let sirenOsc2 = null, sirenGainNode = null, sirenTargetGain = 0.028, sirenPanNode = null, sirenSrcX = 0, sirenSrcY = 0;
 function sirenOn() {
   if (!AC || muted || sirenOsc) return;
   // a real wail: two slightly detuned voices swept together, softened
@@ -752,13 +1007,15 @@ function sirenOn() {
   lg.connect(sirenOsc.frequency);
   lg.connect(sirenOsc2.frequency);
   sirenOsc.connect(lp); sirenOsc2.connect(lp);
-  lp.connect(sirenGainNode); sirenGainNode.connect(out());
+  sirenPanNode = panAt(sirenSrcX, sirenSrcY, true);   // persistent: follows the cruiser, no auto-disconnect
+  lp.connect(sirenGainNode); sirenGainNode.connect(sirenPanNode);
   sirenOsc.start(); sirenOsc2.start(); sirenLfo.start();
 }
 function sirenOff() {
   if (sirenOsc) {
     try { sirenOsc.stop(); sirenOsc2.stop(); sirenLfo.stop(); } catch (e) {}
-    sirenOsc = null; sirenOsc2 = null; sirenLfo = null; sirenGainNode = null;
+    if (sirenPanNode) { try { sirenPanNode.disconnect(); } catch (e) {} }
+    sirenOsc = null; sirenOsc2 = null; sirenLfo = null; sirenGainNode = null; sirenPanNode = null;
   }
 }
 // the engine under you: pitch follows speed, tank idles deeper. One
@@ -766,6 +1023,20 @@ function sirenOff() {
 let engOsc = null, engOsc2 = null, engGain = null, engLp = null;
 function updEngine() {
   if (!AC) return;
+  // skid voices released a beat after their car stops sliding
+  for (const v of [...skidVs]) if (AC.currentTime > v.until) skidStop(v);
+  // the ears ride the player and face where the CAMERA faces — the 360
+  // degree matrix every world-placed sound pans against
+  const LI = AC.listener, tN = AC.currentTime;
+  if (LI.positionX) {
+    LI.positionX.setTargetAtTime(player.x / TILE, tN, 0.05);
+    LI.positionZ.setTargetAtTime(player.y / TILE, tN, 0.05);
+    LI.forwardX.setTargetAtTime(Math.cos(camYaw), tN, 0.05);
+    LI.forwardZ.setTargetAtTime(Math.sin(camYaw), tN, 0.05);
+  } else if (LI.setPosition) {
+    LI.setPosition(player.x / TILE, 0, player.y / TILE);
+    LI.setOrientation(Math.cos(camYaw), 0, Math.sin(camYaw), 0, 1, 0);
+  }
   const want = state === 'play' && !paused && player.car && !player.car.dead && !muted;
   if (want && !engOsc) {
     engOsc = AC.createOscillator(); engOsc.type = 'sawtooth';
@@ -786,8 +1057,14 @@ function updEngine() {
   } else {
     engGain.gain.setTargetAtTime(0.0001, AC.currentTime, 0.08);
   }
-  // the wail rises as the cruiser closes in
-  if (sirenGainNode) sirenGainNode.gain.setTargetAtTime(sirenTargetGain, AC.currentTime, 0.2);
+  // the wail rises as the cruiser closes in — and pans from where it drives
+  if (sirenGainNode) {
+    sirenGainNode.gain.setTargetAtTime(sirenTargetGain, AC.currentTime, 0.2);
+    if (sirenPanNode) {
+      sirenPanNode.positionX.setTargetAtTime(sirenSrcX / TILE, AC.currentTime, 0.15);
+      sirenPanNode.positionZ.setTargetAtTime(sirenSrcY / TILE, AC.currentTime, 0.15);
+    }
+  }
 }
 function updRadio() {
   if (!AC || muted || !radioOn || !player.car || state !== 'play' || paused || musicList.length) { radioT = AC ? AC.currentTime : 0; return; }
@@ -865,6 +1142,12 @@ let tankRespawnT = 0;                            // counts up while the army pad
 const bridgesOpen = [false, false, false, false];
 const BRIDGE_GATES = [3, 17, 40, 30];      // N harbor, S harbor, WEST causeway (40), EAST causeway (30)
 function anyBridgeOpen() { return bridgesOpen[0] || bridgesOpen[1]; }
+// an island is UNLOCKED once at least one freed bridge chains it in
+function islandUnlocked(isl) {
+  if (isl === 1) return bridgesOpen[0] || bridgesOpen[1];
+  if (isl === 2) return bridgesOpen[2] || bridgesOpen[3];
+  return true;                               // island 0 — home soil
+}
 
 function findTileNear(tx, ty, type) {
   for (let r = 0; r < 30; r++) {
@@ -1480,6 +1763,7 @@ let wantedStreakT = 0;
 let npcCarryTick = 0.5;                          // open-carry scans, twice a second
 function statAccuracy() { return STATS.ammoSpent ? Math.round(100 * STATS.shotsHit / STATS.ammoSpent) : 0; }
 let heat = 0, wantedClearT = 0, copSeen = false, seenTick = 0, prevStars = 0, frenzy = null, aimTarget = null;
+let tankGraceT = 0;                          // fresh tank theft: a 20s window where 6 can't land
 let disarmT = 0, disarmCool = 0, armedTick = 0;   // open-carry warnings
 let best = 0;
 try { best = parseInt(localStorage.getItem('gta3_best_cash') || '0', 10) || 0; } catch (e) {}
@@ -1490,7 +1774,16 @@ function stars() { return Math.min(6, Math.floor(heat)); }
 // mid-job mercy: the sixth star holds back while a mission is active, so the
 // job stays finishable — heat already at 6 before taking the job is untouched
 function heatCap() { return (mission && heat < 6) ? 5.9 : 6.9; }
-function addHeat(n) { if (pardonMode) return; heat = Math.min(heatCap(), heat + n); wantedClearT = stars() >= 4 ? 20 : 30; const f = focus(); lastSeenX = f.x; lastSeenY = f.y; }
+function addHeat(n) {
+  if (pardonMode) return;
+  // the army doesn't mobilize over one more stray shot: past 5 stars the
+  // meter fills at half rate — star 6 is EARNED, and it will kill you
+  if (heat >= 5 && n > 0) n *= 0.55;
+  heat = Math.min(heatCap(), heat + n);
+  if (tankGraceT > 0) heat = Math.min(heat, 5.9);   // the theft bought you a running start
+  wantedClearT = stars() >= 4 ? 20 : 30;
+  const f = focus(); lastSeenX = f.x; lastSeenY = f.y;
+}
 function setWanted(n) { if (pardonMode) return; heat = Math.max(heat, Math.min(heatCap(), n)); wantedClearT = stars() >= 4 ? 20 : 30; const f = focus(); lastSeenX = f.x; lastSeenY = f.y; }
 // any officer or military unit with eyes on you (empty parked cars can't see)
 function policeCanSee() {
@@ -2400,10 +2693,11 @@ function breakLamp(i, dirAngRender, byCar) {
     L.respawnT = 60;
     brokenLamps.push(i);
   }
-  sfx('crash');
+  sfx('crash', L.x, L.y);
   sparks(L.x, L.y);
   if (byCar) {
     carDamage(byCar, Math.min(30, sp * 0.06), null);
+    dentCar(byCar, L.x, L.y, sp + 70);
     byCar.speed *= full ? 0.86 : 0.93;           // the post scrubs momentum
     if (byCar === player.car) rumble(full ? 0.5 : 0.3, 0.35, 200);
   }
@@ -2467,7 +2761,7 @@ function checkLampHits(c) {
         // the post HOLDS: bend it (if the hit had real speed) and the car
         // comes to a collision stop against it — no passing through
         if (sp >= 40) breakLamp(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c);
-        else if (sp > 18) { sfx('crash'); if (c === player.car) rumble(0.3, 0.18, 120); }
+        else if (sp > 18) { sfx('crash', L.x, L.y); dentCar(c, L.x, L.y, sp + 90); if (c === player.car) rumble(0.3, 0.18, 120); }
         const px2 = c.x - L.x, py2 = c.y - L.y;
         const pd = Math.max(1, Math.hypot(px2, py2));
         const nx2 = c.x + (px2 / pd) * (reach - pd), ny2 = c.y + (py2 / pd) * (reach - pd);
@@ -3403,11 +3697,12 @@ function buildCarMesh(c) {
     g.userData.bodyMat = bodyMat;
     return g;
   }
-  const body = new THREE.Mesh(new THREE.BoxGeometry(L, 1.15, W), bodyMat);
+  // segmented so the frame can CRUMPLE: dentCar() bends these vertices
+  const body = new THREE.Mesh(new THREE.BoxGeometry(L, 1.15, W, 7, 2, 5), bodyMat);
   body.position.y = 1.0;
   g.add(body);
   const cabMat = new THREE.MeshLambertMaterial({ color: 0x141e28 });
-  const cab = new THREE.Mesh(new THREE.BoxGeometry(L * (c.kind === 'truck' ? 0.3 : 0.48), 0.95, W * 0.84), cabMat);
+  const cab = new THREE.Mesh(new THREE.BoxGeometry(L * (c.kind === 'truck' ? 0.3 : 0.48), 0.95, W * 0.84, 4, 2, 3), cabMat);
   cab.position.set(c.kind === 'truck' ? L * 0.26 : -L * 0.05, 2.0, 0);
   g.add(cab);
   if (c.kind === 'truck') {
@@ -3452,18 +3747,22 @@ function buildCarMesh(c) {
   }
   // (headlight illumination comes from the shared spotlight pool — see HEADLIGHTS)
   if (c.kind === 'cop') {
-    // the push bar: black ram frame ahead of the front bumper
+    // the push bar: black ram frame ahead of the front bumper — one GROUP,
+    // because it bends under frontal hits and tears off when spent
     const ramMat = new THREE.MeshLambertMaterial({ color: 0x14161a });
+    const ramG = new THREE.Group();
     for (const s of [-1, 1]) {
       const up = new THREE.Mesh(new THREE.BoxGeometry(0.5, 1.1, 0.18), ramMat);
       up.position.set(L / 2 + 0.35, 0.85, s * W * 0.2);
-      g.add(up);
+      ramG.add(up);
     }
     for (const hy of [0.5, 1.1]) {
       const bar = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.2, W * 0.62), ramMat);
       bar.position.set(L / 2 + 0.42, hy, 0);
-      g.add(bar);
+      ramG.add(bar);
     }
+    g.add(ramG);
+    g.userData.ramBar = ramG;
     const r = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.28, 0.5), new THREE.MeshBasicMaterial({ color: 0xff3030 }));
     r.position.set(0, 2.6, W * 0.18);
     const bl = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.28, 0.5), new THREE.MeshBasicMaterial({ color: 0x3060ff }));
@@ -3477,7 +3776,109 @@ function buildCarMesh(c) {
   }
   g.userData.bodyMat = bodyMat;
   g.userData.cabMat = cabMat;
+  g.userData.bodyMesh = body;
+  g.userData.cabMesh = cab;
   return g;
+}
+// ---- crash mechanics on the frame: the metal remembers every hit ----
+// vertices near the impact point get pushed inward off the struck surface;
+// depth follows speed, spread follows depth. Jitter is hashed off each
+// vertex's ORIGINAL position (+ a per-hit seed) so duplicated box-edge
+// vertices move identically — the hull crumples but never cracks open.
+function dentGeo(mesh, lx, lz, nx, nz, mag, capX, capZ, seed) {
+  const geo = mesh.geometry;
+  const pos = geo.attributes.position;
+  if (!geo.userData.orig) { geo.userData.orig = pos.array.slice(); geo.userData.disp = new Float32Array(pos.array.length); }
+  const orig = geo.userData.orig, disp = geo.userData.disp;
+  const R = 1.5 + mag * 2.2;
+  const h9 = (a, b, cc, k) => { const s = Math.sin(a * 12.9898 + cc * 78.233 + b * 37.719 + k * 9.173 + seed) * 43758.5453; return s - Math.floor(s); };
+  for (let i = 0; i < pos.count; i++) {
+    const ox = orig[i * 3], oy = orig[i * 3 + 1], oz = orig[i * 3 + 2];
+    const d = Math.hypot(ox - lx, oz - lz);
+    if (d >= R) continue;
+    const push = mag * (1 - d / R) * (1 - d / R);
+    disp[i * 3] = clamp(disp[i * 3] + nx * push + (h9(ox, oy, oz, 1) - 0.5) * 0.22 * push, -capX, capX);
+    disp[i * 3 + 1] = clamp(disp[i * 3 + 1] - h9(ox, oy, oz, 2) * 0.25 * push, -0.45, 0.05);
+    disp[i * 3 + 2] = clamp(disp[i * 3 + 2] + nz * push + (h9(ox, oy, oz, 3) - 0.5) * 0.22 * push, -capZ, capZ);
+    pos.array[i * 3] = ox + disp[i * 3];
+    pos.array[i * 3 + 1] = oy + disp[i * 3 + 1];
+    pos.array[i * 3 + 2] = oz + disp[i * 3 + 2];
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+}
+function dentCar(c, wx, wy, v) {
+  if (!c.mesh || c.kind === 'tank') return;               // armor doesn't crumple
+  const body = c.mesh.userData.bodyMesh;
+  if (!body) return;
+  if (v < 100) return;                                    // parking taps don't bend steel
+  const ca = Math.cos(c.angle), sa = Math.sin(c.angle);
+  const dx = wx - c.x, dy = wy - c.y;
+  const L = c.len * RS, W = c.w * RS;
+  const lx = clamp((dx * ca + dy * sa) * RS, -L / 2, L / 2);      // along the frame, +x = nose
+  const lz = clamp((-dx * sa + dy * ca) * RS, -W / 2, W / 2);     // across it, +z = right side
+  // which SURFACE took the hit — push inward off that face; a corner
+  // (quarter panel) takes it diagonally
+  const rx = Math.abs(lx) / (L / 2), rz = Math.abs(lz) / (W / 2);
+  let nx = 0, nz = 0;
+  if (Math.abs(rx - rz) < 0.25) { nx = (lx > 0 ? -1 : 1) * 0.707; nz = (lz > 0 ? -1 : 1) * 0.707; }
+  else if (rx > rz) nx = lx > 0 ? -1 : 1;
+  else nz = lz > 0 ? -1 : 1;
+  // the cruiser's push bar EATS frontal hits — bending back a little more
+  // each time — until its own HP is spent and it tears off
+  if (nx < 0 && c.kind === 'cop' && !c.ramGone && c.mesh.userData.ramBar) {
+    const bar = c.mesh.userData.ramBar;
+    if (!c.ramSide) c.ramSide = Math.random() < 0.5 ? -1 : 1;
+    c.ramBend = Math.min(1, (c.ramBend || 0) + v / 500);
+    bar.position.x = -c.ramBend * 0.55;
+    bar.rotation.z = c.ramBend * 0.1 * c.ramSide;
+    c.ramHp = (c.ramHp === undefined ? 220 : c.ramHp) - v * 0.3;
+    if (c.ramHp <= 0) dropRamBar(c);
+    v *= 0.3;
+    if (v < 100) return;                                  // the bar took all of it
+  }
+  const mag = Math.min(1.3, 0.14 + (v - 100) * 0.0032);
+  const seed = Math.random() * 1000;                       // no two wrecks alike
+  dentGeo(body, lx, lz, nx, nz, mag, L * 0.20, W * 0.26, seed);
+  const cab = c.mesh.userData.cabMesh;
+  if (cab && mag > 0.3) dentGeo(cab, lx - cab.position.x, lz - cab.position.z, nx, nz, mag * 0.5, L * 0.10, W * 0.16, seed);
+}
+// the spent push bar tears off and clatters into the street
+const droppedParts = [];
+function dropRamBar(c) {
+  const bar = c.mesh && c.mesh.userData.ramBar;
+  if (!bar || c.ramGone) return;
+  c.ramGone = true;
+  c.mesh.remove(bar);
+  const a = c.angle;
+  bar.position.set((c.x + Math.cos(a) * (c.len / 2 + 10)) * RS, 0.02, (c.y + Math.sin(a) * (c.len / 2 + 10)) * RS);
+  bar.rotation.set(0.5 * (Math.random() - 0.5), -a + (Math.random() - 0.5) * 1.2, 0.35 + Math.random() * 0.3);
+  scene.add(bar);
+  droppedParts.push({ mesh: bar, t: 30 });
+  sfx('crash', c.x, c.y, 130);
+}
+function updDropped(dt) {
+  for (let i = droppedParts.length - 1; i >= 0; i--) {
+    const p = droppedParts[i];
+    p.t -= dt;
+    if (p.t <= 0) { scene.remove(p.mesh); droppedParts.splice(i, 1); }
+  }
+}
+// a repair pulls the panels straight again
+function undentCar(c) {
+  if (!c.mesh) return;
+  if (c.kind === 'cop') {
+    c.ramHp = 220; c.ramBend = 0; c.ramSide = 0;
+    if (c.ramGone) { removeCarMesh(c); attachCarMesh(c); c.ramGone = false; }   // fresh bar bolted on
+    else if (c.mesh.userData.ramBar) { c.mesh.userData.ramBar.position.x = 0; c.mesh.userData.ramBar.rotation.z = 0; }
+  }
+  for (const m of [c.mesh.userData.bodyMesh, c.mesh.userData.cabMesh]) {
+    if (!m || !m.geometry.userData.orig) continue;
+    m.geometry.attributes.position.array.set(m.geometry.userData.orig);
+    m.geometry.userData.disp.fill(0);
+    m.geometry.attributes.position.needsUpdate = true;
+    m.geometry.computeVertexNormals();
+  }
 }
 function attachCarMesh(c) {
   c.mesh = buildCarMesh(c);
@@ -3884,7 +4285,7 @@ function scare(x, y, r) {
   }
 }
 function explodeAt(x, y, by) {
-  sfx('boom');
+  sfx('boom', x, y);
   const dP = dist(player.x, player.y, x, y);
   if (dP < 420) rumble(clamp(1.1 - dP / 420, 0.2, 1), clamp(1 - dP / 420, 0.2, 0.9), 380);
   scare(x, y, 450);
@@ -3908,6 +4309,13 @@ function explodeCar(c) {
   if (c.dmgBy === 'p') STATS.carsDestroyed++;
   const wasIn = player.car === c;
   explodeAt(c.x, c.y, c.dmgBy);
+  // the frame takes the blast: crushed in from every side, stays a wreck
+  if (c.kind === 'cop') dropRamBar(c);
+  const ca9 = Math.cos(c.angle), sa9 = Math.sin(c.angle);
+  dentCar(c, c.x + ca9 * c.len / 2, c.y + sa9 * c.len / 2, 380);
+  dentCar(c, c.x - ca9 * c.len / 2, c.y - sa9 * c.len / 2, 340);
+  dentCar(c, c.x - sa9 * c.w / 2, c.y + ca9 * c.w / 2, 320);
+  dentCar(c, c.x + sa9 * c.w / 2, c.y - ca9 * c.w / 2, 320);
   if (wasIn) { player.car = null; player.x = c.x; player.y = c.y; hurtPlayer(200); }
   if (mission && mission.type === 'wheels' && mission.car === c) failMission('The car was destroyed!');
 }
@@ -3988,7 +4396,9 @@ function moveCar(c, dt) {
   c.x = px; c.y = py;
   if (Math.abs(c.speed) > 130) {
     if (c.kind !== 'tank') carDamage(c, Math.abs(c.speed) * 0.06, c.driver === 'player' ? 'p' : null);
-    sfx('crash');
+    const s9 = c.speed >= 0 ? 1 : -1;
+    dentCar(c, c.x + Math.cos(c.angle) * s9 * c.len / 2, c.y + Math.sin(c.angle) * s9 * c.len / 2, Math.abs(c.speed));
+    sfx('crash', c.x, c.y, Math.abs(c.speed));
     sparks(c.x + Math.cos(c.angle) * c.len / 2, c.y + Math.sin(c.angle) * c.len / 2);
   }
   c.speed *= -0.3;
@@ -4045,7 +4455,7 @@ function stepPlayerCar(c, dt) {
     if (c.skidT <= 0) {
       c.skidT = 0.09;
       rumble(0.12, clamp(Math.abs(c.latV) / 250, 0.25, 0.6), 140);   // tires talking through the wheel
-      sfx('screech');
+      skidOn(c, clamp(Math.abs(c.latV) / 250, 0.15, 1));
       const cs = Math.cos(c.angle), sn = Math.sin(c.angle);
       const L2 = c.len * 0.32, W2 = c.w * 0.32;
       for (const side of [-1, 1])
@@ -4108,8 +4518,9 @@ function updCopCar(c, dt) {
       pc2.latV += -side * 150;                 // rear steps out, away from the cruiser
       pc2.speed *= 0.8;
       c.speed *= 0.85;
+      dentCar(pc2, (c.x + pc2.x) / 2, (c.y + pc2.y) / 2, 190);
       rumble(0.65, 0.65, 320);
-      sfx('screech');
+      skidOn(pc2, 1);
       msg('PIT — they clipped your rear quarter!', 5);
       if (window._pitdbg) console.log('PITDBG executed side=' + side + ' latV=' + Math.round(pc2.latV));
     }
@@ -4179,22 +4590,29 @@ function updMobCar(c, dt) {
   moveCar(c, dt);
   if (!player.car && Math.abs(c.speed) > 100 && d < 24 && player.hurtT <= 0) { hurtPlayer(25); player.hurtT = 0.6; }
 }
-function fireShell(c, ang) {
+function fireShell(c, ang, elev) {
   const s = { x: c.x + Math.cos(ang) * (c.len / 2 + 14), y: c.y + Math.sin(ang) * (c.len / 2 + 14), vx: Math.cos(ang) * 520, vy: Math.sin(ang) * 520, life: 1.1, src: c, pby: false, done: false, h: 3.5, vh: 0, mesh: grabMesh(shellMeshes) };
+  if (elev) {
+    // lobbed: up to 45 degrees of barrel, real gravity, longer fuse — artillery
+    s.vh = Math.tan(elev) * 520 * RS;
+    s.grav = true;
+    s.life = 1.1 + elev * 2;
+  }
   shells.push(s);
   addPart(s.x, s.y, 3.5, 0, 0, 0, 0.07, 0xffe9a0, 2.4, true);
-  sfx('cannon');
+  sfx('cannon', s.x, s.y);
 }
 function fireRocket(x, y, ang, vh) {
   const s = { x: x + Math.cos(ang) * 20, y: y + Math.sin(ang) * 20, vx: Math.cos(ang) * 430, vy: Math.sin(ang) * 430, life: 1.4, src: null, pby: true, done: false, h: 1.6, vh: vh || 0, mesh: grabMesh(shellMeshes) };
   shells.push(s);
-  sfx('rocket');
+  sfx('rocket', s.x, s.y);
 }
 function updShells(dt) {
   for (const s of shells) {
     if (s.done) continue;
     s.x += s.vx * dt; s.y += s.vy * dt;
     if (s.h === undefined) s.h = 1.6;
+    if (s.grav) s.vh -= 110 * dt;
     s.h += (s.vh || 0) * dt;
     s.life -= dt;
     if (s.mesh) s.mesh.position.set(s.x * RS, s.h, s.y * RS);
@@ -4204,7 +4622,7 @@ function updShells(dt) {
       if (s.mesh) { s.mesh.visible = false; s.mesh = null; }
       chopper.hp -= 150;
       boomFx(s.x, s.y, s.h);
-      sfx('boom');
+      sfx('boom', s.x, s.y);
       if (chopper.hp <= 0) chopperDown(s.pby || (s.src && s.src.driver === 'player') ? 'p' : null);
       continue;
     }
@@ -4213,7 +4631,7 @@ function updShells(dt) {
       if (s.mesh) { s.mesh.visible = false; s.mesh = null; }
       gunship.hp -= 150;
       boomFx(s.x, s.y, s.h);
-      sfx('boom');
+      sfx('boom', s.x, s.y);
       if (gunship.hp <= 0) gunshipDown(s.pby || (s.src && s.src.driver === 'player') ? 'p' : null);
       continue;
     }
@@ -4730,7 +5148,7 @@ function chopperDown(by) {
   chopper.dead = true;
   chopper.dmgBy = by || null;
   chopper.vAlt = -2;
-  sfx('crash');
+  sfx('crash', chopper.x, chopper.y);
   msg('BIRD DOWN!', 8);
   if (by === 'p') addHeat(2);
 }
@@ -4930,7 +5348,7 @@ function gunshipDown(by) {
   gunship.dead = true;
   gunship.dmgBy = by || null;
   gunship.vAlt = -2;
-  sfx('crash');
+  sfx('crash', gunship.x, gunship.y);
   msg('GUNSHIP DOWN!', 8);
   console.log('GUNDBG down');
   if (by === 'p') addHeat(2);
@@ -5024,7 +5442,7 @@ function updGunship(dt) {
       const aimA = ang + rndf(-0.055, 0.055);
       const vh = ((player.car ? 2 : 1.2) - GS.alt) / tt;
       spawnBullet(mx, my, Math.cos(aimA) * spd2, Math.sin(aimA) * spd2, tt + 0.3, 6, 4, 'c', GS.alt - 1.5, vh);
-      if (Math.random() < 0.3) sfx('uzi');
+      if (Math.random() < 0.3) sfx('uzi', mx, my);
     }
   }
   // ---- the rocket pods: alternate wings, aimed with lead
@@ -5051,7 +5469,7 @@ function updGunship(dt) {
       life: rtt + 0.4, src: null, pby: false, air: true, done: false,
       h: GS.alt - 1.5, vh: (0.3 - GS.alt) / rtt, mesh: grabMesh(shellMeshes)
     });
-    sfx('rocket');
+    sfx('rocket', sx3, sy3);
   }
 }
 function carCollisions() {
@@ -5086,10 +5504,11 @@ function carCollisions() {
           if (lx2 > copC.len * 0.25 && Math.abs(copC.speed) > 60) {
             copC.ramT = 1.2;
             carDamage(player.car, 10 + Math.abs(copC.speed) * 0.05, null);
+            dentCar(player.car, (copC.x + player.car.x) / 2, (copC.y + player.car.y) / 2, 130 + Math.abs(copC.speed) * 0.6);
             rumble(0.8, 0.5, 300);
             player.car.speed += copC.speed * 0.22;             // the shove
             player.car.latV += (Math.random() < 0.5 ? -1 : 1) * 26;
-            sfx('crash');
+            sfx('crash', (copC.x + player.car.x) / 2, (copC.y + player.car.y) / 2);
             sparks((copC.x + player.car.x) / 2, (copC.y + player.car.y) / 2);
           }
         }
@@ -5098,8 +5517,10 @@ function carCollisions() {
         const by = a.driver === 'player' || b.driver === 'player' ? 'p' : null;
         carDamage(a, impact * 0.045, by);
         carDamage(b, impact * 0.045, by);
+        dentCar(a, (a.x + b.x) / 2, (a.y + b.y) / 2, impact);
+        dentCar(b, (a.x + b.x) / 2, (a.y + b.y) / 2, impact);
         if (a === player.car || b === player.car) rumble(clamp(impact / 350, 0.3, 1), 0.5, 260);
-        sfx('crash');
+        sfx('crash', (a.x + b.x) / 2, (a.y + b.y) / 2, impact);
         sparks((a.x + b.x) / 2, (a.y + b.y) / 2);
         if (by && (a.kind === 'cop' || b.kind === 'cop')) addHeat(0.3);
       }
@@ -5170,7 +5591,7 @@ function updRag(o, dt) {
   }
   moveCircle(o, r.vx * dt, r.vy * dt);
   if (r.h <= 0.15 && r.vz < 0) {
-    if (!r.bounced && r.vz < -6) { r.bounced = true; r.vz = -r.vz * 0.3; r.h = 0.15; sfx('punch'); }
+    if (!r.bounced && r.vz < -6) { r.bounced = true; r.vz = -r.vz * 0.3; r.h = 0.15; sfx('punch', o.x, o.y); }
     else if (Math.hypot(r.vx, r.vy) < 20) { o.rag = null; return false; }
     else { r.h = 0.15; r.vz = 0; }
   }
@@ -5204,10 +5625,12 @@ function pedShoot(p, dt, tgt) {
     p.cool = rndf(U.coolA, U.coolB);
     const ang = Math.atan2(t.y - p.y, t.x - p.x) + rndf(-U.spread, U.spread);
     const b = spawnBullet(p.x + Math.cos(ang) * 12, p.y + Math.sin(ang) * 12, Math.cos(ang) * 700, Math.sin(ang) * 700, 0.65, U.dmg, 0, 'c');
-    sfx('pistol');
+    sfx('pistol', p.x, p.y);
     // an NPC firing a gun in front of the law becomes the law's problem —
     // same rule the player lives under (mission-cordon fights excepted)
-    if (!p.cop && !p.pedOutlaw && !(combatMission() && (p.goon || p.guard || p.warTarget))) {
+    if (!p.cop && !p.pedOutlaw && !p.combine) {
+      // Combine soldiers are NEVER cop-bait — the mob owns the badge. The
+      // law hunts every other armed NPC, mission or no mission.
       if (npcGunfireWitnessed(p)) {
         p.pedOutlaw = true;
         p.outlawT = 30;
@@ -5363,7 +5786,7 @@ function updPed(p, dt) {
           const ang = p.angle + rndf(-0.09, 0.09);
           spawnBullet(p.x + Math.cos(ang) * 14, p.y + Math.sin(ang) * 14, Math.cos(ang) * 820, Math.sin(ang) * 820, 0.6, 6, 2, 'c');
           p.mgSfx = (p.mgSfx || 0) + 1;
-          if (p.mgSfx % 3 === 0) sfx('uzi');
+          if (p.mgSfx % 3 === 0) sfx('uzi', p.x, p.y);
           addPart(p.x + Math.cos(ang) * 16, p.y + Math.sin(ang) * 16, 2.6, 0, 0, 0, 0.05, 0xffe9a0, 1.8, true);
         }
         return;
@@ -5501,9 +5924,11 @@ function killPed(p, byPlayer) {
     else if (p.guard || p.target || p.goon) STATS.goonsKilled++;
     else STATS.civiliansKilled++;
   }
+  // the quota counts the body, not the shooter — crossfire, traffic, or the
+  // ghost himself: a dropped goon is a dropped goon (mission stays winnable)
+  if (mission && mission.type === 'goons' && p.goon) mission.count++;
   if (byPlayer) {
     if (frenzy) frenzy.kills++;
-    if (mission && mission.type === 'goons' && p.goon) mission.count++;
     if (p.cop) addHeat(1.2);
     // mission hostiles are the Combine's problem, not the city's — no heat
     else if (p.guard || p.target || p.goon) { /* the job IS the fight */ }
@@ -5573,6 +5998,21 @@ function gunfireWitnessed() {
     msg('Shots fired in front of the law!', 8);
   }
 }
+// The crosshair is the CAMERA's ray, and that ray runs through a pivot at
+// 3.2 — above the 1.9 muzzle. A shot fired merely PARALLEL to it lands
+// below the mark at every range. Converge instead: find the point the
+// crosshair actually covers (chest plane when aiming down, the ground when
+// steep, a 500px sight-in otherwise) and aim the muzzle AT that point.
+function aimVh(spd, h0) {
+  let dRef = 500;
+  if (mousePitch > 0.03) {
+    dRef = (3.2 - 1.5) / (Math.tan(mousePitch) * RS);
+    if (dRef < 45) dRef = (3.2 - 0.2) / (Math.tan(mousePitch) * RS);
+    dRef = clamp(dRef, 25, 900);
+  }
+  const gy = 3.2 - Math.tan(mousePitch) * dRef * RS;
+  return ((gy - h0) / dRef) * spd;
+}
 function fireWeapon() {
   const W = WEAPONS[player.weapon];
   if (player.fireT > 0) return;
@@ -5624,7 +6064,7 @@ function fireWeapon() {
     player.fireT = W.rate;
     player.ammo.rpg--;
     rumble(0.7, 0.4, 220);
-    fireRocket(player.x, player.y, aimAng, aimTarget ? 0 : Math.tan(-mousePitch) * 430 * RS);
+    fireRocket(player.x, player.y, aimAng, aimTarget ? 0 : aimVh(430, 1.6));
     scare(player.x, player.y, 280);
     gunfireWitnessed();
     return;
@@ -5633,8 +6073,8 @@ function fireWeapon() {
   player.fireT = W.rate;
   rumble(W.pellets ? 0.6 : player.weapon === 'uzi' ? 0.12 : 0.3, W.pellets ? 0.3 : 0.1, W.pellets ? 140 : 70);
   const n = W.pellets || 1;
-  // shots follow the crosshair's vertical angle too (locked targets aim level)
-  const vh0 = aimTarget ? 0 : Math.tan(-mousePitch) * W.spd * RS;
+  // shots land ON the crosshair, not under it (locked targets aim level)
+  const vh0 = aimTarget ? 0 : aimVh(W.spd, 1.9);
   for (let i = 0; i < n; i++) {
     const ang = aimAng + (Math.random() - 0.5) * 2 * W.spread;
     spawnBullet(player.x + Math.cos(aimAng) * 16, player.y + Math.sin(aimAng) * 16, Math.cos(ang) * W.spd, Math.sin(ang) * W.spd, W.life, W.dmg, W.cdmg, 'p', 1.9, vh0);
@@ -5685,6 +6125,13 @@ function updGrenades(dt) {
   }
   for (let i = grenades.length - 1; i >= 0; i--) if (grenades[i].done) grenades.splice(i, 1);
 }
+// distance from a point to the car's BODY (oriented len x w box), 0 = touching
+function carBodyDist(c, px, py) {
+  const dx = px - c.x, dy = py - c.y;
+  const lx = Math.abs(dx * Math.cos(c.angle) + dy * Math.sin(c.angle)) - c.len / 2;
+  const ly = Math.abs(-dx * Math.sin(c.angle) + dy * Math.cos(c.angle)) - c.w / 2;
+  return Math.hypot(Math.max(0, lx), Math.max(0, ly));
+}
 function tryEnterExit() {
   if (player.car) {
     const c = player.car;
@@ -5708,13 +6155,10 @@ function tryEnterExit() {
     }
     return true;
   }
-  let bc = null, bd = 56;
-  for (const c of cars) {
-    if (c.dead) continue;
-    const d = dist(c.x, c.y, player.x, player.y);
-    if (d < bd) { bd = d; bc = c; }
-  }
-  if (!bc) return false;
+  return false;
+}
+// boarding: jack the driver if there is one, take the wheel, wear the heat
+function enterCar(bc) {
   if (bc.driver === 'ai') {
     if (bc.kind === 'cop') {
       // jacking a patrol cruiser ejects an officer, not a civilian
@@ -5739,7 +6183,17 @@ function tryEnterExit() {
   // stealing police property carries a mandatory wanted level
   if (!bc.stolen) {
     bc.stolen = true;
-    if (bc.kind === 'tank') { setWanted(5); msg('ARMY HARDWARE THEFT — maximum response!', 8); }
+    if (bc.kind === 'tank') {
+      // an instant FIVE — exactly five, whatever you were carrying — and a
+      // 20-second head start before the meter can climb to six
+      if (!pardonMode) {
+        heat = 5;
+        wantedClearT = 20; copSeen = true;
+        const f9 = focus(); lastSeenX = f9.x; lastSeenY = f9.y;
+        tankGraceT = 20;
+      }
+      msg('ARMY HARDWARE THEFT — maximum response!', 8);
+    }
     else if (bc.kind === 'cop') { setWanted(2); msg('Police vehicle theft!', 8); }
   }
   sfx('enter');
@@ -5826,7 +6280,7 @@ function ensureCops(dt) {
     if (c.dead || c.driver !== 'cop' || c.kind === 'tank') continue;
     if (!c.quarry && s < 2) continue;                    // only chasing cruisers sing
     const d3 = dist(c.x, c.y, player.x, player.y);
-    if (d3 < sirenD) sirenD = d3;
+    if (d3 < sirenD) { sirenD = d3; sirenSrcX = c.x; sirenSrcY = c.y; }
   }
   if (!muted && sirenD < 950) { sirenOn(); sirenTargetGain = clamp(1 - sirenD / 950, 0.1, 1) * 0.028; }
   else sirenOff();
@@ -5851,7 +6305,7 @@ function modItems() {
     if (c.mods.eng < 3) items.push({ key: '1', name: 'Engine tune Lv' + (c.mods.eng + 1) + '  (+12% top speed)', cost: 400, act: () => { c.mods.eng++; } });
     if (c.mods.grip < 3) items.push({ key: '2', name: 'Grip tires Lv' + (c.mods.grip + 1) + '  (+12% grip)', cost: 350, act: () => { c.mods.grip++; } });
     if (c.mods.arm < 3) items.push({ key: '3', name: 'Armor plating Lv' + (c.mods.arm + 1) + '  (+40 HP)', cost: 500, act: () => { c.mods.arm++; c.hp += 40; } });
-    if (c.hp < carMaxHp(c)) items.push({ key: '4', name: 'Full repair', cost: 150, act: () => { c.hp = carMaxHp(c); } });
+    if (c.hp < carMaxHp(c)) items.push({ key: '4', name: 'Full repair', cost: 150, act: () => { c.hp = carMaxHp(c); undentCar(c); } });
   }
   items.push({
     key: '5', name: 'Rental: tuned street whip', cost: 300, act: () => {
@@ -5871,13 +6325,16 @@ function nearestModPad() {
   for (const mp of modPads) { const d = dist(mp.x, mp.y, player.x, player.y); if (d < bd) { bd = d; bp = mp; } }
   return bp;
 }
+function openModShop() {
+  modShopOpen = true;
+  menuSel = 0;
+  sfx('enter');
+}
 function tryModShop() {
   if (!modPads.length) return false;
   const mp = nearestModPad();
   if (dist(mp.x, mp.y, player.x, player.y) >= 44) return false;
-  modShopOpen = true;
-  menuSel = 0;
-  sfx('enter');
+  openModShop();
   return true;
 }
 
@@ -5893,49 +6350,57 @@ function priestItems() {
   items.push({ key: '5', name: 'Alms for the parish', cost: 100, act: () => { STATS.almsGiven++; msg('FATHER: "The parish thanks you."', 6); } });
   return items;
 }
+function openPriest(p) {
+  priestOpen = true;
+  menuSel = 0;
+  const souls = STATS.civiliansKilled + STATS.pedsRunOver;
+  const line = souls > 5 ? 'The innocent follow you in, ghost.'
+    : STATS.copsKilled > 5 ? 'Even badge-men have mothers.'
+    : STATS.timesWasted > 3 ? 'Death keeps spitting you back. There is a reason.'
+    : 'Peace, wanderer. What do you need?';
+  say(p, line, 5);
+  sfx('enter');
+}
 function tryPriest() {
   if (player.car) return false;
   for (const p of peds) {
     if (!p.priest || p.dead) continue;
-    if (dist(p.x, p.y, player.x, player.y) < 44) {
-      priestOpen = true;
-      menuSel = 0;
-      const souls = STATS.civiliansKilled + STATS.pedsRunOver;
-      const line = souls > 5 ? 'The innocent follow you in, ghost.'
-        : STATS.copsKilled > 5 ? 'Even badge-men have mothers.'
-        : STATS.timesWasted > 3 ? 'Death keeps spitting you back. There is a reason.'
-        : 'Peace, wanderer. What do you need?';
-      say(p, line, 5);
-      sfx('enter');
-      return true;
-    }
+    if (dist(p.x, p.y, player.x, player.y) < 44) { openPriest(p); return true; }
   }
   return false;
+}
+function openSaveHouse() {
+  if (mission) { msg('No saving in the middle of a job.', 6); return; }
+  saveHouseOpen = true;
+  menuSel = 0;
+  sfx('enter');
 }
 function trySaveHouse() {
   if (player.car || !savePoint) return false;
   if (dist(savePoint.x, savePoint.y, player.x, player.y) >= 34) return false;
-  if (mission) { msg('No saving in the middle of a job.', 6); return true; }
-  saveHouseOpen = true;
+  openSaveHouse();
+  return true;
+}
+function openGunShop() {
+  shopOpen = true;
   menuSel = 0;
   sfx('enter');
-  return true;
+}
+function buyHotdog() {
+  if (player.cash < 10) { msg('Hot dogs are $10.'); return; }
+  if (player.hp >= 100) { msg('You are already at full health.'); return; }
+  player.cash -= 10;
+  player.hp = Math.min(100, player.hp + 25);
+  sfx('buy');
+  msg('+25 Health. Best dogs in Nuvola City.');
 }
 function tryShops() {
   if (player.car) return false;
   for (const gs of gunShops) {
-    if (dist(gs.x, gs.y, player.x, player.y) < 34) { shopOpen = true; menuSel = 0; sfx('enter'); return true; }
+    if (dist(gs.x, gs.y, player.x, player.y) < 34) { openGunShop(); return true; }
   }
   for (const fc of foodCarts) {
-    if (dist(fc.x, fc.y, player.x, player.y) < 34) {
-      if (player.cash < 10) { msg('Hot dogs are $10.'); return true; }
-      if (player.hp >= 100) { msg('You are already at full health.'); return true; }
-      player.cash -= 10;
-      player.hp = Math.min(100, player.hp + 25);
-      sfx('buy');
-      msg('+25 Health. Best dogs in Nuvola City.');
-      return true;
-    }
+    if (dist(fc.x, fc.y, player.x, player.y) < 34) { buyHotdog(); return true; }
   }
   return false;
 }
@@ -5959,16 +6424,23 @@ function updPads(dt) {
       continue;
     }
     player.cash -= 200;
-    heat = 0; wantedClearT = 0; copSeen = false;
+    // out of sight, out of mind: paint only erases a wanted level the law
+    // didn't watch you buy
+    if (heat > 0 && policeCanSee()) {
+      msg('Sprayed while the law was WATCHING — the paint fools no one. Lose them first.', 7);
+    } else {
+      heat = 0; wantedClearT = 0; copSeen = false;
+      msg('Resprayed. The heat is off.');
+    }
     player.car.hp = CAR_KINDS[player.car.kind].hp;
     player.car.onFireT = 0;
+    undentCar(player.car);                   // the shop pulls the panels too
     if (CAR_KINDS[player.car.kind].color === null) {
       player.car.color = CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)];
       if (player.car.mesh) player.car.mesh.userData.bodyMat.color.set(player.car.color);
     }
     pad.cool = 8;
     sfx('spray');
-    msg('Resprayed. The heat is off.');
   }
 }
 
@@ -6177,12 +6649,12 @@ function startMission(island) {
   } else if (type === 'hit') {
     const p = roadPoint(player.x, player.y, 900, 1600, isl);
     const s = findSidewalkNear(p.ix, p.iy);
-    const target = mkPed(s.x, s.y, { target: true, hp: 40, shirt: 0xe8e8e8 });
+    const target = mkPed(s.x, s.y, { target: true, combine: true, hp: 40, shirt: 0xe8e8e8 });
     attachPedMesh(target);
     peds.push(target);
     const nGuards = (story && story.guards) || 2;
     for (let i = 0; i < nGuards; i++) {
-      const g = mkPed(s.x + rndf(-40, 40), s.y + rndf(-40, 40), { guard: true, hp: 50, shirt: 0x5a1a1a });
+      const g = mkPed(s.x + rndf(-40, 40), s.y + rndf(-40, 40), { guard: true, combine: true, hp: 50, shirt: 0x5a1a1a });
       attachPedMesh(g);
       g.mesh.userData.gun.visible = true;
       peds.push(g);
@@ -6205,7 +6677,7 @@ function startMission(island) {
     for (let i = 0; i < nG; i++) {
       const ang = rndf(0, TAU), d = rndf(350, 650);
       const s = findSidewalkNear(Math.floor((player.x + Math.cos(ang) * d) / TILE), Math.floor((player.y + Math.sin(ang) * d) / TILE));
-      const p = mkPed(s.x, s.y, { goon: true, hp: 35, shirt: 0x6a1a1a, warTarget: true });
+      const p = mkPed(s.x, s.y, { goon: true, combine: true, hp: 35, shirt: 0x6a1a1a, warTarget: true });
       attachPedMesh(p);
       p.mesh.userData.gun.visible = true;
       peds.push(p);
@@ -6267,7 +6739,7 @@ function startMission(island) {
       pts.push({ x: rp.x, y: rp.y, got: false });
     }
     for (let i = 0; i < 2; i++) {
-      const g = mkPed(pts[i].x + rndf(-34, 34), pts[i].y + rndf(-34, 34), { guard: true, hp: 50, shirt: 0x3a3a44 });
+      const g = mkPed(pts[i].x + rndf(-34, 34), pts[i].y + rndf(-34, 34), { guard: true, combine: true, hp: 50, shirt: 0x3a3a44 });
       attachPedMesh(g);
       g.mesh.userData.gun.visible = true;
       peds.push(g);
@@ -6333,7 +6805,7 @@ function advanceStage(d) {
     for (let i = 0; i < (d.n || 8); i++) {
       const ang = rndf(0, TAU), dd = rndf(350, 650);
       const s = findSidewalkNear(Math.floor((player.x + Math.cos(ang) * dd) / TILE), Math.floor((player.y + Math.sin(ang) * dd) / TILE));
-      const g = mkPed(s.x, s.y, { goon: true, hp: 35, shirt: 0x6a1a1a, warTarget: true });
+      const g = mkPed(s.x, s.y, { goon: true, combine: true, hp: 35, shirt: 0x6a1a1a, warTarget: true });
       attachPedMesh(g);
       g.mesh.userData.gun.visible = true;
       peds.push(g);
@@ -6343,11 +6815,11 @@ function advanceStage(d) {
   } else if (d.type === 'hit') {
     const p = roadPoint(player.x, player.y, 700, 1400, isl);
     const s = findSidewalkNear(p.ix, p.iy);
-    const target = mkPed(s.x, s.y, { target: true, hp: 40, shirt: 0xe8e8e8 });
+    const target = mkPed(s.x, s.y, { target: true, combine: true, hp: 40, shirt: 0xe8e8e8 });
     attachPedMesh(target);
     peds.push(target);
     for (let i = 0; i < (d.guards || 2); i++) {
-      const g = mkPed(s.x + rndf(-40, 40), s.y + rndf(-40, 40), { guard: true, hp: 50, shirt: 0x5a1a1a });
+      const g = mkPed(s.x + rndf(-40, 40), s.y + rndf(-40, 40), { guard: true, combine: true, hp: 50, shirt: 0x5a1a1a });
       attachPedMesh(g);
       g.mesh.userData.gun.visible = true;
       peds.push(g);
@@ -6542,13 +7014,49 @@ function updMission(dt) {
 function tryPhone() {
   if (mission || player.car) return false;
   for (const ph of phones) {
-    if (dist(ph.x, ph.y, player.x, player.y) < 34) { startMission(ph.island); return true; }
+    if (dist(ph.x, ph.y, player.x, player.y) < 20) { startMission(ph.island); return true; }   // arm's reach of the booth
   }
   return false;
+}
+// E fires the NEAREST action in reach — no pecking order. Standing on the
+// phone means the phone; a fender at your hip means the ride.
+function nearestAction() {
+  const acts = [];
+  const pd = (x, y) => dist(x, y, player.x, player.y);
+  for (const gs of gunShops) { const d = pd(gs.x, gs.y); if (d < 34) acts.push({ d, go: openGunShop }); }
+  for (const fc of foodCarts) { const d = pd(fc.x, fc.y); if (d < 34) acts.push({ d, go: buyHotdog }); }
+  if (savePoint) { const d = pd(savePoint.x, savePoint.y); if (d < 34) acts.push({ d, go: openSaveHouse }); }
+  for (const p of peds) {
+    if (!p.priest || p.dead) continue;
+    const d = pd(p.x, p.y);
+    if (d < 44) acts.push({ d, go: () => openPriest(p) });
+  }
+  for (const c of cars) {
+    if (c.dead) continue;
+    const d = carBodyDist(c, player.x, player.y);
+    if (d < 14) acts.push({ d, go: () => enterCar(c) });
+  }
+  if (modPads.length) {
+    const mp = nearestModPad();
+    const d = pd(mp.x, mp.y);
+    if (d < 44) acts.push({ d, go: openModShop });
+  }
+  if (!mission) {
+    for (const ph of phones) {
+      const d = pd(ph.x, ph.y);
+      if (d < 20) acts.push({ d, go: () => startMission(ph.island) });
+    }
+  }
+  if (!acts.length) return false;
+  let best = acts[0];
+  for (const a of acts) if (a.d < best.d) best = a;
+  best.go();
+  return true;
 }
 
 // ---------------------------------------------------------------- death / respawn
 let state = 'menu';
+let cheated = false;                         // the ledger never forgets
 let paused = false;
 let overText = '', overT = 0;
 function wasted() {
@@ -6591,8 +7099,17 @@ function respawn() {
   player.rag = null;
   player.mesh.rotation.set(0, 0, 0);
   player.weapon = player.ammo.pistol > 0 ? 'pistol' : 'fist';
-  const isl = islandOfPx(player.x, player.y);
-  const h = hospitals[isl >= 1 ? isl : 0] || hospitals[0];
+  // wake up on the nearest island the state actually lets you walk on
+  let isl = islandOfPx(player.x, player.y);
+  if (isl < 0 || !islandUnlocked(isl)) {
+    let bd = 1e9; isl = 0;
+    for (let i = 0; i < hospitals.length; i++) {
+      if (!islandUnlocked(i)) continue;
+      const d = dist(player.x, player.y, hospitals[i].x, hospitals[i].y);
+      if (d < bd) { bd = d; isl = i; }
+    }
+  }
+  const h = hospitals[isl] || hospitals[0];
   player.x = h.x; player.y = h.y;
   swim = null;
   cutscene = null;
@@ -6651,6 +7168,7 @@ function startGame() {
   player.x = playerStart.x;
   player.y = playerStart.y;
   mouseYaw = player.angle;
+  cheated = false;
   state = 'play';
   mdown = false;                             // the click that started the game is not a trigger pull
   ensureShopkeeps();
@@ -6675,6 +7193,18 @@ function onClick() {
 function update(dt) {
   pollPad(dt);
   updMusic();
+  // FORBIDDEN TERRITORY: an island with no freed bridge is a military zone.
+  // Level 6 the whole time you stand on it — pinned, no fading, no mercy.
+  // Stars act normal again the moment you make it back out (or die trying).
+  if (!player.dead && !pardonMode) {
+    const pIsl = islandOfPx(player.x, player.y);
+    if (pIsl >= 0 && !islandUnlocked(pIsl)) {
+      if (stars() < 6) msg('FORBIDDEN TERRITORY — the state answers with everything it has!', 8);
+      heat = 6;
+      wantedClearT = 30;
+      copSeen = true;
+    }
+  }
   updEngine();
   if (state === 'menu') {
     // no game inputs on the title screen — Enter/click to play, slot key to load
@@ -6813,13 +7343,14 @@ function update(dt) {
     pressed.clear();
     if (cutscene) updCutscene(dt);   // advancing the last line ends the scene
   }
-  // E priority: shops/save door, then cars (a nearby ride beats the mod menu), then mod pad, then phone
+  // E fires the NEAREST action in reach — in a car it always steps out
   if (pressed.has('KeyE') && !player.rag && !swim) {
-    if (!tryShops() && !trySaveHouse() && !tryPriest()) {
-      if (!tryEnterExit()) {
-        if (!(!player.car && tryModShop())) tryPhone();
-      }
-    }
+    if (!tryEnterExit()) nearestAction();
+  }
+  // Space: an honest hop (on foot only — in a car it's the handbrake)
+  if (pressed.has('Space') && !player.car && !swim && !player.rag && !player.dead && !player.jumpH) {
+    player.jumpH = 0.001;
+    player.jumpV = 6.5;
   }
   const digits = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7'];
   for (let i = 0; i < digits.length; i++) if (pressed.has(digits[i])) player.weapon = WORDER[i];
@@ -6831,6 +7362,12 @@ function update(dt) {
 
   player.fireT -= dt;
   player.hurtT -= dt;
+  tankGraceT -= dt;
+  if (player.jumpH) {
+    player.jumpH += player.jumpV * dt;
+    player.jumpV -= 18 * dt;
+    if (player.jumpH <= 0) { player.jumpH = 0; player.jumpV = 0; }
+  }
 
   // stepping into water starts a swim; touching a walkable tile ends it
   if (!player.car && !player.rag && !player.dead) {
@@ -6847,15 +7384,16 @@ function update(dt) {
     if (pc.kind === 'tank') {
       pc.turret += angDiff(pc.turret, mouseYaw) * Math.min(1, dt * 6);   // mouse aims the turret
       pc.fireT -= dt;
-      if ((mdown || padTankFire) && pc.fireT <= 0) { pc.fireT = 1.1; rumble(0.9, 0.3, 260); fireShell(pc, pc.turret); }   // pad: LB fires, RT is gas
+      if ((mdown || padTankFire) && pc.fireT <= 0) { pc.fireT = 1.1; rumble(0.9, 0.3, 260); fireShell(pc, pc.turret, clamp(-mousePitch, 0, 0.785)); }   // pad: LB fires, RT is gas
     }
     // reversing: the camera swings to look BEHIND the car; forward brings it home
     if (pc.speed < -12) pc.revCamT = Math.min(1, (pc.revCamT || 0) + dt * 2.2);
     else if (pc.speed > 6) pc.revCamT = Math.max(0, (pc.revCamT || 0) - dt * 2.6);
     if (pc.revCamT > 0.02) {
       mouseYaw += angDiff(mouseYaw, pc.angle + Math.PI * pc.revCamT) * Math.min(1, dt * 4);
-    } else if (performance.now() - lastMouseMove > 1100) {
-      // camera drifts back behind the car when the mouse is idle
+    } else if (Math.abs(pc.speed) > 8 && performance.now() - lastMouseMove > 250) {
+      // rolling: the camera comes home 0.25s after the player stops moving
+      // it. Parked: fully free — it stays wherever the player put it.
       mouseYaw += angDiff(mouseYaw, pc.angle) * Math.min(1, dt * 2);
     }
     if (pc.hp < 15 && !godMode) {
@@ -6930,6 +7468,7 @@ function update(dt) {
   }
   for (const c of cars) if (!c.dead && (c.driver || Math.abs(c.speed) > 40)) checkLampHits(c);
   updLamps(dt);
+  updDropped(dt);
   carCollisions();
   if (chopper) updChopper(dt);
   if (gunship) updGunship(dt);
@@ -6980,8 +7519,7 @@ function update(dt) {
     if (p.pedOutlaw) {
       p.outlawT -= dt;
       if (p.outlawT <= 0) p.pedOutlaw = false;   // the trail goes cold
-    } else if (npcCarryTick <= 0 && !p.dead && !p.cop && p.mesh && p.mesh.userData.gun && p.mesh.userData.gun.visible
-        && !(combatMission() && (p.goon || p.guard || p.warTarget))) {
+    } else if (npcCarryTick <= 0 && !p.dead && !p.cop && !p.combine && p.mesh && p.mesh.userData.gun && p.mesh.userData.gun.visible) {
       // open carry is illegal for EVERYONE: a cop who sees the iron starts
       // the same 5-second clock the player gets
       let seen = false;
@@ -7371,7 +7909,7 @@ function syncScene(dt, t) {
       player.mesh.rotation.set(0, -player.angle, -1.25);   // negative pitch: head FORWARD, chest down
     } else {
       const bob = animateRig(player.mesh, player.x, player.y, dt, player.weapon !== 'fist');
-      player.mesh.position.set(player.x * RS, bob * 0.12, player.y * RS);
+      player.mesh.position.set(player.x * RS, bob * 0.12 + (player.jumpH || 0), player.y * RS);
       player.mesh.rotation.set(0, -player.angle, 0);
     }
     player.mesh.userData.gun.visible = false;
@@ -7540,9 +8078,9 @@ const CONTROLS = [
   'Mouse ................ free look + aim (click captures mouse)',
   'W A S D .............. move (camera-relative) / drive',
   'Click ................ shoot at the crosshair (soft lock)',
-  'E .................... car / phone / shop / chapel / tune-up / save door',
+  'E .................... nearest action: car / phone / shop / chapel / tune-up / save door',
   'Enter ................ advance cut-scene dialog',
-  'Wheel or 1-7 / Q ..... weapons      Shift ... sprint',
+  'Wheel or 1-7 / Q ..... weapons      Shift ... sprint      Space ... jump',
   'Ctrl + Wheel ......... camera distance',
   'Space handbrake   R radio   P pause   M mute   Esc frees mouse',
   'Respray shop: drive in, $200 clears your stars',
@@ -7909,6 +8447,13 @@ function drawHUD(t) {
     hctx.moveTo(cx, cy + 4); hctx.lineTo(cx, cy + 11);
     hctx.stroke();
   }
+  // the mark of shame: a branded run says so on screen, bottom-right
+  if (cheated && state === 'play') {
+    hctx.textAlign = 'right';
+    hctx.font = 'bold 17px monospace';
+    hctx.fillStyle = '#ffd21a';
+    hctx.fillText('CHEATER', VW - 18, VH - 18);
+  }
   // pointer-lock hint
   if (!ptrLocked && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !priestOpen) {
     hctx.textAlign = 'center';
@@ -8184,7 +8729,7 @@ function frame(now) {
   update(dt);
   updRadio();
   syncScene(dt, gtime);
-  renderer.render(scene, camera);
+  if (!window._noRender) renderer.render(scene, camera);   // audio receipts starve without this skip (headless swiftshader)
   drawHUD(gtime);
   requestAnimationFrame(frame);
 }
@@ -8674,10 +9219,10 @@ if (location.hash === '#npclaw') {
   console.log('NPCLAWDBG copEngaged=' + (cop.copTarget === g) + ' patrolDropped=' + !cop.patrol);
   // fresh scene for the open-carry leg: an idle cop parked next to an armed
   // guard, driven by synchronous update() ticks (harness timers are unreliable)
-  const cop2 = mkPed(player.x - 200, player.y, { cop: true, hp: 200, spd: 0.001, patrol: true, shirt: 0x20306a });
+  const cop2 = mkPed(player.x - 800, player.y, { cop: true, hp: 200, spd: 0.001, patrol: true, shirt: 0x20306a });   // far from leg-1 so he never joins that hunt
   attachPedMesh(cop2);
   peds.push(cop2);
-  const g2 = mkPed(cop2.x + 40, cop2.y, { guard: true, hp: 50, shirt: 0x5a1a1a });
+  const g2 = mkPed(cop2.x + 40, cop2.y, { guard: true, hp: 50, shirt: 0x5a1a1a });   // ordinary armed NPC, NOT Combine
   attachPedMesh(g2);
   g2.mesh.userData.gun.visible = true;
   peds.push(g2);
@@ -8688,6 +9233,22 @@ if (location.hash === '#npclaw') {
     g2.mesh.userData.gun.visible = true;
   }
   console.log('NPCLAWDBG openCarry outlaw=' + !!g2.pedOutlaw + ' carryT=' + (g2.carryT || 0).toFixed(1));
+  // ---- the JOB 8 EXPLOIT leg: Combine goons can never be cop-bait
+  missionsDone = 7;
+  startMission(0);
+  const mg = mission.targets[0];
+  const c9 = mkPed(mg.x + 40, mg.y, { cop: true, hp: 200, patrol: true, shirt: 0x20306a });
+  attachPedMesh(c9);
+  peds.push(c9);
+  mg.cool = 0;
+  pedShoot(mg, 0.016);
+  console.log('NPCLAWDBG combine midMission outlaw=' + !!mg.pedOutlaw + ' (must be false)');
+  killPed(mission.targets[1], false);          // a cop crossfire kill
+  console.log('NPCLAWDBG quota after cop kill count=' + mission.count + ' (must be 1)');
+  failMission('exploit test');
+  mg.cool = 0;
+  if (!mg.dead) pedShoot(mg, 0.016);
+  console.log('NPCLAWDBG combine postMission outlaw=' + !!mg.pedOutlaw + ' (must be false — brand persists)');
 }
 if (location.hash === '#lamp') {
   // lamp two-tier receipt: slow hit bends, fast hit fells, 60s replaces
@@ -8731,6 +9292,395 @@ if (location.hash === '#exitside') {
     tryEnterExit();
     console.log('EXITDBG dy=' + Math.round(player.y - c.y) + ' (negative = LEFT of an east-facing car)');
   }, 800);
+}
+if (location.hash === '#reach') {
+  // body-shape reach receipt: E works only at arm's length from the BODY
+  startGame();
+  godMode = true;
+  for (const c of cars) c.dead = true;               // no ambient rides in the test
+  const cx = player.x + 200, cy = player.y;
+  const rc = mkCar(cx, cy, 0, 'sedan', null);        // len 40 w 21, facing east
+  attachCarMesh(rc);
+  cars.push(rc);
+  const pressE = (px, py) => { player.x = px; player.y = py; rc.x = cx; rc.y = cy; pressed.add('KeyE'); update(1 / 60); };
+  pressE(cx - 48, cy);                               // nose edge 28px — old 56-circle entered here
+  const carA = !player.car;
+  pressE(cx - 30, cy);                               // nose edge 10px — arm's reach
+  const carB = player.car === rc;
+  player.car = null; rc.driver = null;
+  pressE(cx, cy - 20.5);                             // side edge 10px — box works on both axes
+  const carC = player.car === rc;
+  player.car = null; rc.driver = null;
+  pressE(cx, cy - 38.5);                             // side edge 28px, center 38.5 — old entered
+  const carD = !player.car;
+  rc.dead = true;
+  const ph = phones[0];
+  pressE(ph.x - 26, ph.y);                           // old 34-circle answered here
+  const phFar = !mission;
+  pressE(ph.x - 14, ph.y);                           // standing at the booth
+  const phNear = !!mission;
+  if (mission) failMission('receipt done');
+  console.log('REACHDBG carFarNo=' + carA + ' carNoseYes=' + carB + ' carSideYes=' + carC + ' carSideFarNo=' + carD + ' phoneFarNo=' + phFar + ' phoneNearYes=' + phNear);
+  // nearest-action arbitration: booth and fender BOTH in reach
+  const rc2 = mkCar(ph.x + 30, ph.y, 0, 'sedan', null);   // nose 10px east of the booth
+  attachCarMesh(rc2);
+  cars.push(rc2);
+  const pressE2 = (px, py) => { player.x = px; player.y = py; rc2.x = ph.x + 30; rc2.y = ph.y; pressed.add('KeyE'); update(1 / 60); };
+  pressE2(ph.x - 2, ph.y);                           // phone 2px, fender 12px — the phone is nearer
+  const arbPhone = !!mission && !player.car;
+  if (mission) failMission('receipt done');
+  pressE2(ph.x + 16, ph.y);                          // touching the fender, phone 16px — the ride is nearer
+  const arbCar = player.car === rc2 && !mission;
+  player.car = null; rc2.driver = null;
+  console.log('REACHDBG2 nearestPhone=' + arbPhone + ' nearestCar=' + arbCar);
+}
+if (location.hash === '#sound360') {
+  // surround receipt: split the master bus into L/R analysers and prove a
+  // world-placed tone lands in the correct speaker as the camera turns.
+  // REAL-TIME run (no virtual-time budget) — the audio clock is a real clock.
+  startGame();
+  godMode = true;
+  audioInit();
+  if (AC) AC.resume();
+  const sp9 = AC.createChannelSplitter(2);
+  master.connect(sp9);
+  const anL = AC.createAnalyser(), anR = AC.createAnalyser();
+  sp9.connect(anL, 0); sp9.connect(anR, 1);
+  const rms9 = an => { const b = new Float32Array(an.fftSize); an.getFloatTimeDomainData(b); let s = 0; for (const v of b) s += v * v; return Math.sqrt(s / b.length); };
+  let osc9 = null, pan9 = null;
+  const play9 = (dx, dy) => {
+    if (osc9) { try { osc9.stop(); pan9.disconnect(); } catch (e) {} }
+    pan9 = panAt(player.x + dx, player.y + dy, true);
+    osc9 = AC.createOscillator(); osc9.frequency.value = 440;
+    const g9 = AC.createGain(); g9.gain.value = 0.15;
+    osc9.connect(g9); g9.connect(pan9);
+    osc9.start();
+  };
+  const cases9 = [
+    { n: 'right', dx: 0, dy: 300, yaw: 0 },
+    { n: 'left', dx: 0, dy: -300, yaw: 0 },
+    { n: 'ahead', dx: 300, dy: 0, yaw: 0 },
+    { n: 'aboutFace', dx: 0, dy: 300, yaw: Math.PI },   // same source, camera turned 180 — other ear
+  ];
+  let ci9 = 0;
+  const step9 = () => {
+    if (ci9 > 0) {
+      const c = cases9[ci9 - 1], l = rms9(anL), r = rms9(anR);
+      const ok = c.n === 'ahead' ? Math.abs(l - r) < (l + r) * 0.25 : (c.n === 'right' ? r > l * 2 : l > r * 2);
+      console.log('SNDDBG ' + c.n + ' L=' + l.toFixed(4) + ' R=' + r.toFixed(4) + ' ok=' + ok);
+    }
+    if (ci9 >= cases9.length) { try { osc9.stop(); pan9.disconnect(); } catch (e) {} console.log('SNDDBG done state=' + AC.state); return; }
+    const c = cases9[ci9++];
+    mouseYaw = camYaw = c.yaw;
+    play9(c.dx, c.dy);
+    setTimeout(step9, 900);
+  };
+  setTimeout(step9, 700);
+}
+if (location.hash === '#dent') {
+  // crash-mechanics receipt: frontal crush, quarter-panel dent stays LOCAL,
+  // door cave-in, and a repair pulls everything straight
+  startGame();
+  const mkTest = () => { const c = mkCar(player.x + 120, player.y, 0, 'sedan', null); attachCarMesh(c); cars.push(c); return c; };
+  const maxXmid = c => { let m = -1e9; const p = c.mesh.userData.bodyMesh.geometry.attributes.position.array; for (let i = 0; i < p.length; i += 3) if (Math.abs(p[i + 2]) < 1.0) m = Math.max(m, p[i]); return m; };
+  const zEdge = (c, x0, x1, side) => { let m = side > 0 ? -1e9 : 1e9; const p = c.mesh.userData.bodyMesh.geometry.attributes.position.array; for (let i = 0; i < p.length; i += 3) if (p[i] > x0 && p[i] < x1) m = side > 0 ? Math.max(m, p[i + 2]) : Math.min(m, p[i + 2]); return m; };
+  const c1 = mkTest();
+  const nose0 = maxXmid(c1);
+  dentCar(c1, c1.x + 20, c1.y, 320);                       // head-on at speed
+  const nose1 = maxXmid(c1);
+  const c2 = mkTest();
+  const rf0 = zEdge(c2, 4, 6, 1), lf0 = zEdge(c2, 4, 6, -1), rr0 = zEdge(c2, -6, -2, 1);
+  dentCar(c2, c2.x + 18, c2.y + 9, 220);                   // front-RIGHT quarter panel
+  const rf1 = zEdge(c2, 4, 6, 1), lf1 = zEdge(c2, 4, 6, -1), rr1 = zEdge(c2, -6, -2, 1);
+  const c3 = mkTest();
+  const door0 = zEdge(c3, -2, 2, -1), nose3a = maxXmid(c3);
+  dentCar(c3, c3.x, c3.y - 10.5, 260);                     // broadside into the LEFT doors
+  const door1 = zEdge(c3, -2, 2, -1), nose3b = maxXmid(c3);
+  undentCar(c1);
+  const nose2 = maxXmid(c1);
+  console.log('DENTDBG frontal=' + (nose0 - nose1).toFixed(2) + ' ok=' + (nose0 - nose1 > 0.4)
+    + ' | quarterR=' + (rf0 - rf1).toFixed(2) + ' ok=' + (rf0 - rf1 > 0.15)
+    + ' quarterLuntouched=' + (Math.abs(lf1 - lf0) < 0.05) + ' rearRuntouched=' + (Math.abs(rr1 - rr0) < 0.12)
+    + ' | door=' + (door1 - door0).toFixed(2) + ' ok=' + (door1 - door0 > 0.25) + ' noseUntouched=' + (Math.abs(nose3b - nose3a) < 0.05)
+    + ' | repaired=' + (Math.abs(nose2 - nose0) < 0.01));
+}
+if (location.hash === '#dentview') {
+  // eyes-on view of a wrecked sedan, under demo lights (debug hash only)
+  startGame();
+  godMode = true;
+  const c = mkCar(player.x + 55, player.y - 55, 0.6, 'sedan', null);
+  c.color = 0x3a5f9e;
+  c.keep = true;
+  attachCarMesh(c); cars.push(c);
+  dentCar(c, c.x + Math.cos(c.angle) * 20, c.y + Math.sin(c.angle) * 20, 330);   // crushed nose
+  dentCar(c, c.x - Math.sin(c.angle) * 10.5, c.y + Math.cos(c.angle) * 10.5, 260); // caved right doors
+  mousePitch = 0.15;
+  camZoom = 1.3;
+  mouseYaw = camYaw = player.angle = Math.atan2(c.y - player.y, c.x - player.x);
+  scene.fog = null;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+}
+if (location.hash === '#sfxprobe') {
+  // bisect the gunshot chain: raw clipped detonation -> one formant band -> full shot
+  window._noRender = true;
+  startGame();
+  audioInit();
+  if (AC) AC.resume();
+  const anP = AC.createAnalyser();
+  master.connect(anP);
+  const rmsP = () => { const b = new Float32Array(anP.fftSize); anP.getFloatTimeDomainData(b); let s = 0; for (const v of b) s += v * v; return Math.sqrt(s / b.length); };
+  const det = dest => {
+    const t = AC.currentTime, n = (AC.sampleRate * 0.09) | 0;
+    const b = AC.createBuffer(1, n, AC.sampleRate), d = b.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    const src = AC.createBufferSource(); src.buffer = b;
+    const dr = AC.createGain(); dr.gain.value = 30;
+    const cl = shaper(CURVE_HARD);
+    const env = AC.createGain();
+    env.gain.setValueAtTime(1, t);
+    env.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+    src.connect(dr); dr.connect(cl); cl.connect(env); env.connect(dest);
+    src.start(t);
+  };
+  const steps = [
+    ['rawclip', () => det(master)],
+    ['oneband', () => {
+      const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 79; bp.Q.value = 3;
+      const bg = AC.createGain(); bg.gain.value = 10;
+      bp.connect(bg); bg.connect(master);
+      det(bp);
+    }],
+    ['fullshot', () => gunShot(1.1, 0.025, 0.09, 10, 0)],
+    ['chirponly', () => {
+      const t = AC.currentTime;
+      const o = AC.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(5610, t);
+      o.frequency.exponentialRampToValueAtTime(100, t + 0.025);
+      const og = AC.createGain();
+      og.gain.setValueAtTime(0.8, t);
+      og.gain.exponentialRampToValueAtTime(0.001, t + 0.025);
+      o.connect(og); og.connect(master);
+      o.start(t); o.stop(t + 0.05);
+    }],
+  ];
+  let ip = 0;
+  const stepP = () => {
+    if (ip >= steps.length) { console.log('SFXPROBE done'); return; }
+    const [nm, fn] = steps[ip++];
+    fn();
+    let pk = 0;
+    const iv = setInterval(() => { pk = Math.max(pk, rmsP()); }, 25);
+    setTimeout(() => { clearInterval(iv); console.log('SFXPROBE ' + nm + ' peak=' + pk.toFixed(4)); }, 620);
+    setTimeout(stepP, 700);
+  };
+  setTimeout(stepP, 600);
+}
+if (location.hash === '#sfxcheck') {
+  // every new recipe fires and moves the master bus — REAL-TIME run,
+  // renderer off so the meters actually get main-thread time
+  window._noRender = true;
+  startGame();
+  godMode = true;
+  audioInit();
+  if (AC) AC.resume();
+  const an9 = AC.createAnalyser();
+  master.connect(an9);
+  const rms9 = () => { const b = new Float32Array(an9.fftSize); an9.getFloatTimeDomainData(b); let s = 0; for (const v of b) s += v * v; return Math.sqrt(s / b.length); };
+  const seq = ['pistol', 'uzi', 'shotgun', 'cannon', 'crash', 'boom'];
+  let i9 = 0;
+  const step9 = () => {
+    if (i9 < seq.length) {
+      const k = seq[i9++];
+      sfx(k);
+      let pk = 0;
+      const iv = setInterval(() => { pk = Math.max(pk, rms9()); }, 25);
+      setTimeout(() => { clearInterval(iv); console.log('SFXDBG ' + k + ' peak=' + pk.toFixed(4) + ' ok=' + (pk > 0.01)); }, 640);
+      setTimeout(step9, 750);
+    } else {
+      const c9 = cars[0] || { x: player.x, y: player.y, skidV: null };
+      skidOn(c9, 0.8); setTimeout(() => skidOn(c9, 0.8), 100); setTimeout(() => skidOn(c9, 0.8), 200);
+      let pk = 0;
+      const iv = setInterval(() => { pk = Math.max(pk, rms9()); }, 25);
+      setTimeout(() => { clearInterval(iv); console.log('SFXDBG skid peak=' + pk.toFixed(4) + ' ok=' + (pk > 0.01)); }, 450);
+      setTimeout(() => console.log('SFXDBG skidReleased rms=' + rms9().toFixed(4) + ' ok=' + (rms9() < 0.02) + ' | kit=' + (!!verbStreet && !!pinkBuf && !!CURVE_SOFT)), 1500);
+    }
+  };
+  setTimeout(step9, 600);
+}
+if (location.hash === '#rambar') {
+  // push-bar receipt: absorbs frontal hits, bends, tears off at 0 HP,
+  // and only THEN does the cruiser's nose crumple
+  startGame();
+  const cc = mkCar(player.x + 150, player.y, 0, 'cop', null);
+  attachCarMesh(cc); cars.push(cc);
+  const noseX = () => { let m = -1e9; const p = cc.mesh.userData.bodyMesh.geometry.attributes.position.array; for (let i = 0; i < p.length; i += 3) if (Math.abs(p[i + 2]) < 1.0) m = Math.max(m, p[i]); return m; };
+  const n0 = noseX();
+  dentCar(cc, cc.x + 22, cc.y, 300);
+  const absorbed = (n0 - noseX() < 0.05) && !cc.ramGone && cc.mesh.userData.ramBar.position.x < -0.1;
+  dentCar(cc, cc.x + 22, cc.y, 300);
+  const still = !cc.ramGone;
+  dentCar(cc, cc.x + 22, cc.y, 300);
+  const gone = !!cc.ramGone && droppedParts.length > 0;
+  const n1 = noseX();
+  dentCar(cc, cc.x + 22, cc.y, 300);
+  const crumples = n1 - noseX() > 0.3;
+  undentCar(cc);
+  const fresh = !cc.ramGone && !!cc.mesh.userData.ramBar && cc.mesh.userData.ramBar.position.x === 0;
+  console.log('RAMBARDBG absorbed=' + absorbed + ' secondHitHolds=' + still + ' toreOff=' + gone + ' crumplesAfter=' + crumples + ' repairRestores=' + fresh);
+}
+if (location.hash === '#respray') {
+  // respray law: the law watching = heat stays; hidden = heat clears
+  startGame();
+  godMode = true;
+  const pad = pads[0];
+  const rc = mkCar(pad.x, pad.y, 0, 'sedan', 'player');
+  rc.keep = true;
+  attachCarMesh(rc); cars.push(rc);
+  player.car = rc; player.x = pad.x; player.y = pad.y;
+  player.cash = 1000;
+  for (const p of peds) if (p.cop) p.dead = true;
+  for (const c of cars) if (c.driver === 'cop') c.dead = true;
+  const w9 = mkPed(pad.x + 60, pad.y, { cop: true, hp: 200, patrol: true, shirt: 0x20306a });
+  attachPedMesh(w9); peds.push(w9);
+  setWanted(2);
+  pad.cool = 0;
+  updPads(0.1);
+  const heatSeen = heat;
+  w9.dead = true;
+  setWanted(2);
+  pad.cool = 0;
+  updPads(0.1);
+  const heatHidden = heat;
+  console.log('RSPRDBG seenKeepsHeat=' + (heatSeen === 2) + ' hiddenClears=' + (heatHidden === 0) + ' paidTwice=' + (player.cash === 600));
+}
+if (location.hash === '#heat6') {
+  // star 6 soft gate: above 5 the meter fills at half rate
+  startGame();
+  heat = 3; addHeat(1);
+  const below = heat === 4;
+  heat = 5; addHeat(1);
+  const gated = stars() === 5 && Math.abs(heat - 5.55) < 0.01;
+  addHeat(1);
+  const reached = stars() === 6;
+  console.log('HEAT6DBG belowUnchanged=' + below + ' gatedAt5=' + gated + ' stillReachable=' + reached);
+}
+if (location.hash === '#jump') {
+  startGame();
+  pressed.add('Space');
+  update(1 / 60);
+  const airborne = player.jumpH > 0;
+  let maxH = 0, maxMeshY = 0;
+  for (let i = 0; i < 80; i++) {
+    update(1 / 60);
+    syncScene(1 / 60);
+    maxH = Math.max(maxH, player.jumpH);
+    maxMeshY = Math.max(maxMeshY, player.mesh.position.y);
+  }
+  console.log('JMPDBG airborne=' + airborne + ' apex=' + maxH.toFixed(2) + ' ok=' + (maxH > 0.9) + ' meshRose=' + (maxMeshY > 0.8) + ' landed=' + (player.jumpH === 0));
+}
+if (location.hash === '#aim') {
+  // shots converge on the sight ray: at the ray's ground point the bullet
+  // is AT the ground, not a body-length under it (the old parallel error)
+  startGame();
+  runConsole('shut up and take my money');
+  player.weapon = 'pistol';
+  const spd = WEAPONS.pistol.spd;
+  mousePitch = 0.18;
+  aimTarget = null; player.fireT = 0;
+  fireWeapon();
+  const b = bullets[bullets.length - 1];
+  const dG = (3.2 - 0.2) / (Math.tan(0.18) * RS);
+  const hEnd = 1.9 + b.vh * (dG / spd);
+  const hOld = 1.9 - Math.tan(0.18) * dG * RS;
+  mousePitch = -0.3; player.fireT = 0;
+  fireWeapon();
+  const b2 = bullets[bullets.length - 1];
+  console.log('AIMDBG hAtCrosshair=' + hEnd.toFixed(2) + ' ok=' + (Math.abs(hEnd - 0.2) < 0.06) + ' (old parallel aim landed at ' + hOld.toFixed(2) + ') upShotClimbs=' + (b2.vh > 0));
+}
+if (location.hash === '#cannon45') {
+  startGame();
+  const t9 = mkCar(player.x + 300, player.y, 0, 'tank', null);
+  attachCarMesh(t9); cars.push(t9);
+  fireShell(t9, 0, 0.785);
+  const s1 = shells[shells.length - 1];
+  fireShell(t9, Math.PI / 2);
+  const s2 = shells[shells.length - 1];
+  let maxH1 = 0, maxH2 = 0;
+  const x0 = s1.x, y0 = s1.y;
+  for (let i = 0; i < 300 && !(s1.done && s2.done); i++) {
+    updShells(1 / 60);
+    if (!s1.done) maxH1 = Math.max(maxH1, s1.h);
+    if (!s2.done) maxH2 = Math.max(maxH2, s2.h);
+  }
+  const range = Math.round(dist(s1.x, s1.y, x0, y0));
+  console.log('C45DBG lobApex=' + maxH1.toFixed(1) + ' ok=' + (maxH1 > 40) + ' range=' + range + ' far=' + (range > 700) + ' flatShellStaysFlat=' + (maxH2 < 4));
+}
+if (location.hash === '#camfree') {
+  startGame();
+  const fc = mkCar(player.x, player.y, 0, 'sedan', 'player');
+  fc.keep = true;
+  attachCarMesh(fc); cars.push(fc);
+  player.car = fc;
+  lastMouseMove = performance.now() - 5000;
+  mouseYaw = 2.5;
+  fc.speed = 0;
+  for (let i = 0; i < 40; i++) { fc.speed = 0; update(1 / 60); }
+  const parkedFree = Math.abs(mouseYaw - 2.5) < 0.02;
+  for (let i = 0; i < 90; i++) { fc.speed = 60; update(1 / 60); }
+  const homes = Math.abs(angDiff(mouseYaw, fc.angle)) < 1.0;
+  console.log('CAMDBG parkedFree=' + parkedFree + ' yawAfterParked=' + mouseYaw.toFixed(2) + ' rollingHomes=' + homes);
+}
+if (location.hash === '#cheatmark') {
+  startGame();
+  runConsole('save 4');
+  const clean4 = !JSON.parse(localStorage.getItem('gta3_save_4')).cheated;
+  runConsole('medic');
+  runConsole('save 5');
+  const marked5 = !!JSON.parse(localStorage.getItem('gta3_save_5')).cheated;
+  const sum5 = saveSummary(5), sum4 = saveSummary(4);
+  runConsole('load 4');
+  const loadClears = !cheated;
+  runConsole('load 5');
+  const loadCarries = cheated;
+  console.log('CHEATMARKDBG clean4=' + clean4 + ' marked5=' + marked5 + ' listShowsMark=' + sum5.includes('CHEATED') + ' cleanListStaysClean=' + !sum4.includes('CHEATED') + ' loadClears=' + loadClears + ' loadCarries=' + loadCarries);
+}
+if (location.hash === '#forbidden') {
+  // swim to locked soil -> instant 6, pinned; die there -> wake on home
+  // turf clean; on unlocked ground the meter fades like normal
+  startGame();
+  player.x = hospitals[1].x; player.y = hospitals[1].y;   // no bridges open at job 0
+  update(1 / 60);
+  const slam6 = stars() === 6;
+  wantedClearT = 0.01;
+  for (let i = 0; i < 120; i++) update(1 / 60);
+  const pinned = stars() === 6;
+  godMode = false;
+  hurtPlayer(500);
+  overT = 0.01;
+  for (let i = 0; i < 30; i++) update(1 / 60);
+  const respawnUnlocked = islandOfPx(player.x, player.y) === 0 && state === 'play';
+  const cleanAfterDeath = stars() === 0;
+  setWanted(2);
+  wantedClearT = 0.01;
+  let fades = false;
+  for (let i = 0; i < 600 && !fades; i++) { update(1 / 60); if (stars() < 2) fades = true; }
+  console.log('FORBDBG slam6=' + slam6 + ' pinned=' + pinned + ' respawnUnlocked=' + respawnUnlocked + ' cleanAfterDeath=' + cleanAfterDeath + ' fadesOnHomeTurf=' + fades);
+}
+if (location.hash === '#tank5') {
+  // parked-tank theft: exactly 5 stars even with prior mayhem, a 20s window
+  // where 6 cannot land, then normal escalation resumes
+  startGame();
+  heat = 5.7;
+  const t9 = mkCar(player.x + 40, player.y, 0, 'tank', null);
+  attachCarMesh(t9); cars.push(t9);
+  enterCar(t9);
+  const atFive = stars() === 5 && heat === 5;
+  addHeat(2);
+  const graceHolds = stars() === 5;
+  tankGraceT = 0;
+  addHeat(2);
+  const canStillEarnSix = stars() === 6;
+  console.log('TANK5DBG atFive=' + atFive + ' graceHolds=' + graceHolds + ' sixAfterGrace=' + canStillEarnSix);
 }
 if (location.hash === '#pause') {
   startGame();
@@ -8874,6 +9824,22 @@ if (location.hash === '#cheat') {
   addHeat(4);
   console.log('PARDONDBG immune=' + pardonHeld + ' revoked=' + (stars() === 4));
   heat = 0; wantedClearT = 0;
+  // setjob / "i suck at games times 9000: N" — level jump, live game only
+  missionsDone = 12;
+  runConsole('setjob 8');
+  const j1 = missionsDone === 7;
+  runConsole('save 3');
+  let savedJob = -1;
+  try { savedJob = JSON.parse(localStorage.getItem('gta3_save_3')).missionsDone; } catch (e) {}
+  runConsole('i suck at games times 9000: 12');
+  const j2 = missionsDone === 11;
+  runConsole('setjob 99');                   // out of range — must not move
+  const j3 = missionsDone === 11;
+  const st0 = state; state = 'menu';
+  runConsole('setjob 5');                    // gate: no live game, no jump
+  const j4 = missionsDone === 11;
+  state = st0;
+  console.log('JOBDBG setjob=' + j1 + ' savedJob=' + savedJob + ' phrase=' + j2 + ' rejectRange=' + j3 + ' gateMenu=' + j4 + ' bridge0=' + bridgesOpen[0] + ' bridge1closed=' + !bridgesOpen[1]);
   setWanted(3);                              // so the HUD countdown is visible in this view
   paused = true;
   syncConsole();

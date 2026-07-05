@@ -69,8 +69,12 @@ window.addEventListener('keydown', e => {
   if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
   if (!keys[e.code]) pressed.add(e.code);
   keys[e.code] = true;
+  if (e.code === 'KeyQ' && !e.repeat) openWheel('key');
 });
-window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('keyup', e => {
+  keys[e.code] = false;
+  if (e.code === 'KeyQ' && wheelSrc === 'key') closeWheel(true);
+});
 window.addEventListener('mousedown', e => {
   if (e.target === consoleEl) return;       // typing/clicking the console is not gameplay
   if (e.button !== 0) {
@@ -82,6 +86,7 @@ window.addEventListener('mousedown', e => {
     }
     return;
   }
+  if (wheelOpen) { closeWheel(true); return; }   // click a wheel segment to load it
   mdown = true;
   onClick();
 });
@@ -308,8 +313,16 @@ function pollPad(dt) {
     edge(M.interact, 'KeyE');
     edge(M.pause, 'KeyP');
     edge(M.radio, 'KeyR');
-    // in a tank LB is the cannon, not the weapon wheel
-    if (!(player.car && player.car.kind === 'tank')) edge(M.weapNext, 'KeyQ');
+    // weapon WHEEL on the pad: HOLD weapNext to open, right stick aims the
+    // selector, release to load (in a tank LB is the cannon, so no wheel)
+    if (!player.car) {
+      const held = rawBtn(M.weapNext);
+      if (held && !padPrev[M.weapNext]) openWheel('pad');
+      if (wheelOpen && wheelSrc === 'pad') {
+        if (!held) closeWheel(true);
+        else if (Math.hypot(cx2, cy2) > 0.35) wheelSel = wheelSelFromAngle(Math.atan2(cy2, cx2));
+      }
+    }
     edge(M.dialog, 'Enter');
     edge(8, 'KeyO');                           // Back/Share opens controller settings
   }
@@ -365,6 +378,13 @@ document.addEventListener('pointerlockchange', () => {
   ptrLocked = document.pointerLockElement !== null;
 });
 window.addEventListener('mousemove', e => {
+  if (wheelOpen) {
+    wheelPX += (e.movementX || 0); wheelPY += (e.movementY || 0);
+    const r = Math.hypot(wheelPX, wheelPY), R = 130;
+    if (r > R) { wheelPX *= R / r; wheelPY *= R / r; }
+    if (r > 22) wheelSel = wheelSelFromAngle(Math.atan2(wheelPY, wheelPX));
+    return;
+  }
   if (!ptrLocked) return;
   mouseYaw += (e.movementX || 0) * 0.0032;
   mousePitch = clamp(mousePitch + (e.movementY || 0) * 0.0022, -1.45, 1.45);   // near-vertical both ways
@@ -1134,7 +1154,8 @@ function updRadio() {
 }
 
 // ---------------------------------------------------------------- city map (two islands)
-const TILE = 48, GRID_W = 140, GRID_H = 144;   // rows 96+ = the southern water + Capitol Shores
+const TILE = 48, GRID_W = 140, GRID_H = 184;   // rows 96+ = strait + Capitol Shores; 150+ = the MILITARY ISLAND (SW)
+const FLOOR_H = 5.0;   // one story in render units — the 3.54-unit human is ~0.7 of a floor (every window = a story)
 const WORLD_W = TILE * GRID_W, WORLD_H = TILE * GRID_H;
 const T_ROAD = 0, T_SIDE = 1, T_GRASS = 2, T_WATER = 3, T_LOT = 4, T_BLD = 5;
 const tiles = new Uint8Array(GRID_W * GRID_H);
@@ -1149,8 +1170,15 @@ function rowBase(j) { return ROADROW_BASES.includes(j) ? j : (ROADROW_BASES.incl
 function isRoadColIdx(i) { return colBase(i) >= 0; }
 function isRoadRowIdx(j) { return rowBase(j) >= 0; }
 function islandOfTile(ix) { if (ix >= 2 && ix <= 57) return 0; if (ix >= 82 && ix <= 137) return 1; return -1; }
+const MIL = { x0: 2, y0: 150, x1: 45, y1: 181, bcol: 22, bwid: 2, by0: 142, by1: 150 };   // military island + entry bridge
+let milArmed = false;                         // the bridge trap is live
+const milFence = [];                          // barbwire segments {x0,y0,x1,y1} in px — they HURT
 // island 3 (Capitol Shores) is the full-width southern landmass — split by ROW
-function islandAt(ix, iy) { return iy >= 108 ? (ix >= 2 && ix <= 137 ? 2 : -1) : islandOfTile(ix); }
+function islandAt(ix, iy) {
+  if (iy >= MIL.y0) return (ix >= MIL.x0 && ix <= MIL.x1) ? 3 : -1;   // the military base
+  if (iy >= 108) return (ix >= 2 && ix <= 137) ? 2 : -1;             // Capitol Shores
+  return islandOfTile(ix);
+}
 function islandOfPx(x, y) { return islandAt(Math.floor(x / TILE), Math.floor((y === undefined ? 0 : y) / TILE)); }
 function idx(ix, iy) { return iy * GRID_W + ix; }
 function inGrid(ix, iy) { return ix >= 0 && iy >= 0 && ix < GRID_W && iy < GRID_H; }
@@ -1158,7 +1186,12 @@ function tileAt(ix, iy) { return inGrid(ix, iy) ? tiles[idx(ix, iy)] : T_WATER; 
 function solidAtPx(x, y) {
   const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
   if (!inGrid(ix, iy)) return true;
-  return solid[idx(ix, iy)] === 1;
+  if (solid[idx(ix, iy)] === 1) return true;
+  for (const b of blockers) {
+    const dx = x - b.x, dy = y - b.y;
+    if (dx * dx + dy * dy < b.r * b.r) return true;   // inside the circular footprint
+  }
+  return false;
 }
 // camera-only solidity: water blocks cars, not sightlines
 function solidCamAt(x, y) {
@@ -1173,11 +1206,16 @@ function depthAtPx(x, y) {
 function isBridge(ix, iy) {
   if ((iy === 28 || iy === 29 || iy === 64 || iy === 65) && ix >= 54 && ix <= 83) return true;
   // the two southern causeways down to Capitol Shores (approach + span)
-  return ((ix === 28 || ix === 29) || (ix === 108 || ix === 109)) && iy >= 90 && iy <= 109;
+  if (((ix === 28 || ix === 29) || (ix === 108 || ix === 109)) && iy >= 90 && iy <= 109) return true;
+  // the MILITARY ENTRY BRIDGE: south off Capitol Shores into the base
+  return (ix >= MIL.bcol && ix < MIL.bcol + MIL.bwid) && iy >= MIL.by0 && iy <= MIL.by1;
 }
 const buildings = [], trees = [], pickups = [], phones = [], lamps = [], pads = [], gunShops = [], foodCarts = [];
 const crosswalks = [];   // corner crossing points: { x, y, to: [far corners] }
 const props = { cranes: [], tanks: [], stacks: [], conts: [], bills: [], masts: [], ponds: [], gas: [], steeples: [], signs: [], tcranes: [], ships: [], churches: [] };
+// round obstacles collide by their REAL radius, not a square tile block —
+// the mesh is the only contact point, no phantom walls at the corners
+const blockers = [];
 let stadiumPos = null, policeStation = null, DISTRICT_MAP = null;
 let policePads = [];
 // story landmarks: your home, the new hideout, Jason, the Ledger press
@@ -1199,6 +1237,7 @@ function anyBridgeOpen() { return bridgesOpen[0] || bridgesOpen[1]; }
 function islandUnlocked(isl) {
   if (isl === 1) return bridgesOpen[0] || bridgesOpen[1];
   if (isl === 2) return bridgesOpen[2] || bridgesOpen[3];
+  if (isl === 3) return false;               // the military base is NEVER friendly soil
   return true;                               // island 0 — home soil
 }
 
@@ -1231,6 +1270,12 @@ function genCity() {
         const roadR = isRoadRowIdx(iy) && iy >= 110 && ix >= 4 && ix <= 133;
         t = (roadC || roadR) ? T_ROAD : T_GRASS;
       }
+      // the MILITARY ISLAND (SW of Capitol Shores) — a fenced base, its own grid
+      if (iy >= MIL.y0 && iy <= MIL.y1 && ix >= MIL.x0 && ix <= MIL.x1) {
+        const roadC = isRoadColIdx(ix) && iy >= MIL.y0 + 2 && iy <= MIL.y1 - 2;
+        const roadR = isRoadRowIdx(iy) && ix >= MIL.x0 + 2 && ix <= MIL.x1 - 2;
+        t = (roadC || roadR) ? T_ROAD : T_GRASS;
+      }
       if (isBridge(ix, iy)) t = T_ROAD;
       tiles[idx(ix, iy)] = t;
       if (t === T_WATER) solid[idx(ix, iy)] = 1;
@@ -1251,6 +1296,7 @@ function genCity() {
   // industry, working docks; Nuvola Heights = commercial blocks, glass
   // tower core, central park, stadium.
   const BRICK_TINTS = [0x6a3428, 0x57291f, 0x7a3b2e, 0x4e2c22, 0x6e4030];
+  const WOOD_TINTS = [0x7a6242, 0x6b5638, 0x836a48, 0x5e4d34, 0x8a7050];
   const CONC_TINTS = [0x4a4d55, 0x565a63, 0x43464e, 0x5c5f68];
   const GLASS_TINTS = [0x16324f, 0x0d1b2a, 0x1c3a58, 0x122840];
   const DISTRICT = {
@@ -1348,11 +1394,13 @@ function genCity() {
         markSolidRect(x0, y0, 5, 3);
         buildings.push({ tx: x0, ty: y0, tw: 5, th: 3, floors: 2, tint: choice(CONC_TINTS), tex: 'conc', store: false, wt: false, bill: false, crown: false });
         for (const [rx, ry] of [[x0 + 5, y0 + 4], [x0 + 1, y0 + 5]]) {
-          markSolidRect(rx, ry, 2, 2);
-          props.tanks.push({ x: (rx + 1) * TILE, y: (ry + 1) * TILE });
+          const tkx = (rx + 1) * TILE, tky = (ry + 1) * TILE;
+          blockers.push({ x: tkx, y: tky, r: 34 });      // fuel tank: 30px cylinder + skin
+          props.tanks.push({ x: tkx, y: tky });
         }
-        markSolidRect(x0 + 7, y0, 1, 1);
-        props.stacks.push({ x: (x0 + 7.5) * TILE, y: (y0 + 0.5) * TILE });
+        const skx = (x0 + 7.5) * TILE, sky = (y0 + 0.5) * TILE;
+        blockers.push({ x: skx, y: sky, r: 14 });         // smokestack: ~10px pole + skin
+        props.stacks.push({ x: skx, y: sky });
       } else if (kind === 'docks') {
         paveAll(x0, y0);
         markSolidRect(x0, y0, 8, 2);
@@ -1390,7 +1438,7 @@ function genCity() {
           for (const dy of [0, 3, 6]) {
             if (rng() < 0.2) continue;
             markSolidRect(x0 + dx, y0 + dy, 2, 2);
-            buildings.push({ tx: x0 + dx, ty: y0 + dy, tw: 2, th: 2, floors: 2, tint: choice(BRICK_TINTS), tex: 'brick', roof: true });
+            buildings.push({ tx: x0 + dx, ty: y0 + dy, tw: 2, th: 2, floors: 2, tint: choice(WOOD_TINTS), tex: 'wood', roof: true });
           }
       } else if (kind === 'police' || kind === 'hospital') {
         paveAll(x0, y0);
@@ -1477,7 +1525,7 @@ function genCity() {
           tint: 0xb8b2a2, tex: 'conc', store: false, wt: false, bill: false, crown: false, sign: 'capitol'
         });
         capitolPos = { x: (x0 + 4) * TILE, y: (y0 + 4) * TILE };
-        props.capitol = { x: (x0 + 4) * TILE, y: (y0 + 4) * TILE, h: 4 * 3.2 };
+        props.capitol = { x: (x0 + 4) * TILE, y: (y0 + 4) * TILE, h: 4 * FLOOR_H };
       }
     }
   }
@@ -1599,7 +1647,7 @@ function genCity() {
   for (const [ax, ay] of [[30, 18], [94, 42], [118, 84]]) foodCarts.push(Object.assign(findSidewalkNear(ax, ay), { hintT: 0 }));
   // rooftop height field — what the chopper must fly over (or into)
   for (const b of buildings) {
-    const h = b.floors * 3.2 + (b.crown ? 12 : 0);
+    const h = b.floors * FLOOR_H + (b.crown ? 12 : 0);
     for (let iy = b.ty; iy < b.ty + b.th; iy++)
       for (let ix = b.tx; ix < b.tx + b.tw; ix++)
         heightMap[idx(ix, iy)] = Math.max(heightMap[idx(ix, iy)], h);
@@ -1689,6 +1737,21 @@ function genCity() {
   // the hideout garage: a clear lot pad by the safehouse
   garagePad = findTileNear(32, 62, T_LOT);
   armyBase = findTileNear(112, 66, T_LOT);
+  // ---- the MILITARY BASE perimeter: barbwire fence, solid, and it HURTS.
+  const fx0 = MIL.x0 * TILE, fy0 = MIL.y0 * TILE, fx1 = (MIL.x1 + 1) * TILE, fy1 = (MIL.y1 + 1) * TILE;
+  const gapL = MIL.bcol * TILE, gapR = (MIL.bcol + MIL.bwid) * TILE;
+  milFence.push({ x0: fx0, y0: fy0, x1: gapL, y1: fy0 }, { x0: gapR, y0: fy0, x1: fx1, y1: fy0 });
+  milFence.push({ x0: fx0, y0: fy1, x1: fx1, y1: fy1 });
+  milFence.push({ x0: fx0, y0: fy0, x1: fx0, y1: fy1 });
+  milFence.push({ x0: fx1, y0: fy0, x1: fx1, y1: fy1 });
+  for (let iy = MIL.y0; iy <= MIL.y1; iy++) for (const ix of [MIL.x0, MIL.x1])
+    if (!(ix >= MIL.bcol && ix < MIL.bcol + MIL.bwid)) solid[idx(ix, iy)] = 1;
+  for (let ix = MIL.x0; ix <= MIL.x1; ix++) for (const iy of [MIL.y0, MIL.y1])
+    if (!(iy === MIL.y0 && ix >= MIL.bcol && ix < MIL.bcol + MIL.bwid)) solid[idx(ix, iy)] = 1;
+  for (const [hx, hy] of [[MIL.x0 + 6, MIL.y0 + 6], [MIL.x1 - 12, MIL.y0 + 18]]) {
+    for (let iy = hy; iy < hy + 4; iy++) for (let ix = hx; ix < hx + 8; ix++) solid[idx(ix, iy)] = 1;
+    buildings.push({ tx: hx, ty: hy, tw: 8, th: 4, floors: 2, tint: 0x3d4636, tex: 'conc', store: false, wt: false, bill: false, crown: false });
+  }
   // all four crossings barricaded until missions open them (jobs 3 / 17 / 20)
   setBarrier(0, true);
   setBarrier(1, true);
@@ -1714,6 +1777,7 @@ function zoneOf(x, y) {
     if (iy >= 90 && iy <= 109 && (ix === 28 || ix === 29 || ix === 108 || ix === 109)) return 'THE CAUSEWAY';
   }
   const isl = islandOfPx(x, y);
+  if (isl === 3) return 'RESTRICTED — MILITARY';
   if (isl === 0) return 'OLD PORT';
   if (isl === 1) return 'NUVOLA HEIGHTS';
   if (isl === 2) return 'CAPITOL SHORES';
@@ -1799,6 +1863,24 @@ const WEAPONS = {
   rpg: { name: 'ROCKETS', rate: 1.2, rocket: true }
 };
 const WORDER = ['fist', 'pistol', 'uzi', 'shotgun', 'flame', 'grenade', 'rpg'];
+// ---- weapon selection WHEEL: hold Q / pad weapon button to open ----
+let wheelOpen = false, wheelSel = 0, wheelSrc = null, wheelPX = 0, wheelPY = 0;
+function wheelSelFromAngle(ang) {
+  let a = ang + Math.PI / 2;                 // segment 0 sits at the top
+  a = ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+  return Math.round(a / (2 * Math.PI / WORDER.length)) % WORDER.length;
+}
+function openWheel(srcKind) {
+  if (wheelOpen || state !== 'play' || paused || shopOpen || saveHouseOpen || modShopOpen || priestOpen || player.car) return;
+  wheelOpen = true; wheelSrc = srcKind; wheelPX = 0; wheelPY = 0;
+  wheelSel = Math.max(0, WORDER.indexOf(player.weapon));
+  sfx('enter');
+}
+function closeWheel(commit) {
+  if (!wheelOpen) return;
+  if (commit && wheelSel >= 0 && wheelSel < WORDER.length) { player.weapon = WORDER[wheelSel]; sfx('pickup'); }
+  wheelOpen = false; wheelSrc = null;
+}
 const player = {
   x: 0, y: 0, angle: 0, hp: 100, armor: 0, cash: 0, car: null, weapon: 'fist',
   ammo: { pistol: 0, uzi: 0, shotgun: 0, flame: 0, grenade: 0, rpg: 0 }, fireT: 0, hurtT: 0, dead: false, mesh: null, aimHold: 0, rag: null
@@ -1878,8 +1960,8 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-scene.add(new THREE.HemisphereLight(0x3a4670, 0x16161e, 1.45));
-const moonLight = new THREE.DirectionalLight(0x8090c0, 0.8);
+scene.add(new THREE.HemisphereLight(0x46527e, 0x1b1b24, 1.75));   // brighter sky fill — the city reads
+const moonLight = new THREE.DirectionalLight(0x9aa6d0, 1.05);
 moonLight.position.set(120, 200, 60);
 scene.add(moonLight);
 { // moon + stars
@@ -1953,6 +2035,31 @@ scene.add(moonLight);
   g.computeVertexNormals();
   scene.add(new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true })));
 }
+// military perimeter fence: posts, chain-link haze, and a barbwire coil
+{
+  const T = TILE * RS;
+  const postMat = new THREE.MeshLambertMaterial({ color: 0x3a3e42 });
+  const meshMat = new THREE.MeshLambertMaterial({ color: 0x6a7076, transparent: true, opacity: 0.28, side: THREE.DoubleSide });
+  const wireMat = new THREE.MeshBasicMaterial({ color: 0xb0b4b8, wireframe: true });
+  const postGeo = new THREE.CylinderGeometry(0.09, 0.09, 3.0, 5);
+  for (const seg of milFence) {
+    const ax = seg.x0 * RS, az = seg.y0 * RS, bx = seg.x1 * RS, bz = seg.y1 * RS;
+    const len = Math.hypot(bx - ax, bz - az), ang = Math.atan2(bz - az, bx - ax);
+    const panel = new THREE.Mesh(new THREE.PlaneGeometry(len, 2.6), meshMat);
+    panel.position.set((ax + bx) / 2, 1.3, (az + bz) / 2);
+    panel.rotation.y = -ang;
+    scene.add(panel);
+    const coil = new THREE.Mesh(new THREE.TorusGeometry(0.35, 0.12, 4, Math.max(6, len | 0)), wireMat);
+    coil.position.set((ax + bx) / 2, 2.75, (az + bz) / 2);
+    coil.rotation.y = -ang; coil.scale.x = len / 0.7;
+    scene.add(coil);
+    for (let d = 0; d <= len; d += 3) {
+      const post = new THREE.Mesh(postGeo, postMat);
+      post.position.set(ax + Math.cos(ang) * d, 1.5, az + Math.sin(ang) * d);
+      scene.add(post);
+    }
+  }
+}
 // lane markings
 {
   const pos = [];
@@ -2014,8 +2121,8 @@ scene.add(moonLight);
     // a stripe from (x0,z0) to (x1,z1), half-width hw, laid flat on the lot
     const dx = x1 - x0, dz = z1 - z0, dl = Math.hypot(dx, dz) || 1;
     const px = -dz / dl * hw, pz = dx / dl * hw;
-    pos.push(x0 + px, 0.028, z0 + pz, x0 - px, 0.028, z0 - pz, x1 - px, 0.028, z1 - pz,
-             x0 + px, 0.028, z0 + pz, x1 - px, 0.028, z1 - pz, x1 + px, 0.028, z1 + pz);
+    pos.push(x0 + px, 0.05, z0 + pz, x0 - px, 0.05, z0 - pz, x1 - px, 0.05, z1 - pz,
+             x0 + px, 0.05, z0 + pz, x1 - px, 0.05, z1 - pz, x1 + px, 0.05, z1 + pz);
   };
   for (const sp of parkSpots) {
     const ax = Math.cos(sp.ang), az = Math.sin(sp.ang);        // bay axis (car noses this way)
@@ -2031,7 +2138,9 @@ scene.add(moonLight);
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  scene.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0x9aa0a6 })));
+  const plMesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xd2d6dc }));
+  plMesh.renderOrder = 1;                     // draw over the lot so lines always read
+  scene.add(plMesh);
   window._plines = { spots: parkSpots.length, verts: pos.length / 3 };
 }
 // bridge rails + pillars (two harbor crossings + two southern causeways)
@@ -2119,6 +2228,36 @@ function mkTex(w, h, draw) {
   tex.magFilter = THREE.NearestFilter;
   return tex;
 }
+function woodTexture() {
+  // horizontal clapboard siding: lapped planks with a shadow line under
+  // each, painted trim windows, a plank front door on the ground course
+  return mkTex(64, 64, g => {
+    const boards = ['#6a5236', '#5c4a30', '#71583a'];
+    g.fillStyle = boards[(Math.random() * boards.length) | 0]; g.fillRect(0, 0, 64, 64);
+    for (let y = 0; y < 64; y += 6) {
+      g.fillStyle = 'rgba(255,240,210,0.05)'; g.fillRect(0, y, 64, 1);        // plank highlight
+      g.fillStyle = 'rgba(0,0,0,0.28)'; g.fillRect(0, y + 5, 64, 1);          // lap shadow
+      for (let x = 4; x < 64; x += 21) { g.fillStyle = 'rgba(0,0,0,0.12)'; g.fillRect(x, y, 1, 6); }   // knots/seams
+    }
+    for (let wx = 0; wx < 3; wx++) {
+      const X = 6 + wx * 20, Y = 11, WH = 34;
+      g.fillStyle = '#d8cbb0'; g.fillRect(X - 3, Y - 3, 17, WH + 6);          // painted trim
+      const lit = Math.random() < 0.32;
+      if (lit) {
+        const gr = g.createLinearGradient(0, Y, 0, Y + WH);
+        gr.addColorStop(0, '#ffe6b0'); gr.addColorStop(0.6, '#e0ab5e'); gr.addColorStop(1, '#6a4a26');
+        g.fillStyle = gr; g.fillRect(X, Y, 11, WH);
+      } else {
+        const gr = g.createLinearGradient(X, Y, X + 11, Y + WH);
+        gr.addColorStop(0, '#3a4a5e'); gr.addColorStop(0.5, '#26323f'); gr.addColorStop(1, '#1a2028');
+        g.fillStyle = gr; g.fillRect(X, Y, 11, WH);
+        g.fillStyle = 'rgba(200,220,245,0.22)'; g.fillRect(X, Y, 11, 3);
+      }
+      g.strokeStyle = 'rgba(60,45,30,0.9)'; g.lineWidth = 1;
+      g.strokeRect(X + 5.5, Y, 0.5, WH); g.strokeRect(X, Y + WH / 2, 11, 0.5);
+    }
+  });
+}
 function brickTexture(fireEscape) {
   // one tile = half a building-tile wide x one floor tall
   return mkTex(64, 64, g => {
@@ -2127,36 +2266,27 @@ function brickTexture(fireEscape) {
     for (let y = 0; y < 64; y += 8) { g.beginPath(); g.moveTo(0, y + 0.5); g.lineTo(64, y + 0.5); g.stroke(); }
     for (let y = 0; y < 64; y += 8)
       for (let x = (y / 8) % 2 ? 8 : 0; x < 64; x += 16) { g.beginPath(); g.moveTo(x + 0.5, y); g.lineTo(x + 0.5, y + 8); g.stroke(); }
-    for (let wy = 0; wy < 2; wy++)
-      for (let wx = 0; wx < 3; wx++) {
-        const X = 5 + wx * 20, Y = 8 + wy * 30;
-        const lit = Math.random() < 0.3;
-        // frame + a real window ledge under the sill
-        g.fillStyle = '#4a423a'; g.fillRect(X - 1, Y - 1, 13, 19);
-        g.fillStyle = '#5c5346'; g.fillRect(X - 2, Y + 17, 15, 2);
-        if (lit) {
-          // an occupied room: lamp-lit ceiling fading to a dark floor,
-          // sometimes a furniture silhouette against the glass
-          const gr = g.createLinearGradient(0, Y, 0, Y + 17);
-          gr.addColorStop(0, '#ffe2a0');
-          gr.addColorStop(0.55, '#dfa75c');
-          gr.addColorStop(1, '#684826');
-          g.fillStyle = gr; g.fillRect(X, Y, 11, 17);
-          if (Math.random() < 0.6) {
-            g.fillStyle = 'rgba(28,16,8,0.8)';
-            g.fillRect(X + 1 + ((Math.random() * 6) | 0), Y + 9, 3, 8);
-          }
-          g.fillStyle = 'rgba(0,0,0,0.35)';
-          g.fillRect(X + 5, Y, 1, 17);
-          g.fillRect(X, Y + 8, 11, 1);
-        } else {
-          g.fillStyle = '#0e141c'; g.fillRect(X, Y, 11, 17);
-          g.fillStyle = 'rgba(120,140,170,0.13)'; g.fillRect(X, Y, 11, 5);   // sky in the glass
-          g.fillStyle = 'rgba(0,0,0,0.4)';
-          g.fillRect(X + 5, Y, 1, 17);
-          g.fillRect(X, Y + 8, 11, 1);
-        }
+    // ONE window row = ONE STORY. Sill sits low (waist), glazing fills the
+    // upper story, spandrel brick below — proportioned to a person.
+    for (let wx = 0; wx < 3; wx++) {
+      const X = 5 + wx * 20, Y = 9, WH = 38;
+      const lit = Math.random() < 0.32;
+      g.fillStyle = '#4a423a'; g.fillRect(X - 2, Y - 2, 15, WH + 4);       // frame
+      g.fillStyle = '#5c5346'; g.fillRect(X - 3, Y + WH, 17, 3);           // sill ledge
+      if (lit) {
+        const gr = g.createLinearGradient(0, Y, 0, Y + WH);
+        gr.addColorStop(0, '#ffe2a0'); gr.addColorStop(0.55, '#dfa75c'); gr.addColorStop(1, '#684826');
+        g.fillStyle = gr; g.fillRect(X, Y, 12, WH);
+        if (Math.random() < 0.6) { g.fillStyle = 'rgba(28,16,8,0.8)'; g.fillRect(X + 2 + ((Math.random() * 6) | 0), Y + WH * 0.45, 4, WH * 0.5); }
+      } else {
+        const gg2 = g.createLinearGradient(X, Y, X + 12, Y + WH);
+        gg2.addColorStop(0, '#4a5f78'); gg2.addColorStop(0.5, '#2b3a4c'); gg2.addColorStop(1, '#18222e');
+        g.fillStyle = gg2; g.fillRect(X, Y, 12, WH);
+        g.fillStyle = 'rgba(210,228,250,0.26)'; g.fillRect(X + 1, Y + 1, 4, WH - 3);
       }
+      g.fillStyle = 'rgba(0,0,0,0.4)';                                     // mullions
+      g.fillRect(X + 5.5, Y, 1, WH); g.fillRect(X, Y + WH / 2, 12, 1);
+    }
     if (fireEscape) {
       g.strokeStyle = '#1a1a1d';
       g.lineWidth = 2;
@@ -2172,33 +2302,27 @@ function glassTexture() {
   // 8 rows x 4 bays per tile; a few "late shift" floors are mostly lit
   return mkTex(64, 128, g => {
     g.fillStyle = '#0d1117'; g.fillRect(0, 0, 64, 128);
-    const hotRows = new Set();
-    while (hotRows.size < 3) hotRows.add((Math.random() * 8) | 0);
-    for (let r = 0; r < 8; r++)
-      for (let c2 = 0; c2 < 4; c2++) {
-        const lit = Math.random() < (hotRows.has(r) ? 0.7 : 0.22);
-        const X = 2 + c2 * 16, Y = 2 + r * 16;
-        if (lit) {
-          // an office with the lights on: bright ceiling, floor in shadow,
-          // sometimes a desk silhouette against the curtain wall
-          const m = Math.random();
-          const top = m < 0.7 ? '#cfe4ff' : (m < 0.9 ? '#ffd98a' : '#b8ffd0');
-          const gr = g.createLinearGradient(0, Y, 0, Y + 12);
-          gr.addColorStop(0, top);
-          gr.addColorStop(1, '#3a3e30');
-          g.fillStyle = gr;
-          g.fillRect(X, Y, 12, 12);
-          if (Math.random() < 0.5) {
-            g.fillStyle = 'rgba(10,10,16,0.75)';
-            g.fillRect(X + 2 + ((Math.random() * 5) | 0), Y + 6, 4, 6);
-          }
-        } else {
-          g.fillStyle = Math.random() < 0.1 ? '#1e2a3a' : '#16202e';
-          g.fillRect(X, Y, 12, 12);
-          g.fillStyle = 'rgba(160,180,210,0.08)';
-          g.fillRect(X, Y, 12, 4);
-        }
+    // one STORY: a horizontal band of 4 curtain-wall lights + a spandrel
+    g.fillStyle = '#0a0e14'; g.fillRect(0, 46, 64, 18);                    // spandrel panel below the glazing
+    for (let c2 = 0; c2 < 4; c2++) {
+      const X = 2 + c2 * 16, Y = 4, WH = 40;
+      const lit = Math.random() < 0.34;
+      if (lit) {
+        const m = Math.random();
+        const top = m < 0.7 ? '#cfe4ff' : (m < 0.9 ? '#ffd98a' : '#b8ffd0');
+        const gr = g.createLinearGradient(0, Y, 0, Y + WH);
+        gr.addColorStop(0, top); gr.addColorStop(1, '#3a3e30');
+        g.fillStyle = gr; g.fillRect(X, Y, 12, WH);
+        if (Math.random() < 0.5) { g.fillStyle = 'rgba(10,10,16,0.75)'; g.fillRect(X + 2 + ((Math.random() * 5) | 0), Y + WH * 0.5, 4, WH * 0.4); }
+      } else {
+        const gg4 = g.createLinearGradient(X, Y, X + 12, Y + WH);
+        gg4.addColorStop(0, '#3f5570'); gg4.addColorStop(0.5, '#223040'); gg4.addColorStop(1, '#141d29');
+        g.fillStyle = gg4; g.fillRect(X, Y, 12, WH);
+        g.fillStyle = 'rgba(180,205,235,0.16)'; g.fillRect(X, Y, 5, WH);
       }
+      g.fillStyle = 'rgba(0,0,0,0.35)'; g.fillRect(X + 5.5, Y, 1, WH);     // vertical mullion
+    }
+    g.fillStyle = 'rgba(0,0,0,0.4)'; g.fillRect(0, 44, 64, 2);            // floor slab line
   });
 }
 function concTexture() {
@@ -2206,59 +2330,50 @@ function concTexture() {
     g.fillStyle = '#33363e'; g.fillRect(0, 0, 64, 64);
     g.fillStyle = 'rgba(0,0,0,0.25)';
     g.fillRect(0, 60, 64, 4);
-    for (let wy = 0; wy < 2; wy++)
-      for (let wx = 0; wx < 3; wx++) {
-        const X = 5 + wx * 20, Y = 7 + wy * 30;
-        const lit = Math.random() < 0.25;
-        // frame + poured-concrete ledge
-        g.fillStyle = '#42454e'; g.fillRect(X - 1, Y - 1, 14, 18);
-        g.fillStyle = '#565963'; g.fillRect(X - 2, Y + 16, 16, 2);
-        if (lit) {
-          const gr = g.createLinearGradient(0, Y, 0, Y + 16);
-          gr.addColorStop(0, '#ffe4a4');
-          gr.addColorStop(0.6, '#d9a054');
-          gr.addColorStop(1, '#5e4222');
-          g.fillStyle = gr; g.fillRect(X, Y, 12, 16);
-          if (Math.random() < 0.5) {
-            g.fillStyle = 'rgba(20,14,8,0.75)';
-            g.fillRect(X + 2 + ((Math.random() * 6) | 0), Y + 8, 4, 8);
-          }
-          g.fillStyle = 'rgba(0,0,0,0.3)';
-          g.fillRect(X + 6, Y, 1, 16);
-        } else {
-          g.fillStyle = '#1c2026'; g.fillRect(X, Y, 12, 16);
-          g.fillStyle = 'rgba(120,140,170,0.12)'; g.fillRect(X, Y, 12, 5);
-          g.fillStyle = 'rgba(0,0,0,0.35)';
-          g.fillRect(X + 6, Y, 1, 16);
-        }
+    // TWO broad windows per tile — wide panes, not vertical slits
+    for (let wx = 0; wx < 2; wx++) {
+      const X = 6 + wx * 30, Y = 10, WH = 38, WW = 22;
+      const lit = Math.random() < 0.28;
+      g.fillStyle = '#42454e'; g.fillRect(X - 2, Y - 2, WW + 4, WH + 4);
+      g.fillStyle = '#565963'; g.fillRect(X - 3, Y + WH, WW + 6, 3);        // poured ledge
+      if (lit) {
+        const gr = g.createLinearGradient(0, Y, 0, Y + WH);
+        gr.addColorStop(0, '#ffe4a4'); gr.addColorStop(0.6, '#d9a054'); gr.addColorStop(1, '#5e4222');
+        g.fillStyle = gr; g.fillRect(X, Y, WW, WH);
+        if (Math.random() < 0.5) { g.fillStyle = 'rgba(20,14,8,0.75)'; g.fillRect(X + 5 + ((Math.random() * 8) | 0), Y + WH * 0.45, 5, WH * 0.5); }
+      } else {
+        const gg3 = g.createLinearGradient(X, Y, X + WW, Y + WH);
+        gg3.addColorStop(0, '#46596f'); gg3.addColorStop(0.5, '#28343f'); gg3.addColorStop(1, '#171f28');
+        g.fillStyle = gg3; g.fillRect(X, Y, WW, WH);
+        g.fillStyle = 'rgba(205,224,248,0.24)'; g.fillRect(X + 1, Y + 1, 6, WH - 3);
       }
+      g.fillStyle = 'rgba(0,0,0,0.32)'; g.fillRect(X + WW / 2, Y, 1, WH); g.fillRect(X, Y + WH / 2, WW, 1);
+    }
   });
 }
 function storeTexture() {
-  // ground-floor band: 8 narrow human-scale storefronts per texture —
-  // awning, glowing window with sill and mullion, door slot, light spill
+  // ground-floor band: 3 BROAD shopfronts per texture — wide plate-glass
+  // window with a couple of mullions, an awning, and a door beside it
   return mkTex(256, 64, g => {
     g.fillStyle = '#2a2a2e'; g.fillRect(0, 0, 256, 64);
-    const aw = [['#7a1f1f', '#d8cfc0'], ['#1f4e6b', '#d8cfc0'], ['#3f6b2a', '#e8e0c8'], ['#6b4a1f', '#d8cfc0']];
-    for (let s = 0; s < 8; s++) {
-      const x = s * 32, [c1, c2] = aw[s % 4];
-      for (let i = 0; i < 4; i++) { g.fillStyle = i % 2 ? c2 : c1; g.fillRect(x + 2 + i * 7, 4, 7, 9); }
-      g.fillStyle = '#0e0f14';
-      g.fillRect(x + 2, 13, 20, 3);
-      g.fillStyle = '#ffe9b0';
-      g.fillRect(x + 3, 18, 18, 32);
-      g.fillStyle = 'rgba(0,0,0,0.4)';
-      g.fillRect(x + 11, 18, 2, 32);
-      g.fillRect(x + 3, 33, 18, 2);
-      g.fillStyle = '#4a4438';
-      g.fillRect(x + 2, 50, 20, 3);
-      g.fillStyle = '#15161c';
-      g.fillRect(x + 24, 14, 7, 42);
-      g.fillStyle = '#8a7a4a';
-      g.fillRect(x + 29, 34, 1, 5);
+    const aw = [['#7a1f1f', '#d8cfc0'], ['#1f4e6b', '#d8cfc0'], ['#3f6b2a', '#e8e0c8']];
+    const N = 3, BW = 256 / N;                 // ~85px per shop = a real storefront width
+    for (let s = 0; s < N; s++) {
+      const x = s * BW, [c1, c2] = aw[s % 3];
+      const winW = BW - 26;                    // wide plate glass
+      // striped awning across the bay
+      const stripes = 10;
+      for (let i = 0; i < stripes; i++) { g.fillStyle = i % 2 ? c2 : c1; g.fillRect(x + 2 + i * ((BW - 4) / stripes), 3, (BW - 4) / stripes + 1, 10); }
+      g.fillStyle = '#0e0f14'; g.fillRect(x + 2, 13, winW + 2, 3);          // header
+      g.fillStyle = '#ffe9b0'; g.fillRect(x + 3, 18, winW, 34);            // the big glowing window
+      g.fillStyle = 'rgba(0,0,0,0.35)';
+      for (let mx = x + 3 + winW / 3; mx < x + 3 + winW; mx += winW / 3) g.fillRect(mx, 18, 2, 34);   // slim mullions
+      g.fillRect(x + 3, 34, winW, 2);                                       // transom line
+      g.fillStyle = '#4a4438'; g.fillRect(x + 2, 52, winW + 2, 3);          // sill / bulkhead
+      g.fillStyle = '#15161c'; g.fillRect(x + BW - 21, 14, 18, 44);         // door
+      g.fillStyle = '#8a7a4a'; g.fillRect(x + BW - 7, 34, 2, 6);            // handle
     }
-    g.fillStyle = '#ffe9b0';
-    g.fillRect(0, 60, 256, 4);
+    g.fillStyle = '#ffe9b0'; g.fillRect(0, 60, 256, 4);                     // curb light spill
   });
 }
 function billTexture(bg, fg, l1, l2) {
@@ -2280,27 +2395,32 @@ function motelTexture() {
     g.fillStyle = '#b0a084'; g.fillRect(0, 0, 256, 64);
     g.fillStyle = 'rgba(0,0,0,0.18)'; g.fillRect(0, 0, 256, 4);
     g.fillStyle = 'rgba(255,255,255,0.12)'; g.fillRect(0, 58, 256, 6);   // walkway skirt
-    for (let s = 0; s < 4; s++) {
-      const x = s * 64;
-      // the room door: muted, darker than the wall, with a number plate
-      g.fillStyle = '#7a5f2e'; g.fillRect(x + 8, 22, 10, 40);
-      g.fillStyle = 'rgba(0,0,0,0.4)'; g.fillRect(x + 8, 22, 10, 2);
-      g.fillStyle = '#d8d0be'; g.fillRect(x + 10, 26, 6, 3);
-      // the big picture window: wide glass, dark unless someone's home
+    // THREE broad rooms per tile — wide door + wide picture window, no slits
+    for (let s = 0; s < 3; s++) {
+      const x = Math.floor(s * 256 / 3);
+      // the room door: 23px = ~2.14u = ~1.07m wide, 23px = ~4.13u = ~2.07m tall
+      // (a king mattress passes on edge). Sill at 0.72u; REAL 3D stoop
+      // meshes rise to it in the building pass.
+      g.fillStyle = '#7a5f2e'; g.fillRect(x + 5, 37, 23, 23);
+      g.fillStyle = 'rgba(0,0,0,0.4)'; g.fillRect(x + 5, 37, 23, 2);
+      g.fillStyle = 'rgba(0,0,0,0.25)'; g.fillRect(x + 5, 37, 2, 23); g.fillRect(x + 26, 37, 2, 23);
+      g.fillStyle = '#d8d0be'; g.fillRect(x + 10, 41, 12, 4);
+      g.fillStyle = '#c8b060'; g.fillRect(x + 23, 50, 2, 3);
+      // the big picture window: broad glass, dark unless someone's home
       const lit = Math.random() < 0.28;
-      g.fillStyle = '#847a64'; g.fillRect(x + 24, 18, 30, 36);   // frame
+      g.fillStyle = '#847a64'; g.fillRect(x + 34, 16, 46, 38);   // frame
       g.fillStyle = lit ? '#f0d090' : '#10151d';
-      g.fillRect(x + 26, 20, 26, 32);
+      g.fillRect(x + 37, 19, 40, 32);
       g.fillStyle = lit ? 'rgba(170,130,70,0.75)' : 'rgba(180,190,210,0.14)';
-      g.fillRect(x + 26, 20, 4, 32);
-      g.fillRect(x + 48, 20, 4, 32);
+      g.fillRect(x + 37, 19, 6, 32);
+      g.fillRect(x + 71, 19, 6, 32);
       g.fillStyle = 'rgba(0,0,0,0.35)';
-      g.fillRect(x + 38, 20, 2, 32);
-      if (!lit) { g.fillStyle = 'rgba(200,210,230,0.1)'; g.fillRect(x + 26, 20, 26, 9); }
+      g.fillRect(x + 56, 19, 2, 32);
+      if (!lit) { g.fillStyle = 'rgba(200,210,230,0.1)'; g.fillRect(x + 37, 19, 40, 10); }
       // AC grille under the window
-      g.fillStyle = '#6a6154'; g.fillRect(x + 29, 56, 20, 6);
+      g.fillStyle = '#6a6154'; g.fillRect(x + 44, 56, 26, 6);
       g.fillStyle = 'rgba(0,0,0,0.3)';
-      for (let gy = 57; gy < 61; gy += 2) g.fillRect(x + 30, gy, 18, 1);
+      for (let gy = 57; gy < 61; gy += 2) g.fillRect(x + 45, gy, 24, 1);
     }
   });
 }
@@ -2334,6 +2454,7 @@ function signTexture(bg, fg, text, cross) {
   });
 }
 const TEXS = {
+  wood: woodTexture(),
   brickA: brickTexture(false),
   brickB: brickTexture(true),
   glass: glassTexture(),
@@ -2348,6 +2469,7 @@ const TEXS = {
   ],
   signs: {
     police: signTexture('#1a3a6e', '#ffffff', 'POLICE', false),
+    office: signTexture('#0c0c10', '#ffd070', 'OFFICE', false),
     hospital: signTexture('#f0f0f0', '#202028', 'HOSPITAL', true),
     mall: signTexture('#6e1a4a', '#ffe9b0', 'NUVOLA MALL', false),
     motel: signTexture('#0c0c10', '#ff5090', 'MOTEL', false),
@@ -2361,6 +2483,7 @@ const TEXS = {
   }
 };
 const roofMat = new THREE.MeshLambertMaterial({ color: 0x181b22 });
+const parapetMat = new THREE.MeshLambertMaterial({ color: 0x2b2e36 });
 const roofSlopeMat = new THREE.MeshLambertMaterial({ color: 0x42302c });
 const pilasterMat = new THREE.MeshLambertMaterial({ color: 0x2a2c33 });
 const doorMat = new THREE.MeshLambertMaterial({ color: 0x1c150e });
@@ -2368,6 +2491,14 @@ const gableMat = new THREE.MeshLambertMaterial({ color: 0x54423a });   // painte
 const gableGeos = {};                                                  // shared per building width
 const wtTankMat = new THREE.MeshLambertMaterial({ color: 0x4a3828 });
 const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
+// walkable stoop tops (logic px rects, h in render units) — the character
+// actually gains height standing on motel steps
+const stoopRects = [];
+function stoopTopAt(px, py) {
+  let h = 0;
+  for (const r of stoopRects) if (px >= r.x0 && px <= r.x1 && py >= r.y0 && py <= r.y1 && r.h > h) h = r.h;
+  return h;
+}
 {
   const boxGeo = new THREE.BoxGeometry(1, 1, 1);
   const wtTankGeo = new THREE.CylinderGeometry(1.5, 1.5, 2.8, 10);
@@ -2375,28 +2506,77 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
   const wtLegGeo = new THREE.CylinderGeometry(0.08, 0.08, 2.2, 4);
   const CROWN_COLORS = [0xff3355, 0x33ddff, 0xffcc44];
   let crownIdx = 0;
+  const stoopMat = new THREE.MeshLambertMaterial({ color: 0x8f887e });
+  const stoopPlacements = [];
   const T2 = TILE * RS;
   for (const b of buildings) {
-    const W = b.tw * T2 - 0.6, D = b.th * T2 - 0.6, H = b.floors * 3.2;
+    const W = b.tw * T2 - 0.6, D = b.th * T2 - 0.6, H = b.floors * FLOOR_H;
     const cx = (b.tx + b.tw / 2) * T2, cz = (b.ty + b.th / 2) * T2;
     const base = b.tex === 'glass' ? TEXS.glass : b.tex === 'garage' ? TEXS.garage
-      : b.tex === 'motel' ? TEXS.motel
+      : b.tex === 'motel' ? TEXS.motel : b.tex === 'wood' ? TEXS.wood
       : b.tex === 'brick' ? (Math.random() < 0.5 ? TEXS.brickA : TEXS.brickB) : TEXS.conc;
     const tex = base.clone();
     tex.needsUpdate = true;
-    tex.repeat.set(Math.max(1, Math.round(b.tw * 2)), b.tex === 'glass' ? Math.max(1, Math.round(b.floors / 4)) : b.tex === 'motel' ? 1 : b.floors);
-    const wall = new THREE.MeshLambertMaterial({ color: b.tint, map: tex });
-    const mesh = new THREE.Mesh(boxGeo, [wall, wall, roofMat, roofMat, wall, wall]);
+    tex.repeat.set(Math.max(1, Math.round(b.tw * (b.tex === 'motel' ? 0.5 : 1.3))), b.tex === 'motel' ? 1 : b.floors);   // vertical repeat = FLOORS: every window is a story; motel = broad rooms
+    // emissiveMap = the wall texture: lit-window pixels GLOW at night, dark
+    // wall stays dark — the city reads without washing everything out
+    const wall = new THREE.MeshLambertMaterial({ color: b.tint, map: tex, emissive: 0xffffff, emissiveMap: tex, emissiveIntensity: b.tex === 'glass' ? 0.55 : 0.42 });
+    // motel side faces span th tiles, not tw — give them their own repeat so
+    // rooms keep real-world width on every face (doors rendered 2x wide on sides)
+    let wallX = wall;
+    if (b.tex === 'motel' && b.th !== b.tw) {
+      const texX = base.clone();
+      texX.needsUpdate = true;
+      texX.repeat.set(Math.max(1, Math.round(b.th * 0.5)), 1);
+      wallX = new THREE.MeshLambertMaterial({ color: b.tint, map: texX, emissive: 0xffffff, emissiveMap: texX, emissiveIntensity: 0.42 });
+    }
+    const mesh = new THREE.Mesh(boxGeo, [wallX, wallX, roofMat, roofMat, wall, wall]);
     mesh.scale.set(W, H, D);
     mesh.position.set(cx, H / 2, cz);
     scene.add(mesh);
+    if (b.tex === 'motel') {
+      // REAL two-tier concrete stoops under every painted door (0.36u risers,
+      // top at the 0.72u door sill). Skipped where the face abuts another
+      // building. Walk-over height — no blocker, same as a curb.
+      const addStoop = (px, pz, alongX, dir) => {
+        const ix = Math.floor((alongX ? px : px + dir * 0.7) / T2), iy = Math.floor((alongX ? pz + dir * 0.7 : pz) / T2);
+        if (tileAt(ix, iy) === T_BLD) return;
+        if (alongX) {
+          stoopPlacements.push({ x: px, y: 0.18, z: pz + dir * 0.72, sx: 3.1, sy: 0.36, sz: 1.5 });
+          stoopPlacements.push({ x: px, y: 0.54, z: pz + dir * 0.4, sx: 2.7, sy: 0.36, sz: 0.85 });
+        } else {
+          stoopPlacements.push({ x: px + dir * 0.72, y: 0.18, z: pz, sx: 1.5, sy: 0.36, sz: 3.1 });
+          stoopPlacements.push({ x: px + dir * 0.4, y: 0.54, z: pz, sx: 0.85, sy: 0.36, sz: 2.7 });
+        }
+      };
+      // door centers sit at u = (repeat + module/3 + 16/256) / R on each face
+      const Rw = Math.max(1, Math.round(b.tw * 0.5)), Rd = Math.max(1, Math.round(b.th * 0.5));
+      for (let k = 0; k < Rw * 3; k++) {
+        const f = (Math.floor(k / 3) + (k % 3) / 3 + 0.0625) / Rw;
+        addStoop(cx - W / 2 + f * W, cz + D / 2, true, 1);    // south face: u runs +x
+        addStoop(cx + W / 2 - f * W, cz - D / 2, true, -1);   // north face: u runs -x
+      }
+      for (let k = 0; k < Rd * 3; k++) {
+        const f = (Math.floor(k / 3) + (k % 3) / 3 + 0.0625) / Rd;
+        addStoop(cx + W / 2, cz + D / 2 - f * D, false, 1);   // east face: u runs -z
+        addStoop(cx - W / 2, cz - D / 2 + f * D, false, -1);  // west face: u runs +z
+      }
+    }
+    // a parapet cap: a thin overhang at the roofline so a flat building
+    // reads as STRUCTURE, not a bare extruded box
+    if (!b.roof) {
+      const cap = new THREE.Mesh(boxGeo, parapetMat);
+      cap.scale.set(W + 0.7, 0.6, D + 0.7);
+      cap.position.set(cx, H + 0.2, cz);
+      scene.add(cap);
+    }
     if (b.store) {
       const st = TEXS.store.clone();
       st.needsUpdate = true;
-      st.repeat.set(Math.max(2, b.tw * 2), 1);
+      st.repeat.set(Math.max(1, Math.round(b.tw * 0.5)), 1);   // wide shopfronts, not narrow slats
       const sm = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ map: st }));
-      sm.scale.set(W + 0.4, 3.3, D + 0.4);
-      sm.position.set(cx, 1.65, cz);
+      sm.scale.set(W + 0.4, FLOOR_H, D + 0.4);
+      sm.position.set(cx, FLOOR_H / 2, cz);
       scene.add(sm);
     }
     if (b.wt) {
@@ -2496,36 +2676,50 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
         const probeX = (b.tx + b.tw / 2 + fx2 * (b.tw / 2 + 0.6)) * TILE;
         const probeY = (b.ty + b.th / 2 + fz2 * (b.th / 2 + 0.6)) * TILE;
         if (solidAtPx(probeX, probeY)) continue;
-        const dx2 = cx + fx2 * (W / 2 + 0.08), dz2 = cz + fz2 * (D / 2 + 0.08);
+        let dx2 = cx + fx2 * (W / 2 + 0.08), dz2 = cz + fz2 * (D / 2 + 0.08);
         const across = !!fx2;   // door plane faces along x?
+        const mo = b.sign === 'motel';
+        if (mo) {
+          // the OFFICE is one of the room modules — snap the entry onto the
+          // middle painted door slot of this face (same u-math as the stoops)
+          const R = Math.max(1, Math.round((across ? b.th : b.tw) * 0.5));
+          const k = Math.floor(R * 3 / 2);
+          const f = (Math.floor(k / 3) + (k % 3) / 3 + 0.0625) / R;
+          if (!across) dx2 = fz2 === 1 ? cx - W / 2 + f * W : cx + W / 2 - f * W;
+          else dz2 = fx2 === 1 ? cz + D / 2 - f * D : cz - D / 2 + f * D;
+          console.log('MOTEL OFFICE at ' + Math.round(dx2 / RS) + ',' + Math.round(dz2 / RS));
+        }
         const out = (v) => across ? fx2 * v : 0;        // offset off the wall
         const outZ = (v) => across ? 0 : fz2 * v;
         // doors sized to the people who use them: taller and wider than
         // the character, transom and name stacked above
         const frame = new THREE.Mesh(boxGeo, pilasterMat);
-        frame.scale.set(across ? 0.18 : 2.8, 4.8, across ? 2.8 : 0.18);
-        frame.position.set(dx2, 2.4, dz2);
+        frame.scale.set(across ? 0.18 : 2.8, mo ? 5.5 : 4.8, across ? 2.8 : 0.18);
+        frame.position.set(dx2, mo ? 2.75 : 2.4, dz2);
         scene.add(frame);
         const door = new THREE.Mesh(boxGeo, doorMat);
-        door.scale.set(across ? 0.22 : 2.15, 4.25, across ? 2.15 : 0.22);
-        door.position.set(dx2 + out(0.05), 2.12, dz2 + outZ(0.05));
+        door.scale.set(across ? 0.22 : 2.15, mo ? 4.3 : 4.25, across ? 2.15 : 0.22);
+        door.position.set(dx2 + out(0.05), mo ? 2.87 : 2.12, dz2 + outZ(0.05));
         scene.add(door);
         const transom = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: 0xffdf9a }));
         transom.scale.set(across ? 0.24 : 1.9, 0.4, across ? 1.9 : 0.24);
-        transom.position.set(dx2 + out(0.06), 4.55, dz2 + outZ(0.06));
+        transom.position.set(dx2 + out(0.06), mo ? 5.25 : 4.55, dz2 + outZ(0.06));
         scene.add(transom);
-        const step = new THREE.Mesh(boxGeo, pilasterMat);
-        step.scale.set(across ? 1.2 : 2.6, 0.28, across ? 2.6 : 1.2);
-        step.position.set(dx2 + fx2 * 0.6, 0.14, dz2 + fz2 * 0.6);
-        scene.add(step);
+        if (!mo) {   // motel office already stands on its room's real stoop
+          const step = new THREE.Mesh(boxGeo, pilasterMat);
+          step.scale.set(across ? 1.2 : 2.6, 0.28, across ? 2.6 : 1.2);
+          step.position.set(dx2 + fx2 * 0.6, 0.14, dz2 + fz2 * 0.6);
+          scene.add(step);
+        }
         const doorLamp = new THREE.Mesh(new THREE.SphereGeometry(0.16, 6, 5), new THREE.MeshBasicMaterial({ color: 0xffe9b0 }));
-        doorLamp.position.set(dx2 + fx2 * 0.35, 5.15, dz2 + fz2 * 0.35);
+        doorLamp.position.set(dx2 + fx2 * 0.35, mo ? 5.75 : 5.15, dz2 + fz2 * 0.35);
         scene.add(doorLamp);
-        // the name over the door, on the WALL where the street reads it
-        if (b.sign !== 'capitol' && b.sign !== 'motel') {
-          const fs = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ map: TEXS.signs[b.sign] }));
+        // the name over the door, on the WALL where the street reads it —
+        // the motel's entry module wears OFFICE (the roof frame carries MOTEL)
+        if (b.sign !== 'capitol') {
+          const fs = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ map: mo ? TEXS.signs.office : TEXS.signs[b.sign] }));
           fs.scale.set(across ? 0.2 : 3.4, 0.85, across ? 3.4 : 0.2);
-          fs.position.set(dx2 + out(0.07), 5.45, dz2 + outZ(0.07));
+          fs.position.set(dx2 + out(0.07), mo ? 6.15 : 5.45, dz2 + outZ(0.07));
           scene.add(fs);
         }
         // ---- type-true architecture at the entrance
@@ -2690,6 +2884,22 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
         scene.add(bea);
       }
     }
+  }
+  if (stoopPlacements.length) {
+    const sm = new THREE.InstancedMesh(boxGeo, stoopMat, stoopPlacements.length);
+    const M = new THREE.Matrix4(), Q = new THREE.Quaternion();
+    stoopPlacements.forEach((s, i) => {
+      M.compose(new THREE.Vector3(s.x, s.y, s.z), Q, new THREE.Vector3(s.sx, s.sy, s.sz));
+      sm.setMatrixAt(i, M);
+    });
+    sm.instanceMatrix.needsUpdate = true;
+    scene.add(sm);
+    for (const s of stoopPlacements) stoopRects.push({
+      x0: (s.x - s.sx / 2) / RS, x1: (s.x + s.sx / 2) / RS,
+      y0: (s.z - s.sz / 2) / RS, y1: (s.z + s.sz / 2) / RS,
+      h: s.y + 0.18
+    });
+    console.log('MOTEL STOOPS: ' + (stoopPlacements.length / 2) + ' doors got real steps');
   }
 }
 // trees (instanced)
@@ -5289,6 +5499,34 @@ function updShells(dt) {
     else addPart(s.x, s.y, s.h || 1.6, rndf(-8, 8), rndf(-8, 8), rndf(0, 1), 0.25, s.pby ? 0xff9040 : 0x888888, 0.8, true);
   }
   for (let i = shells.length - 1; i >= 0; i--) if (shells[i].done) shells.splice(i, 1);
+}
+function ensureMilGuards() {
+  let n = 0;
+  for (const c of cars) if (c.milGuard && !c.dead) n++;
+  if (n >= 2) return;
+  const north = -Math.PI / 2;
+  for (const gx of [MIL.bcol - 2.5, MIL.bcol + MIL.bwid + 1.5]) {
+    let have = false;
+    for (const c of cars) if (c.milGuard && !c.dead && Math.abs(c.x - (gx + 0.5) * TILE) < 30) have = true;
+    if (have) continue;
+    const c = mkCar((gx + 0.5) * TILE, (MIL.y0 + 1.5) * TILE, 0, 'tank', 'mil');
+    c.angle = north; c.turret = north; c.milGuard = true; c.keep = true;
+    attachCarMesh(c); cars.push(c);
+  }
+}
+function updMilGuard(c, dt) {
+  c.speed = 0;
+  const t = focus();
+  const d = dist(c.x, c.y, t.x, t.y);
+  const ta = Math.atan2(t.y - c.y, t.x - c.x);
+  const want = milArmed ? ta : -Math.PI / 2;
+  c.turret += clamp(angDiff(c.turret, want), -1.6 * dt, 1.6 * dt);
+  c.fireT -= dt;
+  // emplaced guns commanding the bridge — no fence blocks their field of fire
+  if (milArmed && c.fireT <= 0 && d < 900) {
+    c.fireT = 2.6;
+    fireShell(c, c.turret + rndf(-0.06, 0.06));
+  }
 }
 function updArmyTank(c, dt) {
   const t = focus();
@@ -8169,6 +8407,33 @@ function update(dt) {
       copSeen = true;
     }
   }
+  // the MILITARY BRIDGE trap
+  const pmx = Math.floor(player.x / TILE), pmy = Math.floor(player.y / TILE);
+  if (pmy >= MIL.by0 - 6 && pmx >= MIL.x0 - 2 && pmx <= MIL.x1 + 2) {
+    ensureMilGuards();
+    const onDeck = pmx >= MIL.bcol - 1 && pmx <= MIL.bcol + MIL.bwid;
+    const pastCenter = player.y >= (MIL.by0 + MIL.by1) / 2 * TILE;
+    if (!milArmed && !player.dead && !pardonMode && onDeck && pastCenter) {
+      milArmed = true;
+      heat = 6; wantedClearT = 30; copSeen = true;
+      msg('YOU CROSSED THE LINE — the base opens fire. Turn back or die.', 10);
+      sfx('fail');
+    }
+    if (!player.car && !player.dead && !godMode) {
+      for (const s of milFence) {
+        const dx = s.x1 - s.x0, dy = s.y1 - s.y0, L2 = dx * dx + dy * dy || 1;
+        let tt = clamp(((player.x - s.x0) * dx + (player.y - s.y0) * dy) / L2, 0, 1);
+        const cxp = s.x0 + dx * tt, cyp = s.y0 + dy * tt;
+        if (dist(player.x, player.y, cxp, cyp) < 12) {
+          hurtPlayer(9 * dt);
+          const a = Math.atan2(player.y - cyp, player.x - cxp);
+          player.x += Math.cos(a) * 40 * dt; player.y += Math.sin(a) * 40 * dt;
+          break;
+        }
+      }
+    }
+  }
+  if (milArmed && islandOfPx(player.x, player.y) !== 3 && Math.floor(player.y / TILE) < MIL.by0) milArmed = false;
   updEngine();
   if (state === 'menu') {
     // no game inputs on the title screen — Enter/click to play, slot key to load
@@ -8318,10 +8583,6 @@ function update(dt) {
   }
   const digits = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7'];
   for (let i = 0; i < digits.length; i++) if (pressed.has(digits[i])) player.weapon = WORDER[i];
-  if (pressed.has('KeyQ')) {
-    const i = WORDER.indexOf(player.weapon);
-    player.weapon = WORDER[(i + 1) % WORDER.length];
-  }
   pressed.clear();
 
   player.fireT -= dt;
@@ -8418,6 +8679,7 @@ function update(dt) {
   for (const c of cars) {
     if (c.dead) continue;
     if (c.driver === 'ai') updTraffic(c, dt);
+    else if (c.driver === 'mil') updMilGuard(c, dt);
     else if (c.driver === 'cop') { if (c.kind === 'tank') updArmyTank(c, dt); else updCopCar(c, dt); }
     else if (c.driver === 'mob') updMobCar(c, dt);
     else if (c.driver === null && (Math.abs(c.speed) > 2 || Math.abs(c.latV) > 2)) { c.speed *= Math.pow(0.2, dt); tireGrip(c, dt, 1); moveCar(c, dt); }
@@ -8896,7 +9158,10 @@ function syncScene(dt, t) {
       player.mesh.rotation.set(0, -player.angle, -1.25);   // negative pitch: head FORWARD, chest down
     } else {
       const bob = animateRig(player.mesh, player.x, player.y, dt, player.weapon !== 'fist');
-      player.mesh.position.set(player.x * RS, bob * 0.12 + (player.jumpH || 0), player.y * RS);
+      // step elevation: climb motel stoops for real, eased so it reads as steps
+      const gh = stoopTopAt(player.x, player.y);
+      player.gh = (player.gh || 0) + (gh - (player.gh || 0)) * Math.min(1, dt * 10);
+      player.mesh.position.set(player.x * RS, bob * 0.12 + (player.jumpH || 0) + player.gh, player.y * RS);
       player.mesh.rotation.set(0, -player.angle, 0);
     }
     player.mesh.userData.gun.visible = false;
@@ -9440,6 +9705,34 @@ function drawHUD(t) {
     hctx.moveTo(cx, cy - 11); hctx.lineTo(cx, cy - 4);
     hctx.moveTo(cx, cy + 4); hctx.lineTo(cx, cy + 11);
     hctx.stroke();
+  }
+  // the weapon selection WHEEL
+  if (wheelOpen) {
+    const cx = VW / 2, cy = VH / 2, R = 150, ir = 58;
+    hctx.fillStyle = 'rgba(6,9,14,0.55)'; hctx.fillRect(0, 0, VW, VH);
+    for (let i = 0; i < WORDER.length; i++) {
+      const a = -Math.PI / 2 + i * (2 * Math.PI / WORDER.length);
+      const on = i === wheelSel;
+      const px = cx + Math.cos(a) * (ir + R) / 2, py = cy + Math.sin(a) * (ir + R) / 2;
+      hctx.beginPath(); hctx.arc(px, py, on ? 40 : 32, 0, 2 * Math.PI);
+      hctx.fillStyle = on ? 'rgba(255,210,60,0.92)' : 'rgba(24,30,40,0.85)';
+      hctx.fill();
+      hctx.strokeStyle = on ? '#fff' : '#4a525e'; hctx.lineWidth = on ? 3 : 1.5; hctx.stroke();
+      hctx.fillStyle = on ? '#1a1206' : '#cdd3db';
+      hctx.font = 'bold ' + (on ? 13 : 11) + 'px monospace';
+      hctx.textAlign = 'center';
+      const nm = WEAPONS[WORDER[i]].name;
+      hctx.fillText(nm.length > 8 ? nm.slice(0, 8) : nm, px, py + 4);
+    }
+    hctx.beginPath(); hctx.arc(cx, cy, ir - 6, 0, 2 * Math.PI);
+    hctx.fillStyle = 'rgba(10,14,20,0.9)'; hctx.fill();
+    hctx.fillStyle = '#ffd23c'; hctx.font = 'bold 12px monospace'; hctx.textAlign = 'center';
+    hctx.fillText('WEAPON', cx, cy - 2); hctx.fillText('WHEEL', cx, cy + 12);
+    // the pointer: mouse-driven dot or stick direction
+    if (wheelPX || wheelPY) {
+      hctx.strokeStyle = '#ffd23c'; hctx.lineWidth = 2;
+      hctx.beginPath(); hctx.moveTo(cx, cy); hctx.lineTo(cx + wheelPX, cy + wheelPY); hctx.stroke();
+    }
   }
   // directed dialog banner, top center — the movie's dialogue track
   if (topSay && state === 'play' && !cutscene && !paused) {
@@ -10981,6 +11274,125 @@ if (location.hash === '#finale') {
   startMission(0);
   const fin = mission && mission.lines && mission.lines.length === 5 && !!partner;
   console.log('FINDBG lastTable=' + fin + ' higherChain=' + (mission.lines[3].indexOf('HIGHER') >= 0));
+}
+if (location.hash === '#wheel') {
+  startGame();
+  player.weapon = 'pistol';
+  openWheel('key');
+  const opened = wheelOpen && wheelSrc === 'key';
+  const startSel = wheelSel === WORDER.indexOf('pistol');
+  // point the selector straight DOWN (segment math): pick 'shotgun' by angle
+  const target = WORDER.indexOf('shotgun');
+  const ang = -Math.PI / 2 + target * (2 * Math.PI / WORDER.length);
+  wheelSel = wheelSelFromAngle(ang);
+  const aimedRight = wheelSel === target;
+  closeWheel(true);
+  const loaded = player.weapon === 'shotgun' && !wheelOpen;
+  // release without a pick keeps current
+  player.weapon = 'uzi'; openWheel('pad'); closeWheel(true);
+  const keepsIfCentered = player.weapon === 'uzi';
+  console.log('WHEELDBG opened=' + opened + ' startsOnCurrent=' + startSel + ' angleToSeg=' + aimedRight + ' loadsOnCommit=' + loaded + ' centeredKeeps=' + keepsIfCentered);
+}
+if (location.hash === '#scalecheck') {
+  startGame();
+  godMode = true;
+  // stand the ghost right at a brick facade, camera at eye level
+  const b = buildings.find(bb => bb.tex === 'brick' && bb.floors >= 4) || buildings[0];
+  const bx = (b.tx + b.tw / 2) * TILE, by = (b.ty - 0.4) * TILE;
+  player.x = bx; player.y = by;
+  syncScene(1 / 60, 0);
+  const headTop = player.mesh.position.y + 3.54;   // measured rig head-top
+  const floorH = FLOOR_H;
+  console.log('SCALEDBG humanHeight=' + headTop.toFixed(2) + ' floorHeight=' + floorH.toFixed(2) + ' human/floor=' + (headTop / floorH).toFixed(2) + ' floors=' + b.floors + ' bldgH=' + (b.floors * FLOOR_H).toFixed(1));
+  player.x = bx - 55; player.y = by - 55;
+  mousePitch = -0.12; camZoom = 0.9;
+  mouseYaw = camYaw = player.angle = Math.atan2(by - player.y, bx - player.x);
+  scene.fog = null;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+}
+if (location.hash === '#milview') {
+  startGame();
+  godMode = true;
+  player.x = (MIL.bcol + 0.5) * TILE; player.y = (MIL.by0 - 10) * TILE;
+  mousePitch = 0.05; camZoom = 2.6;
+  mouseYaw = camYaw = player.angle = Math.PI / 2;   // look south down the bridge into the base
+  scene.fog = null;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+  console.log('MILVIEWDBG gridH=' + GRID_H + ' fenceSegs=' + milFence.length);
+}
+if (location.hash === '#milbase') {
+  startGame();
+  godMode = true;
+  const isl3 = islandAt(MIL.x0 + 5, MIL.y0 + 5) === 3 && !islandUnlocked(3);
+  const water = islandAt(MIL.x0 + 5, MIL.y0 - 4) !== 3;
+  player.x = (MIL.bcol + 0.5) * TILE; player.y = (MIL.by0 - 2) * TILE;
+  update(1 / 60);
+  ensureMilGuards();
+  let guards = 0; for (const c of cars) if (c.milGuard) guards++;
+  const armedBefore = milArmed;
+  player.y = (MIL.by0 + MIL.by1) / 2 * TILE + 20;
+  update(1 / 60);
+  const armedAfter = milArmed;
+  const stars6 = stars() === 6;
+  for (const c of cars) if (c.milGuard) c.fireT = 0;
+  let firedShots = 0;
+  const s0 = shells.length;
+  update(1 / 60);
+  firedShots = shells.length - s0;
+  let anyReset = false;
+  for (const c of cars) if (c.milGuard && c.fireT > 1) anyReset = true;
+  const guardsFired = firedShots >= 1 || anyReset;
+  godMode = false;
+  player.x = MIL.x0 * TILE; player.y = (MIL.y0 + 10) * TILE;
+  const hp0 = player.hp;
+  for (let i = 0; i < 30; i++) { player.x = MIL.x0 * TILE; player.y = (MIL.y0 + 10) * TILE; update(1 / 60); }
+  const wireHurts = player.hp < hp0;
+  console.log('MILDBG island3Forbidden=' + isl3 + ' waterAround=' + water + ' guards=' + guards + ' armedAtMouth=' + armedBefore + ' armedPastCenter=' + armedAfter + ' sixStars=' + stars6 + ' guardsFired=' + guardsFired + ' wireHurts=' + wireHurts + ' gridH=' + GRID_H);
+}
+if (location.hash === '#parkview') {
+  startGame();
+  godMode = true;
+  const sp = parkSpots[0];
+  const c9 = mkCar(sp.x, sp.y, 0, 'sedan', null);
+  c9.angle = sp.ang; c9.keep = true;
+  attachCarMesh(c9); cars.push(c9);
+  player.x = sp.x - 70; player.y = sp.y + 70;
+  mousePitch = 0.35; camZoom = 1.1;
+  mouseYaw = camYaw = player.angle = Math.atan2(sp.y - player.y, sp.x - player.x);
+  scene.fog = null;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+  console.log('PARKVIEWDBG spots=' + parkSpots.length + ' sp0=' + Math.round(sp.x) + ',' + Math.round(sp.y) + ' lineVerts=' + (window._plines ? window._plines.verts : 0));
+}
+if (location.hash === '#cityview') {
+  // eyes-on the buildings: overlook a mixed district at street-into-skyline
+  startGame();
+  godMode = true;
+  // find a wood house and a glass tower, stand between them
+  const wd = buildings.find(b => b.tex === 'wood');
+  const gl = buildings.find(b => b.tex === 'glass');
+  const tgt = wd || buildings[0];
+  player.x = (tgt.tx + tgt.tw / 2) * TILE - 150;
+  player.y = (tgt.ty + tgt.th / 2) * TILE + 150;
+  mousePitch = 0.02;
+  camZoom = 1.8;
+  mouseYaw = camYaw = player.angle = Math.atan2((tgt.ty * TILE) - player.y, (tgt.tx * TILE) - player.x);
+  const woodCount = buildings.filter(b => b.tex === 'wood').length;
+  console.log('CITYDBG buildings=' + buildings.length + ' wood=' + woodCount + ' glass=' + buildings.filter(b => b.tex==='glass').length + ' brick=' + buildings.filter(b=>b.tex==='brick').length + ' at=' + Math.round(player.x) + ',' + Math.round(player.y));
+}
+if (location.hash === '#phantom') {
+  startGame();
+  let tk = null, minR = 1e9;
+  for (const b of blockers) if (b.r > 20 && b.r < minR) { minR = b.r; tk = b; }
+  const found = !!tk && props.tanks.length > 0;
+  const cornerWalkable = tk ? !solidAtPx(tk.x + 46, tk.y + 46) : false;   // old 2x2 corner
+  const edgeWalkable = tk ? !solidAtPx(tk.x + 42, tk.y) : false;          // just past the cylinder
+  const meshSolid = tk ? solidAtPx(tk.x + 20, tk.y) : false;              // inside the cylinder
+  const centerSolid = tk ? solidAtPx(tk.x, tk.y) : false;
+  const c9 = mkCar(tk.x + 55, tk.y + 46, 0, 'sedan', null);   // over the OLD phantom corner, clear of the cylinder
+  const carClearsOldWall = !carHitsSolid(c9);
+  c9.x = tk.x; c9.y = tk.y;                                   // sitting on the tank itself
+  const carStopsAtMesh = carHitsSolid(c9);
+  console.log('PHANTOMDBG tankFound=' + found + ' oldCornerWalkable=' + cornerWalkable + ' edgeWalkable=' + edgeWalkable + ' meshStillSolid=' + meshSolid + ' centerSolid=' + centerSolid + ' carClearsOldWall=' + carClearsOldWall + ' carStopsAtMesh=' + carStopsAtMesh);
 }
 if (location.hash === '#injguard') {
   startGame();

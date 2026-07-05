@@ -1477,6 +1477,7 @@ const STATS = {
   almsGiven: 0, atoned: 0
 };
 let wantedStreakT = 0;
+let npcCarryTick = 0.5;                          // open-carry scans, twice a second
 function statAccuracy() { return STATS.ammoSpent ? Math.round(100 * STATS.shotsHit / STATS.ammoSpent) : 0; }
 let heat = 0, wantedClearT = 0, copSeen = false, seenTick = 0, prevStars = 0, frenzy = null, aimTarget = null;
 let disarmT = 0, disarmCool = 0, armedTick = 0;   // open-carry warnings
@@ -1982,7 +1983,8 @@ const TEXS = {
     apts: signTexture('#2a2018', '#ffd9a0', 'HARBOR ARMS', false),
     capitol: signTexture('#3a3628', '#f0ead2', 'STATE CAPITOL', false),
     mod: signTexture('#170f2e', '#c890ff', 'TUNE-UP GARAGE', false),
-    church: signTexture('#241c14', '#ffe9b0', 'FIRST CHAPEL', false)
+    church: signTexture('#241c14', '#ffe9b0', 'FIRST CHAPEL', false),
+    hotdog: signTexture('#7a1f1f', '#ffe9b0', 'HOT DOGS $10', false)
   }
 };
 const roofMat = new THREE.MeshLambertMaterial({ color: 0x181b22 });
@@ -2335,22 +2337,145 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
     scene.add(trunk); scene.add(canopy);
   }
 }
-// street lamps (instanced) + glow heads
+// street lamps (instanced) + glow heads — DESTRUCTIBLE: a car at speed
+// snaps the post at the base, it falls along the car's line, the light
+// dies, and 60 seconds later the city replaces it
+let lampPoles = null, lampHeads = null;
+const lampGrid = new Map();                      // tile key -> lamp indices
 {
   const n = lamps.length;
   if (n) {
-    const poles = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.09, 0.12, 5, 5), new THREE.MeshLambertMaterial({ color: 0x30343c }), n);
-    const heads = new THREE.InstancedMesh(new THREE.SphereGeometry(0.32, 6, 6), new THREE.MeshBasicMaterial({ color: 0xffd9a0 }), n);
+    lampPoles = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.09, 0.12, 5, 5), new THREE.MeshLambertMaterial({ color: 0x30343c }), n);
+    lampHeads = new THREE.InstancedMesh(new THREE.SphereGeometry(0.32, 6, 6), new THREE.MeshBasicMaterial({ color: 0xffd9a0 }), n);
     const m = new THREE.Matrix4();
     for (let i = 0; i < n; i++) {
       const L = lamps[i], x = L.x * RS, z = L.y * RS;
       m.makeTranslation(x, 2.5, z);
-      poles.setMatrixAt(i, m);
+      lampPoles.setMatrixAt(i, m);
       m.makeTranslation(x, 5.1, z);
-      heads.setMatrixAt(i, m);
+      lampHeads.setMatrixAt(i, m);
+      lampHeads.setColorAt(i, new THREE.Color(0xffffff));
+      const k = Math.floor(L.x / TILE) + ',' + Math.floor(L.y / TILE);
+      if (!lampGrid.has(k)) lampGrid.set(k, []);
+      lampGrid.get(k).push(i);
     }
-    scene.add(poles); scene.add(heads);
+    if (lampHeads.instanceColor) lampHeads.instanceColor.needsUpdate = true;
+    scene.add(lampPoles); scene.add(lampHeads);
   }
+}
+const _lampM = new THREE.Matrix4(), _lampR = new THREE.Matrix4(), _lampT = new THREE.Matrix4();
+const _lampAxis = new THREE.Vector3();
+function setLampPose(i, ang) {
+  // pole rotated about its BASE, tipping toward the fall direction
+  const L = lamps[i], x = L.x * RS, z = L.y * RS;
+  _lampAxis.set(-Math.sin(L.fallDir || 0), 0, Math.cos(L.fallDir || 0));
+  _lampR.makeRotationAxis(_lampAxis, ang);
+  _lampT.makeTranslation(0, 2.5, 0);
+  _lampM.makeTranslation(x, 0, z);
+  _lampM.multiply(_lampR).multiply(_lampT);
+  lampPoles.setMatrixAt(i, _lampM);
+  _lampT.makeTranslation(0, 5.1, 0);
+  _lampM.makeTranslation(x, 0, z);
+  _lampM.multiply(_lampR).multiply(_lampT);
+  lampHeads.setMatrixAt(i, _lampM);
+  lampPoles.instanceMatrix.needsUpdate = true;
+  lampHeads.instanceMatrix.needsUpdate = true;
+}
+function breakLamp(i, dirAngRender, byCar) {
+  // slow hit BENDS the post (light survives); fast hit SNAPS it flat and
+  // kills the light. Either way the city replaces it in 60 seconds.
+  const L = lamps[i];
+  const sp = byCar ? Math.abs(byCar.speed) : 200;
+  const full = sp >= 110;
+  const target = full ? 1.45 : 0.2 + clamp((sp - 40) / 70, 0, 1) * 0.5;
+  if (L.broken) {
+    if (target <= L.maxAng + 0.05) return;       // already worse than this hit
+    L.maxAng = target;                           // a harder hit finishes the job
+    L.respawnT = 60;
+  } else {
+    L.broken = true;
+    L.fallT = 0;
+    L.maxAng = target;
+    L.fallDir = dirAngRender;
+    L.respawnT = 60;
+    brokenLamps.push(i);
+  }
+  sfx('crash');
+  sparks(L.x, L.y);
+  if (byCar) {
+    carDamage(byCar, Math.min(30, sp * 0.06), null);
+    byCar.speed *= full ? 0.86 : 0.93;           // the post scrubs momentum
+    if (byCar === player.car) rumble(full ? 0.5 : 0.3, 0.35, 200);
+  }
+  if (full && lampHeads.setColorAt) {
+    lampHeads.setColorAt(i, new THREE.Color(0x333333));   // the light dies
+    lampHeads.instanceColor.needsUpdate = true;
+  }
+}
+const brokenLamps = [];
+function updLamps(dt) {
+  for (let bi = brokenLamps.length - 1; bi >= 0; bi--) {
+    const i = brokenLamps[bi];
+    const L = lamps[i];
+    if (L.fallT < 1) {
+      L.fallT = Math.min(1, L.fallT + dt * 1.7);
+      setLampPose(i, L.fallT * L.maxAng);
+    } else if (L.poseDirty) {
+      L.poseDirty = false;
+      setLampPose(i, L.maxAng);
+    }
+    L.respawnT -= dt;
+    if (L.respawnT <= 0) {
+      // the city sends a truck: post restored, light back on
+      L.broken = false;
+      setLampPose(i, 0);
+      if (lampHeads.setColorAt) {
+        lampHeads.setColorAt(i, new THREE.Color(0xffffff));
+        lampHeads.instanceColor.needsUpdate = true;
+      }
+      brokenLamps.splice(bi, 1);
+    }
+  }
+}
+function checkLampHits(c) {
+  if (!lampPoles) return;
+  const sp = Math.abs(c.speed);
+  if (sp < 2) return;
+  const cx2 = Math.floor(c.x / TILE), cy2 = Math.floor(c.y / TILE);
+  const reach = c.len / 2 + 5;
+  for (let oy = -1; oy <= 1; oy++)
+    for (let ox = -1; ox <= 1; ox++) {
+      const arr = lampGrid.get((cx2 + ox) + ',' + (cy2 + oy));
+      if (!arr) continue;
+      for (const i of arr) {
+        const L = lamps[i];
+        const d2 = dist(c.x, c.y, L.x, L.y);
+        if (d2 >= reach) continue;
+        if (L.broken) {
+          // a leaning post yields to a HARD follow-up; otherwise drive past
+          if (L.maxAng < 1.4 && sp >= 110) {
+            L.poseDirty = true;
+            breakLamp(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c);
+          }
+          continue;
+        }
+        if (sp >= 110) {
+          // full speed: the post gives way, you barrel through
+          breakLamp(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c);
+          continue;
+        }
+        // the post HOLDS: bend it (if the hit had real speed) and the car
+        // comes to a collision stop against it — no passing through
+        if (sp >= 40) breakLamp(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c);
+        else if (sp > 18) { sfx('crash'); if (c === player.car) rumble(0.3, 0.18, 120); }
+        const px2 = c.x - L.x, py2 = c.y - L.y;
+        const pd = Math.max(1, Math.hypot(px2, py2));
+        const nx2 = c.x + (px2 / pd) * (reach - pd), ny2 = c.y + (py2 / pd) * (reach - pd);
+        if (!solidAtPx(nx2, ny2)) { c.x = nx2; c.y = ny2; }
+        c.speed *= 0.12;
+        c.latV *= 0.5;
+      }
+    }
 }
 // district props: docks, industry, downtown landmarks
 {
@@ -2593,6 +2718,59 @@ const wtLegMat = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
     const flag = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.5, 0.08), new THREE.MeshLambertMaterial({ color: 0x8a1a24 }));
     flag.position.set(cx3 - 9 + 1.4, 10.8, face + 4);
     scene.add(flag);
+  }
+  // hot dog stands: the real cart — body, wheels, grill, striped umbrella,
+  // condiments, and the price sign. The vendor works behind it.
+  {
+    const cartBox = new THREE.BoxGeometry(1, 1, 1);
+    const bodyM = new THREE.MeshLambertMaterial({ color: 0xd8d4cc });
+    const steelM = new THREE.MeshLambertMaterial({ color: 0x8a8f98 });
+    const grillM = new THREE.MeshLambertMaterial({ color: 0x2a2c30 });
+    const umbM = new THREE.MeshLambertMaterial({ color: 0xb02828 });
+    const umbM2 = new THREE.MeshLambertMaterial({ color: 0xe8dfc8 });
+    for (const fc of foodCarts) {
+      const fx3 = fc.x * RS, fz3 = fc.y * RS;
+      const body = new THREE.Mesh(cartBox, bodyM);
+      body.scale.set(3.2, 1.5, 1.7);
+      body.position.set(fx3, 1.25, fz3);
+      scene.add(body);
+      const grill = new THREE.Mesh(cartBox, grillM);
+      grill.scale.set(2.2, 0.18, 1.3);
+      grill.position.set(fx3 - 0.3, 2.1, fz3);
+      scene.add(grill);
+      for (const s of [-1, 1]) {
+        const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.42, 0.2, 10), grillM);
+        wheel.rotation.x = Math.PI / 2;
+        wheel.position.set(fx3 + s * 1.1, 0.42, fz3 + 0.92);
+        scene.add(wheel);
+      }
+      const handle = new THREE.Mesh(cartBox, steelM);
+      handle.scale.set(0.12, 0.12, 1.9);
+      handle.position.set(fx3 + 1.8, 1.5, fz3);
+      scene.add(handle);
+      // condiments on the counter
+      const must = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.34, 6), new THREE.MeshLambertMaterial({ color: 0xd8b820 }));
+      must.position.set(fx3 + 1.05, 2.2, fz3 - 0.45);
+      scene.add(must);
+      const ketch = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.34, 6), umbM);
+      ketch.position.set(fx3 + 1.05, 2.2, fz3 - 0.15);
+      scene.add(ketch);
+      // the striped umbrella
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 3.6, 6), steelM);
+      pole.position.set(fx3 - 0.4, 3.2, fz3);
+      scene.add(pole);
+      const umb = new THREE.Mesh(new THREE.ConeGeometry(2.3, 0.9, 10), umbM);
+      umb.position.set(fx3 - 0.4, 5.1, fz3);
+      scene.add(umb);
+      const umbRim = new THREE.Mesh(new THREE.ConeGeometry(2.42, 0.35, 10), umbM2);
+      umbRim.position.set(fx3 - 0.4, 4.72, fz3);
+      scene.add(umbRim);
+      // price sign on the cart face
+      const sgn = new THREE.Mesh(cartBox, new THREE.MeshBasicMaterial({ map: TEXS.signs.hotdog }));
+      sgn.scale.set(2.4, 0.7, 0.08);
+      sgn.position.set(fx3, 1.3, fz3 + 0.9);
+      scene.add(sgn);
+    }
   }
   // walk-in gun shops: open-front kiosk — back wall, sides, roof, counter,
   // and the wares racked on the wall behind the man
@@ -3696,7 +3874,7 @@ function carDamage(c, amt, by) {
 }
 function scare(x, y, r) {
   for (const p of peds) {
-    if (p.cop || p.guard || p.goon || p.vip || p.shopkeep || p.fare || p.priest || p.prayer || p.dead) continue;
+    if (p.cop || p.guard || p.goon || p.vip || p.shopkeep || p.vendor || p.fare || p.priest || p.prayer || p.dead) continue;
     if (dist(p.x, p.y, x, y) < r) {
       p.state = 'flee';
       p.fleeT = rndf(3, 5.5);
@@ -4317,6 +4495,12 @@ const CHATTER = {
     'Ammo\'s in the back, cash up front.',
     'Careful where you point that.'
   ],
+  vendor: [
+    'Best dogs in Nuvola City!',
+    'Hot and fresh — ten bucks!',
+    'You look hungry, ghost.',
+    'Mustard? We got mustard.'
+  ],
   fareHail: [
     'TAXI! Over here!',
     'Hey — you free?',
@@ -4356,7 +4540,7 @@ function say(p, text, life) {
 function sayNear(x, y, r, pool, life) {
   let bp = null, bd = r;
   for (const p of peds) {
-    if (p.dead || p.rag || p.cop || p.guard || p.goon || p.vip || p.shopkeep || p.priest || p.prayer || (p.voxT || 0) > 0) continue;
+    if (p.dead || p.rag || p.cop || p.guard || p.goon || p.vip || p.shopkeep || p.vendor || p.priest || p.prayer || (p.voxT || 0) > 0) continue;
     const d = dist(p.x, p.y, x, y);
     if (d < bd) { bd = d; bp = p; }
   }
@@ -4374,7 +4558,7 @@ function updChatter(dt) {
   chatT = rndf(3.5, 7);
   const cands = [];
   for (const p of peds) {
-    if (p.dead || p.rag || p.vip || p.guard || p.goon || p.shopkeep || p.priest || p.prayer || (p.voxT || 0) > 0 || p.state === 'flee') continue;
+    if (p.dead || p.rag || p.vip || p.guard || p.goon || p.shopkeep || p.vendor || p.priest || p.prayer || (p.voxT || 0) > 0 || p.state === 'flee') continue;
     const d = dist(p.x, p.y, player.x, player.y);
     if (d < 520) cands.push({ p, d });
   }
@@ -5011,21 +5195,47 @@ const UNITS = {
   cia: { hp: 80, spd: 85, shirt: 0x2a2a32, head: 0xe0b090, dmg: 14, coolA: 0.5, coolB: 0.9, range: 480, spread: 0.06 },
   mil: { hp: 120, spd: 78, shirt: 0x3d4a2e, head: 0x2e3a22, dmg: 16, coolA: 0.4, coolB: 0.8, range: 550, spread: 0.08 }
 };
-function pedShoot(p, dt) {
+function pedShoot(p, dt, tgt) {
   p.cool -= dt;
   const U = UNITS[p.unit] || UNITS.cop;
-  const t = focus();
+  const t = tgt || focus();
   const d = dist(p.x, p.y, t.x, t.y);
   if (p.cool <= 0 && d < U.range && hasLOS(p.x, p.y, t.x, t.y)) {
     p.cool = rndf(U.coolA, U.coolB);
     const ang = Math.atan2(t.y - p.y, t.x - p.x) + rndf(-U.spread, U.spread);
-    spawnBullet(p.x + Math.cos(ang) * 12, p.y + Math.sin(ang) * 12, Math.cos(ang) * 700, Math.sin(ang) * 700, 0.65, U.dmg, 0, 'c');
+    const b = spawnBullet(p.x + Math.cos(ang) * 12, p.y + Math.sin(ang) * 12, Math.cos(ang) * 700, Math.sin(ang) * 700, 0.65, U.dmg, 0, 'c');
     sfx('pistol');
+    // an NPC firing a gun in front of the law becomes the law's problem —
+    // same rule the player lives under (mission-cordon fights excepted)
+    if (!p.cop && !p.pedOutlaw && !(combatMission() && (p.goon || p.guard || p.warTarget))) {
+      if (npcGunfireWitnessed(p)) {
+        p.pedOutlaw = true;
+        p.outlawT = 30;
+        sayNearestCop(p, 'Shots fired — take the shooter DOWN!');
+      }
+    }
     if ((p.voxT || 0) <= 0 && Math.random() < 0.35) {
       if (p.cop) say(p, pick(stars() >= 4 ? CHATTER.copSwat : CHATTER.copSpot), 2.6);
       else if (p.guard || p.goon) say(p, pick(CHATTER.goonAggro), 2.6);
     }
   }
+}
+function npcGunfireWitnessed(p) {
+  for (const q of peds) {
+    if (!q.cop || q.dead) continue;
+    const d2 = dist(q.x, q.y, p.x, p.y);
+    if (d2 < 320 || (d2 < 650 && hasLOS(q.x, q.y, p.x, p.y))) return true;
+  }
+  return false;
+}
+function sayNearestCop(p, line) {
+  let nc = null, nd = 650;
+  for (const q of peds) {
+    if (!q.cop || q.dead) continue;
+    const d2 = dist(q.x, q.y, p.x, p.y);
+    if (d2 < nd) { nd = d2; nc = q; }
+  }
+  if (nc && (nc.voxT || 0) <= 0) say(nc, line, 2.8);
 }
 // does a straight walk from A to B step onto any road tile?
 function pathCrossesRoad(x0, y0, x1, y1) {
@@ -5078,6 +5288,24 @@ function updPed(p, dt) {
     return;
   }
   if (p.cop) {
+    // an armed-and-firing NPC outranks a low-heat player: hunt the shooter
+    if (!p.copTarget || p.copTarget.dead || !p.copTarget.pedOutlaw) {
+      p.copTarget = null;
+      for (const q of peds) {
+        if (q.dead || !q.pedOutlaw) continue;
+        const d2 = dist(p.x, p.y, q.x, q.y);
+        if (d2 < 560 && (!p.copTarget || d2 < dist(p.x, p.y, p.copTarget.x, p.copTarget.y))) p.copTarget = q;
+      }
+    }
+    if (p.copTarget && stars() < 3) {
+      if (p.patrol) { p.patrol = false; p.spd = (UNITS[p.unit] || UNITS.cop).spd; }
+      const q = p.copTarget;
+      p.angle = Math.atan2(q.y - p.y, q.x - p.x);
+      const dq = dist(p.x, p.y, q.x, q.y);
+      if (dq > 60) moveCircle(p, Math.cos(p.angle) * p.spd * dt, Math.sin(p.angle) * p.spd * dt);
+      pedShoot(p, dt, q);
+      return;
+    }
     if (p.patrol && stars() > 0) { p.patrol = false; p.spd = (UNITS[p.unit] || UNITS.cop).spd; }   // beat cop joins the response
     if (!p.patrol) {
       const d = dist(p.x, p.y, player.x, player.y);
@@ -5110,6 +5338,13 @@ function updPed(p, dt) {
     // a customer at the curb: holds their spot and tracks the cab
     const d = dist(p.x, p.y, player.x, player.y);
     if (d < 340) p.angle = Math.atan2(player.y - p.y, player.x - p.x);
+    return;
+  }
+  if (p.vendor) {
+    // the hot dog man works his cart: faces the customer, hawks the goods
+    const d = dist(p.x, p.y, player.x, player.y);
+    if (d < 120 && !player.dead) p.angle = Math.atan2(player.y - p.y, player.x - p.x);
+    if (d < 90 && (p.voxT || 0) <= 0) say(p, pick(CHATTER.vendor), 3);
     return;
   }
   if (p.shopkeep) {
@@ -6385,6 +6620,16 @@ function ensureShopkeeps() {
     attachPedMesh(sk);
     peds.push(sk);
   }
+  // the hot dog men take their carts
+  for (const fc of foodCarts) {
+    let hasV = false;
+    for (const p of peds) if (p.vendor && !p.dead && dist(p.x, p.y, fc.x, fc.y) < 60) { hasV = true; break; }
+    if (hasV) continue;
+    const vd = mkPed(fc.x, fc.y - 10, { vendor: true, hp: 60, shirt: 0xd8d4cc });
+    vd.angle = Math.PI / 2;                    // facing the counter, south
+    attachPedMesh(vd);
+    peds.push(vd);
+  }
   // the chapels fill: a priest at each altar, the faithful in the pews
   for (const ch of props.churches) {
     let hasP = false;
@@ -6683,6 +6928,8 @@ function update(dt) {
       }
     }
   }
+  for (const c of cars) if (!c.dead && (c.driver || Math.abs(c.speed) > 40)) checkLampHits(c);
+  updLamps(dt);
   carCollisions();
   if (chopper) updChopper(dt);
   if (gunship) updGunship(dt);
@@ -6726,11 +6973,35 @@ function update(dt) {
     }
   }
 
+  npcCarryTick -= dt;
   for (const p of peds) {
     if (p.sayT > 0) p.sayT -= dt;
     if (p.voxT > 0) p.voxT -= dt;
+    if (p.pedOutlaw) {
+      p.outlawT -= dt;
+      if (p.outlawT <= 0) p.pedOutlaw = false;   // the trail goes cold
+    } else if (npcCarryTick <= 0 && !p.dead && !p.cop && p.mesh && p.mesh.userData.gun && p.mesh.userData.gun.visible
+        && !(combatMission() && (p.goon || p.guard || p.warTarget))) {
+      // open carry is illegal for EVERYONE: a cop who sees the iron starts
+      // the same 5-second clock the player gets
+      let seen = false;
+      for (const q of peds) {
+        if (!q.cop || q.dead) continue;
+        const d2 = dist(q.x, q.y, p.x, p.y);
+        if (d2 < 300 || (d2 < 650 && hasLOS(q.x, q.y, p.x, p.y))) { seen = true; break; }
+      }
+      if (seen) {
+        p.carryT = (p.carryT || 0) + 0.5;
+        if (p.carryT >= 5) {
+          p.pedOutlaw = true;
+          p.outlawT = 30;
+          sayNearestCop(p, 'Drop the weapon! Last warning!');
+        }
+      } else p.carryT = 0;
+    }
     if (!p.dead) updPed(p, dt);
   }
+  if (npcCarryTick <= 0) npcCarryTick = 0.5;
   updChatter(dt);
 
   for (const b of bullets) {
@@ -6968,10 +7239,11 @@ function update(dt) {
     const p = peds[i];
     const d = dist(p.x, p.y, f.x, f.y);
     if (p.dead) { removePedMesh(p); peds.splice(i, 1); continue; }
-    if (p.cop && !p.patrol && (stars() === 0 || d > 1900)) { removePedMesh(p); peds.splice(i, 1); continue; }
+    // a cop actively chasing an NPC gunman survives the zero-star cull
+    if (p.cop && !p.patrol && !(p.copTarget && !p.copTarget.dead) && (stars() === 0 || d > 1900)) { removePedMesh(p); peds.splice(i, 1); continue; }
     if (p.cop && p.patrol && d > 1600) { removePedMesh(p); peds.splice(i, 1); continue; }
     if (p.despawnOk && d > 800) { removePedMesh(p); peds.splice(i, 1); continue; }
-    if (!p.cop && !p.guard && !p.target && !p.warTarget && !p.goon && !p.vip && !p.shopkeep && !p.fare && !p.priest && !p.prayer && d > 1400) { removePedMesh(p); peds.splice(i, 1); }
+    if (!p.cop && !p.guard && !p.target && !p.warTarget && !p.goon && !p.vip && !p.shopkeep && !p.vendor && !p.fare && !p.priest && !p.prayer && d > 1400) { removePedMesh(p); peds.splice(i, 1); }
   }
   for (let i = cars.length - 1; i >= 0; i--) {
     const c = cars[i];
@@ -8383,6 +8655,70 @@ if (location.hash === '#island3') {
   mousePitch = -0.28;
   mouseYaw = camYaw = player.angle = -Math.PI / 2;   // face north toward the capitol
   console.log('ISLDBG zone=' + zoneOf(player.x, player.y) + ' district=' + districtAt(capitolPos.x, capitolPos.y) + ' capitol=' + Math.round(capitolPos.x) + ',' + Math.round(capitolPos.y));
+}
+if (location.hash === '#npclaw') {
+  // NPC crime parity: shooter gets hunted; open carry starts the same clock
+  startGame();
+  godMode = true;
+  const g = mkPed(player.x + 60, player.y, { goon: true, hp: 35, shirt: 0x6a1a1a });
+  attachPedMesh(g);
+  g.mesh.userData.gun.visible = true;
+  peds.push(g);
+  const cop = mkPed(g.x + 50, g.y, { cop: true, hp: 200, spd: 75, shirt: 0x20306a, patrol: true });
+  attachPedMesh(cop);
+  peds.push(cop);
+  g.cool = 0;
+  pedShoot(g, 0.016);
+  console.log('NPCLAWDBG afterShot outlaw=' + !!g.pedOutlaw);
+  updPed(cop, 0.016);
+  console.log('NPCLAWDBG copEngaged=' + (cop.copTarget === g) + ' patrolDropped=' + !cop.patrol);
+  // fresh scene for the open-carry leg: an idle cop parked next to an armed
+  // guard, driven by synchronous update() ticks (harness timers are unreliable)
+  const cop2 = mkPed(player.x - 200, player.y, { cop: true, hp: 200, spd: 0.001, patrol: true, shirt: 0x20306a });
+  attachPedMesh(cop2);
+  peds.push(cop2);
+  const g2 = mkPed(cop2.x + 40, cop2.y, { guard: true, hp: 50, shirt: 0x5a1a1a });
+  attachPedMesh(g2);
+  g2.mesh.userData.gun.visible = true;
+  peds.push(g2);
+  const px0 = g2.x, py0 = g2.y, cx0 = cop2.x, cy0 = cop2.y;
+  for (let i = 0; i < 420 && !g2.pedOutlaw; i++) {
+    update(1 / 60);
+    g2.x = px0; g2.y = py0; cop2.x = cx0; cop2.y = cy0;   // pin them face to face
+    g2.mesh.userData.gun.visible = true;
+  }
+  console.log('NPCLAWDBG openCarry outlaw=' + !!g2.pedOutlaw + ' carryT=' + (g2.carryT || 0).toFixed(1));
+}
+if (location.hash === '#lamp') {
+  // lamp two-tier receipt: slow hit bends, fast hit fells, 60s replaces
+  startGame();
+  const L0 = lamps[0];
+  const c = mkCar(L0.x - 18, L0.y, 0, 'sedan', 'player');
+  c.keep = true;
+  attachCarMesh(c);
+  cars.push(c);
+  c.speed = 70;
+  checkLampHits(c);
+  console.log('LAMPDBG slowHit broken=' + !!L0.broken + ' ang=' + (L0.maxAng || 0).toFixed(2) + ' carHp=' + Math.round(c.hp) + ' STOPPED speed=' + Math.round(c.speed) + ' pushedTo=' + Math.round(dist(c.x, c.y, L0.x, L0.y)));
+  c.x = L0.x - 18; c.y = L0.y;                 // drive back in for the hard hit
+  c.speed = 160;
+  checkLampHits(c);
+  console.log('LAMPDBG fastHit ang=' + (L0.maxAng || 0).toFixed(2) + ' (1.45 = felled)');
+  L0.respawnT = 0.01;
+  updLamps(0.02);
+  console.log('LAMPDBG respawned broken=' + !!L0.broken);
+}
+if (location.hash === '#hotdog') {
+  // the stand, under demo lights
+  startGame();
+  godMode = true;
+  const fc = foodCarts[0];
+  player.x = fc.x - 55; player.y = fc.y + 55;
+  mousePitch = 0.1;
+  camZoom = 1.3;
+  mouseYaw = camYaw = player.angle = Math.atan2(fc.y - player.y, fc.x - player.x);
+  scene.fog = null;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.85));
 }
 if (location.hash === '#exitside') {
   startGame();

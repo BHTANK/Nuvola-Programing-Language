@@ -261,7 +261,7 @@ function pollPad(dt) {
   const mx = dz(gp.axes[sw ? 2 : 0] || 0), my = dz(gp.axes[sw ? 3 : 1] || 0);
   const cx2 = dz(gp.axes[sw ? 0 : 2] || 0), cy2 = dz(gp.axes[sw ? 1 : 3] || 0);
   padLX = mx; padLY = my;
-  if (state === 'play' && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !cutscene && !wheelOpen) {
+  if (state === 'play' && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !bankOpen && !cutscene && !wheelOpen) {
     // while the weapon wheel is held open the right stick ONLY aims the
     // selector — no camera, nothing else
     const sens = padCfg.sens * 0.55;
@@ -307,7 +307,7 @@ function pollPad(dt) {
   // digital edges feed the same `pressed` set the keyboard uses.
   // In menus the pad becomes a navigator: dpad = arrows, A = enter, B = back.
   const edge = (i, code) => { if (btn(i) && !padPrev[i]) pressed.add(code); };
-  if (paused || state === 'menu' || shopOpen || modShopOpen || saveHouseOpen || priestOpen) {
+  if (paused || state === 'menu' || shopOpen || modShopOpen || saveHouseOpen || priestOpen || bankOpen) {
     edge(12, 'ArrowUp'); edge(13, 'ArrowDown'); edge(14, 'ArrowLeft'); edge(15, 'ArrowRight');
     edge(0, 'Enter'); edge(1, 'Escape');
     edge(M.pause, 'KeyP');
@@ -565,6 +565,7 @@ function saveGame(slot) {
     weapon: player.weapon, ammo: player.ammo, missionsDone: missionsDone, cheated: cheated,
     bridges: [bridgesOpen[0], bridgesOpen[1], bridgesOpen[2], bridgesOpen[3]], heat: heat, god: godMode, pardon: pardonMode,
     stats: STATS,
+    bank: bankBalance,
     garage: garageSnapshot()
   };
   try {
@@ -603,6 +604,7 @@ function loadGame(slot) {
   cheated = !!data.cheated;                  // an honest save loads honest
   if (data.stats) for (const k in STATS) if (typeof data.stats[k] === 'number') STATS[k] = data.stats[k];
   heat = data.heat || 0; wantedClearT = 30; copSeen = false;
+  bankBalance = data.bank || 0;
   disarmT = 0; disarmCool = 8;
   godMode = !!data.god;
   pardonMode = !!data.pardon;
@@ -1257,8 +1259,10 @@ function updGarDeck(ent) {
 function pWalkAt(x, y, deck, gar) {
   const g = garAt(x, y);
   if (g) return gWalkable(g, x, y, (gar === g && deck != null) ? deck : 0, player);
+  if (waterAt(x, y)) return true;                    // bailing into water: the swim takes over
   return !solidAtPx(x, y);
 }
+function waterAt(x, y) { return tileAt(Math.floor(x / TILE), Math.floor(y / TILE)) === T_WATER; }
 // camera-only solidity: water blocks cars, not sightlines
 function solidCamAt(x, y) {
   // inside a garage the camera floats through the structure with the player
@@ -1295,7 +1299,7 @@ let savePoint = null, garagePad = null, saveHouseOpen = false, saveIcon = null;
 const modPads = [];                              // tune-up garage pads
 let modShopOpen = false, priestOpen = false;
 const parkSpots = [];                            // store parking bays — any spot may hold a car
-let hospitals = [], playerStart = null, armyBase = null, capitolPos = null, heloPad = null;
+let hospitals = [], playerStart = null, armyBase = null, capitolPos = null, heloPad = null, atmSpot = null;
 let tankRespawnT = 0;                            // counts up while the army pad sits empty
 // 0 north harbor, 1 south harbor (A<->B), 2 west causeway (A->3), 3 east causeway (B->3)
 const bridgesOpen = [false, false, false, false];
@@ -1372,7 +1376,7 @@ function genCity() {
     '4,4': 'tenement', '16,4': 'rowhouse', '28,4': 'tenement', '40,4': 'docks',
     '4,16': 'rowhouse', '16,16': 'tenement', '28,16': 'park', '40,16': 'docks',
     '4,28': 'tenement', '16,28': 'police', '28,28': 'tenement', '40,28': 'docks',
-    '4,40': 'motel', '16,40': 'hospital', '28,40': 'tenement', '40,40': 'docks',
+    '4,40': 'motel', '16,40': 'hospital', '28,40': 'bank', '40,40': 'docks',
     '4,52': 'industry', '16,52': 'tenement', '28,52': 'rowhouse', '40,52': 'docks',
     '4,64': 'industry', '16,64': 'construction', '28,64': 'tenement', '40,64': 'docks',
     '4,76': 'gas', '16,76': 'industry', '28,76': 'rowhouse', '40,76': 'docks',
@@ -1545,6 +1549,13 @@ function genCity() {
           ry0: ggy + TILE, ry1: ggy + 4 * TILE,               // ramp run, 3 tiles
           top: 4, blk: []
         });
+      } else if (kind === 'bank') {
+        // FIRST NUVOLA BANK: stone civic block with a walk-up ATM by the door
+        paveAll(x0, y0);
+        markSolidRect(x0 + 4, y0 + 4, 5, 4);
+        buildings.push({ tx: x0 + 4, ty: y0 + 4, tw: 5, th: 4, floors: 4, tint: 0xb8b2a4, tex: 'conc', sign: 'bank' });
+        atmSpot = { x: (x0 + 7.8) * TILE, y: (y0 + 8) * TILE + 10 };
+        blockers.push({ x: atmSpot.x, y: atmSpot.y - 4, r: 5 });   // the machine itself
       } else if (kind === 'gas') {
         paveAll(x0, y0);
         markSolidRect(x0 + 5, y0 + 5, 2, 2);
@@ -1949,7 +1960,7 @@ function wheelSelFromAngle(ang) {
   return Math.round(a / (2 * Math.PI / WORDER.length)) % WORDER.length;
 }
 function openWheel(srcKind) {
-  if (wheelOpen || state !== 'play' || paused || shopOpen || saveHouseOpen || modShopOpen || priestOpen || player.car) return;
+  if (wheelOpen || state !== 'play' || paused || shopOpen || saveHouseOpen || modShopOpen || priestOpen || bankOpen || player.car) return;
   wheelOpen = true; wheelSrc = srcKind; wheelPX = 0; wheelPY = 0;
   wheelSel = Math.max(0, WORDER.indexOf(player.weapon));
   sfx('enter');
@@ -2549,6 +2560,7 @@ const TEXS = {
     police: signTexture('#1a3a6e', '#ffffff', 'POLICE', false),
     office: signTexture('#0c0c10', '#ffd070', 'OFFICE', false),
     parking: signTexture('#101418', '#ffd23f', 'PARKING', false),
+    bank: signTexture('#0e2416', '#7dffa0', 'FIRST NUVOLA BANK', false),
     hospital: signTexture('#f0f0f0', '#202028', 'HOSPITAL', true),
     mall: signTexture('#6e1a4a', '#ffe9b0', 'NUVOLA MALL', false),
     motel: signTexture('#0c0c10', '#ff5090', 'MOTEL', false),
@@ -3184,6 +3196,7 @@ function updLamps(dt) {
   }
 }
 function checkLampHits(c) {
+  if ((c.alt || 0) > 4) return;                      // the flying bird clips no lampposts
   if (!lampPoles) return;
   const sp = Math.abs(c.speed);
   if (sp < 2) return;
@@ -3437,6 +3450,19 @@ function checkLampHits(c) {
         blockers.push({ x: px2 / RS, y: pz2 / RS, r: 5 });   // pump body + skin, mesh-true
       }
     }
+  }
+  // the walk-up ATM beside the bank door: dark kiosk, lit screen, keypad
+  if (atmSpot) {
+    const ax = atmSpot.x * RS, az = (atmSpot.y - 4) * RS;
+    const kiosk = new THREE.Mesh(new THREE.BoxGeometry(1.7, 3.5, 1.1), new THREE.MeshLambertMaterial({ color: 0x23262e }));
+    kiosk.position.set(ax, 1.75, az);
+    scene.add(kiosk);
+    const screen = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.8, 0.12), new THREE.MeshBasicMaterial({ color: 0x9fe8b0 }));
+    screen.position.set(ax, 2.5, az + 0.56);
+    scene.add(screen);
+    const pad9 = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.5, 0.1), new THREE.MeshLambertMaterial({ color: 0x585c64 }));
+    pad9.position.set(ax, 1.7, az + 0.56);
+    scene.add(pad9);
   }
   // the army helipad: concrete circle, painted H, corner lights
   if (heloPad) {
@@ -5251,6 +5277,7 @@ function carHitsSolid(c) {
         continue;
       }
     }
+    if (waterAt(px, py)) continue;                   // water doesn't block a car — it drowns it
     if (solidAtPx(px, py)) return true;
   }
   return false;
@@ -5454,6 +5481,11 @@ function tireGrip(c, dt, gripScale) {
   c.speed *= Math.max(0, 1 - Math.abs(c.latV) * 0.0015 * dt);
 }
 function moveCar(c, dt) {
+  if (!c.drowned && waterAt(c.x, c.y)) {
+    c.drowned = true;                                // flooded: the engine locks up for good
+    sfx('crash', c.x, c.y, 40);
+    if (c === player.car) msg('Engine flooded. She is DONE.', 7);
+  }
   if (carHitsSolid(c)) unstickCar(c);
   const rx = -Math.sin(c.angle), ry = Math.cos(c.angle);   // car-right axis
   const dx = (Math.cos(c.angle) * c.speed + rx * c.latV) * dt;
@@ -5484,14 +5516,10 @@ function moveCar(c, dt) {
   c.latV *= 0.3;
 }
 function heloAimPoint() {
-  // the crosshair's ray from the camera, dropped onto the ground plane
-  const cvp = Math.cos(mousePitch), svp = Math.sin(mousePitch);
-  const dirX = Math.cos(mouseYaw) * cvp, dirY = -svp, dirZ = Math.sin(mouseYaw) * cvp;
-  const t9 = dirY < -0.05 ? Math.min(camPos.y / -dirY, 300) : 300;
-  return {
-    x: clamp((camPos.x + dirX * t9) / RS, 20, WORLD_W - 20),
-    y: clamp((camPos.z + dirZ * t9) / RS, 20, WORLD_H - 20)
-  };
+  // same aim triangle as on foot: the crosshair ray marched into the world —
+  // rooftops and walls catch rockets now, not just the street behind them
+  const ct = crosshairPoint();
+  return { x: clamp(ct.x, 20, WORLD_W - 20), y: clamp(ct.y, 20, WORLD_H - 20), h: ct.h };
 }
 function heloMuzzle(c, lx, lz) {
   const cs = Math.cos(c.angle), sn = Math.sin(c.angle);
@@ -5505,14 +5533,43 @@ function stepPlayerHelo(c, dt) {
   c.rotor = clamp((c.rotor || 0) + (thrN * 0.38 - brkN * 0.55) * dt, 0, 1);
   const ground = tileHeight(c.x, c.y);
   const floor9 = (c.alt || 0) >= ground - 0.1 ? ground : 0;   // rooftops hold the skids
-  const lift = ((c.rotor || 0) - 0.6) * 30;
-  c.vAlt = (c.vAlt || 0) + (lift - (c.vAlt || 0)) * Math.min(1, dt * 3);
-  c.alt = clamp((c.alt || 0) + c.vAlt * dt, floor9, 64);
+  // REAL vertical physics: constant gravity vs rotor-proportional lift, with
+  // blade-speed-dependent damping (autorotation drag). Powered flight feels
+  // as before (hover ~0.6 spool); a dead rotor is a ballistic brick — vAlt
+  // builds toward a -65 terminal, and the impact energy settles the rest.
+  const HELO_G = 22;
+  const auth = clamp((c.rotor || 0) / 0.6, 0, 1);             // blade authority
+  const liftAcc = (c.rotor || 0) * (HELO_G / 0.6);
+  const vDamp = 0.35 + auth * 0.95;
+  c.vAlt = clamp((c.vAlt || 0) + (liftAcc - HELO_G - (c.vAlt || 0) * vDamp) * dt, -65, 30);
+  const wasAlt = c.alt || 0;
+  c.alt = clamp(wasAlt + c.vAlt * dt, floor9, 64);
+  if (c.alt <= floor9 + 0.01 && wasAlt > floor9 + 0.01) {
+    const impact = Math.abs(Math.min(0, c.vAlt));             // momentum meets the ground
+    if (impact > 30 && !godMode) { explodeCar(c); return; }
+    if (impact > 14) {
+      carDamage(c, (impact - 14) * 10, null);
+      sfx('crash', c.x, c.y, impact * 3);
+      rumble(0.9, 0.5, 300);
+      c.vAlt = -c.vAlt * 0.18;                                // one hard bounce
+    }
+  }
   if (c.alt <= floor9 + 0.01) { c.alt = floor9; if (c.vAlt < 0) c.vAlt = 0; }
   if (c.alt < ground) c.alt = ground;                          // forgiving: pop over a wall you clip
+  if (waterAt(c.x, c.y) && c.alt <= 0.6 && !c.drowned) {
+    const impact = Math.abs(c.vAlt || 0) + Math.abs(c.speed || 0) * 0.12;
+    if (impact > 10) { explodeCar(c); return; }      // hit the water hard: she blows
+    c.drowned = true; c.rotor = 0;
+    if (c === player.car) msg('Rotor flooded. She is not coming back up.', 7);
+  }
+  if (c.drowned) { c.rotor = 0; c.vAlt = Math.min(0, c.vAlt || 0); }
   const air = c.alt > floor9 + 0.4 || (c.rotor || 0) > 0.62;
-  // yaw: the nose follows where you LOOK
-  if (air) c.angle += angDiff(c.angle, mouseYaw) * Math.min(1, dt * 2.4);
+  // yaw: the nose follows where you LOOK — with a LIVE tail rotor. A dead
+  // bird only drifts.
+  if (air) {
+    c.angle += angDiff(c.angle, mouseYaw) * Math.min(1, dt * 2.4) * auth;
+    if (auth < 0.4) c.angle += (1 - auth) * 0.7 * dt;         // uncontrolled slow spin
+  }
   // left stick: pitch and roll (keys: arrows pitch, A/D roll)
   const pit = clamp(((key('ArrowUp') ? 1 : 0) - (key('ArrowDown') ? 1 : 0)) || -padLY, -1, 1);
   const rol = clamp(((key('KeyD') ? 1 : 0) - (key('KeyA') ? 1 : 0)) || padLX, -1, 1);
@@ -5520,9 +5577,9 @@ function stepPlayerHelo(c, dt) {
   c.tiltR = (c.tiltR || 0) + (rol - (c.tiltR || 0)) * Math.min(1, dt * 5);
   if (c.alt > floor9 + 0.4) {
     const fx2 = Math.cos(c.angle), fy2 = Math.sin(c.angle), rx2 = -fy2, ry2 = fx2;
-    c.vx = (c.vx || 0) + (fx2 * c.tiltP * 190 + rx2 * c.tiltR * 130) * dt;
-    c.vy = (c.vy || 0) + (fy2 * c.tiltP * 190 + ry2 * c.tiltR * 130) * dt;
-    const drag = Math.pow(0.5, dt);
+    c.vx = (c.vx || 0) + (fx2 * c.tiltP * 260 + rx2 * c.tiltR * 180) * auth * dt;
+    c.vy = (c.vy || 0) + (fy2 * c.tiltP * 260 + ry2 * c.tiltR * 180) * auth * dt;
+    const drag = Math.pow(0.5 + (1 - auth) * 0.44, dt);       // dead rotor: momentum rides
     c.vx *= drag; c.vy *= drag;
     c.x = clamp(c.x + c.vx * dt, 60, WORLD_W - 60);
     c.y = clamp(c.y + c.vy * dt, 60, WORLD_H - 60);
@@ -5544,8 +5601,8 @@ function stepPlayerHelo(c, dt) {
       addPart(m.x, m.y, c.alt + 1.1, 0, 0, 0, 0.05, 0xffe9a0, 1.6, true);
     }
     const jx = tgt.x + rndf(-9, 9), jy = tgt.y + rndf(-9, 9);
-    spawnBullet(jx, jy, rndf(-8, 8), rndf(-8, 8), 0.07, 9, 5, 'p', 1.2, 0);
-    spawnBullet(jx + rndf(-6, 6), jy + rndf(-6, 6), rndf(-8, 8), rndf(-8, 8), 0.07, 9, 5, 'p', 1.2, 0);
+    spawnBullet(jx, jy, rndf(-8, 8), rndf(-8, 8), 0.07, 9, 5, 'p', (tgt.h || 0) + 1.2, 0);
+    spawnBullet(jx + rndf(-6, 6), jy + rndf(-6, 6), rndf(-8, 8), rndf(-8, 8), 0.07, 9, 5, 'p', (tgt.h || 0) + 1.2, 0);
     sparks(jx, jy);
     if (++c.cShots % 3 === 0) sfx('uzi', c.x, c.y);
     if (c.cShots % 5 === 0) decalAt(jx, jy, 0.5, 0x1a1a16);
@@ -5560,12 +5617,18 @@ function stepPlayerHelo(c, dt) {
     const ang = Math.atan2(tgt.y - m.y, tgt.x - m.x);
     const D = Math.max(60, dist(m.x, m.y, tgt.x, tgt.y));
     const tof = D / 460;
-    shells.push({ x: m.x, y: m.y, vx: Math.cos(ang) * 460, vy: Math.sin(ang) * 460, life: tof + 0.05, src: c, pby: true, done: false, h: c.alt + 1.4, vh: -(c.alt + 1.2) / tof, mesh: grabMesh(shellMeshes) });
+    shells.push({ x: m.x, y: m.y, vx: Math.cos(ang) * 460, vy: Math.sin(ang) * 460, life: tof + 0.05, src: c, pby: true, done: false, h: c.alt + 1.4, vh: ((tgt.h || 0) + 0.2 - (c.alt + 1.4)) / tof, mesh: grabMesh(shellMeshes) });
     sfx('rocket', m.x, m.y);
     rumble(0.5, 0.2, 160);
   }
 }
 function stepPlayerCar(c, dt) {
+  if (c.drowned) {                                   // locked up: no throttle, no steering — bail out
+    c.speed *= Math.pow(0.08, dt);
+    c.steerVis = 0;
+    moveCar(c, dt);
+    return;
+  }
   // keyboard is digital; pad triggers are analog throttle/brake, stick steers
   const thr = (key('KeyW') || key('ArrowUp')) ? 1 : padThrottle;
   const brk = (key('KeyS') || key('ArrowDown')) ? 1 : padBrakeV;
@@ -5764,7 +5827,7 @@ function fireShell(c, ang, elev) {
   sfx('cannon', s.x, s.y);
 }
 function fireRocket(x, y, ang, vh) {
-  const s = { x: x + Math.cos(ang) * 20, y: y + Math.sin(ang) * 20, vx: Math.cos(ang) * 430, vy: Math.sin(ang) * 430, life: 1.4, src: null, pby: true, done: false, h: 1.6, vh: vh || 0, mesh: grabMesh(shellMeshes) };
+  const s = { x: x + Math.cos(ang) * 20, y: y + Math.sin(ang) * 20, vx: Math.cos(ang) * 430, vy: Math.sin(ang) * 430, life: 1.4, src: null, pby: true, done: false, h: 1.6 + gHeightAt(player), vh: vh || 0, mesh: grabMesh(shellMeshes) };
   shells.push(s);
   sfx('rocket', s.x, s.y);
 }
@@ -5832,7 +5895,7 @@ function ensureMilGuards() {
   }
   // the attack bird waits on its pad; a destroyed one is replaced
   let hv = null;
-  for (const c of cars) if (c.kind === 'helo' && !c.dead) hv = c;
+  for (const c of cars) if (c.kind === 'helo' && !c.dead && !c.drowned) hv = c;
   if (!hv && heloPad) {
     const h = mkCar(heloPad.x, heloPad.y, 0, 'helo', null);
     h.angle = -Math.PI / 2; h.keep = true; h.alt = 0; h.rotor = 0; h.vx = 0; h.vy = 0;
@@ -5870,7 +5933,7 @@ function updArmyTank(c, dt) {
     fireShell(c, ta + rndf(-0.12, 0.12));
   }
   for (const p of peds) {
-    if (p.dead || p.rag || p.cop) continue;
+    if (p.dead || p.rag || p.cop || p.riding) continue;
     if (Math.abs(c.speed) > 20 && dist(p.x, p.y, c.x, c.y) < 26) { p.hp -= 500; p.ragBy = false; launchRag(p, c); }
   }
 }
@@ -6705,7 +6768,7 @@ function carCollisions() {
     for (let j = i + 1; j < cars.length; j++) {
       const b = cars[j];
       if (b.dead) continue;
-      if ((a.gDeck || 0) !== (b.gDeck || 0)) continue;   // different garage decks
+      if ((a.gDeck || 0) !== (b.gDeck || 0) || Math.abs((a.alt || 0) - (b.alt || 0)) > 6) continue;   // different decks / altitudes never touch
       const d = dist(a.x, a.y, b.x, b.y);
       const rr2 = (a.len + b.len) / 4 + 4;
       if (d > rr2 || d === 0) continue;
@@ -6767,6 +6830,7 @@ function moveCircle(o, dx, dy) {
 function charCarHit(o, r) {
   for (const c of cars) {
     if (c.dead) continue;
+    if ((c.alt || 0) > 4) continue;                  // airborne: nothing on the street feels it
     if (Math.abs(c.x - o.x) > 60 || Math.abs(c.y - o.y) > 60) continue;
     const cs = Math.cos(c.angle), sn = Math.sin(c.angle);
     const dx = o.x - c.x, dy = o.y - c.y;
@@ -7282,6 +7346,40 @@ function gunfireWitnessed() {
 // below the mark at every range. Converge instead: find the point the
 // crosshair actually covers (chest plane when aiming down, the ground when
 // steep, a 500px sight-in otherwise) and aim the muzzle AT that point.
+let lastPivotY = 3.2;
+function aimPivotY() {
+  // the character's eye height RIGHT NOW (same formula the camera uses)
+  return (player.car ? 4 : swim ? 0.9 : 3.2)
+    + gHeightAt(player.car || player)
+    + (player.car && player.car.alt ? player.car.alt : 0);
+}
+function crosshairPoint() {
+  // the aim TRIANGLE: the camera looks from above through the character's
+  // eyes; this ray, marched against real world heights, is what the
+  // crosshair marks. Weapons fire from the character TO this point — so the
+  // crosshair stays true without shooting through the character or the bird.
+  const f = focus();
+  const cvp = Math.max(0.05, Math.cos(mousePitch));
+  const slope = -Math.sin(mousePitch) / cvp;         // render units of height per render unit forward
+  const hx = Math.cos(mouseYaw), hz = Math.sin(mouseYaw);
+  const p0 = aimPivotY();
+  let x = f.x, y = f.y, hh = p0, prevH = p0;
+  for (let d9 = 10; d9 <= 1400; d9 += 10) {
+    x += hx * 10; y += hz * 10; prevH = hh; hh += slope * 10 * RS;
+    const th = Math.max(0, tileHeight(x, y));
+    if (hh <= th) {
+      // refine to the actual surface: came down THROUGH the roof plane, or
+      // straight into a wall face
+      if (prevH >= th && hh < th) {
+        const t9 = (prevH - th) / Math.max(0.001, prevH - hh);
+        return { x: x - hx * 10 * (1 - t9), y: y - hz * 10 * (1 - t9), h: th, d: d9 - 10 * (1 - t9) };
+      }
+      return { x, y, h: clamp(hh, 0, th), d: d9 };
+    }
+    if (hh > 120) return { x, y, h: hh, d: d9 };     // aimed at the sky: point ON the ray, where it left the world
+  }
+  return { x: f.x + hx * 1400, y: f.y + hz * 1400, h: Math.max(0.5, hh), d: 1400 };
+}
 function aimVh(spd, h0) {
   let dRef = 500;
   if (mousePitch > 0.03) {
@@ -7296,7 +7394,11 @@ function fireWeapon() {
   const W = WEAPONS[player.weapon];
   if (player.fireT > 0) return;
   if (!W.melee) STATS.ammoSpent++;           // every trigger pull goes in the ledger
-  const aimAng = aimTarget ? Math.atan2(aimTarget.y - player.y, aimTarget.x - player.x) : mouseYaw;
+  const ct9 = (aimTarget || W.melee) ? null : crosshairPoint();
+  const ctD = ct9 ? Math.max(8, dist(player.x, player.y, ct9.x, ct9.y) - 16) : 0;   // from the MUZZLE (16px out)
+  const gunH = gHeightAt(player);              // shots start at the hand, wherever the hand stands
+  const aimAng = aimTarget ? Math.atan2(aimTarget.y - player.y, aimTarget.x - player.x)
+    : ct9 ? Math.atan2(ct9.y - player.y, ct9.x - player.x) : mouseYaw;
   if (W.melee) {
     player.fireT = W.rate;
     rumble(0.25, 0.05, 70);
@@ -7347,7 +7449,7 @@ function fireWeapon() {
     player.fireT = W.rate;
     player.ammo.rpg--;
     rumble(0.7, 0.4, 220);
-    fireRocket(player.x, player.y, aimAng, aimTarget ? 0 : aimVh(430, 1.6));
+    fireRocket(player.x, player.y, aimAng, aimTarget ? 0 : clamp((ct9.h - (1.6 + gunH)) * 430 / ctD, -400, 400));
     scare(player.x, player.y, 280);
     gunfireWitnessed();
     return;
@@ -7356,11 +7458,12 @@ function fireWeapon() {
   player.fireT = W.rate;
   rumble(W.pellets ? 0.6 : player.weapon === 'uzi' ? 0.12 : 0.3, W.pellets ? 0.3 : 0.1, W.pellets ? 140 : 70);
   const n = W.pellets || 1;
-  // shots land ON the crosshair, not under it (locked targets aim level)
-  const vh0 = aimTarget ? 0 : aimVh(W.spd, 1.9);
+  // shots land ON the crosshair, not under it (locked targets aim level):
+  // the drop is computed to the marked point itself — roof, wall or street
+  const vh0 = aimTarget ? 0 : clamp((ct9.h - (1.9 + gunH)) * W.spd / ctD, -W.spd, W.spd);
   for (let i = 0; i < n; i++) {
     const ang = aimAng + (Math.random() - 0.5) * 2 * W.spread;
-    spawnBullet(player.x + Math.cos(aimAng) * 16, player.y + Math.sin(aimAng) * 16, Math.cos(ang) * W.spd, Math.sin(ang) * W.spd, W.life, W.dmg, W.cdmg, 'p', 1.9, vh0);
+    spawnBullet(player.x + Math.cos(aimAng) * 16, player.y + Math.sin(aimAng) * 16, Math.cos(ang) * W.spd, Math.sin(ang) * W.spd, W.life, W.dmg, W.cdmg, 'p', 1.9 + gunH, vh0);
   }
   addPart(player.x + Math.cos(aimAng) * 18, player.y + Math.sin(aimAng) * 18, 2.1, 0, 0, 0, 0.05, 0xffe9a0, 1.4, true);
   sfx(W.sfx);
@@ -7467,6 +7570,13 @@ function enterCar(bc) {
   bc.keep = true;
   bc.speed *= 0.3;
   player.car = bc;
+  if (partner && !partner.dead) {
+    // the crew boards WITH you — stowed instantly, no first-frame squash race
+    partner.riding = true;
+    partner.rag = null;
+    partner.x = bc.x; partner.y = bc.y;
+    if (partner.mesh) { partner.mesh.visible = false; partner.mesh.userData.gun.visible = false; partner.mesh.rotation.set(0, 0, 0); }
+  }
   // stealing police property carries a mandatory wanted level
   if (!bc.stolen) {
     bc.stolen = true;
@@ -7672,6 +7782,28 @@ function openGunShop() {
   shopOpen = true;
   menuSel = 0;
   sfx('enter');
+}
+let bankOpen = false, bankBalance = 0;       // what's banked, the law can't touch
+function openBank() {
+  bankOpen = true;
+  menuSel = 0;
+  sfx('enter');
+}
+function bankItems() {
+  return [
+    { key: '1', name: 'Deposit $500', act: () => bankMove(Math.min(500, player.cash), 1) },
+    { key: '2', name: 'Deposit ALL', act: () => bankMove(player.cash, 1) },
+    { key: '3', name: 'Withdraw $500', act: () => bankMove(Math.min(500, bankBalance), -1) },
+    { key: '4', name: 'Withdraw ALL', act: () => bankMove(bankBalance, -1) }
+  ];
+}
+function bankMove(amt, dir) {
+  amt = Math.max(0, Math.floor(amt));
+  if (amt <= 0) { msg(dir > 0 ? 'No cash to deposit.' : 'Nothing in the account.'); return; }
+  player.cash -= amt * dir;
+  bankBalance += amt * dir;
+  sfx('buy');
+  msg((dir > 0 ? 'Deposited $' : 'Withdrew $') + amt + '.  Balance: $' + bankBalance);
 }
 function buyHotdog() {
   if (player.cash < 10) { msg('Hot dogs are $10.'); return; }
@@ -8341,7 +8473,7 @@ function updAlly(p, dt) {
   if (pc && !pc.dead) {
     p.riding = true;
     p.x = pc.x; p.y = pc.y;
-    if (p.mesh) p.mesh.visible = false;
+    if (p.mesh) { p.mesh.visible = false; p.mesh.userData.gun.visible = false; }
     return;
   }
   if (p.riding) {
@@ -8561,6 +8693,7 @@ function nearestAction() {
   const acts = [];
   const pd = (x, y) => dist(x, y, player.x, player.y);
   for (const gs of gunShops) { const d = pd(gs.x, gs.y); if (d < 34) acts.push({ d, go: openGunShop }); }
+  if (atmSpot) { const d = pd(atmSpot.x, atmSpot.y); if (d < 34) acts.push({ d, go: openBank }); }
   for (const fc of foodCarts) { const d = pd(fc.x, fc.y); if (d < 34) acts.push({ d, go: buyHotdog }); }
   if (savePoint) { const d = pd(savePoint.x, savePoint.y); if (d < 34) acts.push({ d, go: openSaveHouse }); }
   for (const p of peds) {
@@ -8808,6 +8941,17 @@ function update(dt) {
     pressed.clear();
     return;
   }
+  if (bankOpen) {
+    const BK = bankItems();
+    if (pressed.has('ArrowUp')) menuSel = (menuSel + BK.length - 1) % BK.length;
+    if (pressed.has('ArrowDown')) menuSel = (menuSel + 1) % BK.length;
+    for (let ii = 0; ii < BK.length; ii++) {
+      if (pressed.has('Digit' + BK[ii].key) || (pressed.has('Enter') && ii === menuSel)) BK[ii].act();
+    }
+    if (pressed.has('KeyE') || pressed.has('Escape')) bankOpen = false;
+    pressed.clear();
+    return;
+  }
   if (saveHouseOpen) {
     if (pressed.has('ArrowUp')) menuSel = (menuSel + 9) % 10;
     if (pressed.has('ArrowDown')) menuSel = (menuSel + 1) % 10;
@@ -8880,7 +9024,7 @@ function update(dt) {
     return;
   }
   // controller Back/Share (or O) jumps straight into the settings from play
-  if (pressed.has('KeyO') && !paused && state === 'play' && !shopOpen && !modShopOpen && !saveHouseOpen && !priestOpen && !cutscene) {
+  if (pressed.has('KeyO') && !paused && state === 'play' && !shopOpen && !modShopOpen && !saveHouseOpen && !priestOpen && !bankOpen && !cutscene) {
     paused = true;
     settingsOpen = true;
     settingsSel = 0;
@@ -9015,6 +9159,7 @@ function update(dt) {
 
   for (const c of cars) {
     if (c.dead) continue;
+    if (c.drowned) { c.sink = Math.min(2.8, (c.sink || 0) + dt * 0.9); c.speed *= Math.pow(0.1, dt); c.latV *= Math.pow(0.1, dt); }
     if (c.driver === 'ai') updTraffic(c, dt);
     else if (c.driver === 'mil') updMilGuard(c, dt);
     else if (c.driver === 'cop') { if (c.kind === 'tank') updArmyTank(c, dt); else updCopCar(c, dt); }
@@ -9069,9 +9214,11 @@ function update(dt) {
   }
   for (const p of peds) {
     if (p.dead) continue;
+    if (p.riding) continue;                          // riding shotgun: not on the street
     if (p.rag && p.rag.h > 1.5) continue;            // flying overhead — cars pass under
     const hc = charCarHit(p, 7);
     if (!hc) continue;
+    if (p.ally && hc === player.car) continue;       // your crew boards — you don't run them down
     if (p.cop && hc.driver === 'cop') continue;      // police don't squash their own
     const sp = Math.hypot(hc.speed, hc.latV);        // sideways momentum counts
     const tank = hc.kind === 'tank';
@@ -9407,18 +9554,19 @@ function update(dt) {
 // ---------------------------------------------------------------- render sync
 let camYaw = 0;
 const camPos = new THREE.Vector3(playerStart.x * RS, 10, playerStart.y * RS + 20);
+const camLook = new THREE.Vector3(playerStart.x * RS, 3, playerStart.y * RS);
 function syncScene(dt, t) {
   // cars
   for (const c of cars) {
     if (!c.mesh) continue;
     c.mesh.visible = !c.dead;
     if (c.dead) continue;
-    c.mesh.position.set(c.x * RS, gHeightAt(c) + (c.empl || 0), c.y * RS);
+    c.mesh.position.set(c.x * RS, gHeightAt(c) + (c.empl || 0) - (c.sink || 0), c.y * RS);
     c.mesh.rotation.y = -c.angle;
     if (c.kind === 'helo') {
-      c.mesh.position.y = (c.alt || 0) + 2.55;
+      c.mesh.position.y = (c.alt || 0) + 2.55 - (c.sink || 0);
       c.mesh.rotation.order = 'YZX';
-      c.mesh.rotation.set((c.tiltR || 0) * 0.16, -c.angle, -(c.tiltP || 0) * 0.2);
+      c.mesh.rotation.set((c.tiltR || 0) * 0.5, -c.angle, -(c.tiltP || 0) * 0.55);   // real helicopter attitudes, ~30 degrees at full stick
       if (!c.driver) c.rotor = Math.max(0, (c.rotor || 0) - dt * 0.08);   // abandoned: spools down
       c.rotorW = (c.rotorW || 0) + (0.6 + (c.rotor || 0) * 36) * dt * ((c.rotor || 0) > 0.005 ? 1 : 0);
       const hu = c.mesh.userData;
@@ -9662,6 +9810,7 @@ function syncScene(dt, t) {
   const fx = f.x * RS, fz = f.y * RS;
   const gH = gHeightAt(player.car || player) + (player.car && player.car.alt ? player.car.alt : 0);
   const pivotY = (player.car ? 4 : swim ? 0.9 : 3.2) + gH;   // the lens rides the waterline with a swimmer — and garage decks
+  lastPivotY = pivotY;                                        // the aim triangle starts here (the character's eyes)
   // camera collision: pull in so we never sit inside a building
   let tMax = 1;
   const hDist = cd * cvp;
@@ -9669,15 +9818,28 @@ function syncScene(dt, t) {
     const tt = i / 8;
     if (solidCamAt(f.x - Math.cos(camYaw) * (hDist / RS) * tt, f.y - Math.sin(camYaw) * (hDist / RS) * tt)) { tMax = (i - 1) / 8; break; }
   }
-  const cdEff = cd * Math.max(0.2, tMax);
+  let cdEff = cd * Math.max(0.2, tMax);
+  // THE TRIANGLE: the camera perches ABOVE the eye line and looks AT the aim
+  // mark, so the screen-center reticle sits ON the weapon's impact point and
+  // the sight line passes clean over the character (or the bird), never
+  // through them. Weapons still fire from the eyes to the same mark.
+  const camRise = player.car ? (player.car.kind === 'helo' ? 4.5 : 3) : swim ? 1.6 : 2.4;
+  const perchY = pivotY + camRise;
+  // floor the camera by DOLLYING IN along the ray, never by lifting it off
+  if (perchY - dirY * cdEff < 0.5 + gH && dirY > 0.01) cdEff = Math.max(1.2, (perchY - (0.5 + gH)) / dirY);
   const dx = fx - dirX * cdEff;
-  const dy = Math.max(0.5 + gH, pivotY - dirY * cdEff);    // never below the pavement (or the deck)
+  const dy = perchY - dirY * cdEff;
   const dz = fz - dirZ * cdEff;
   camPos.x += (dx - camPos.x) * Math.min(1, dt * 14);
   camPos.y += (dy - camPos.y) * Math.min(1, dt * 10);
   camPos.z += (dz - camPos.z) * Math.min(1, dt * 14);
   camera.position.copy(camPos);
-  camera.lookAt(camPos.x + dirX * 30, camPos.y + dirY * 30, camPos.z + dirZ * 30);
+  const mk9 = crosshairPoint();
+  const lk = Math.min(1, dt * 16);           // eased so depth pops don't snap the view
+  camLook.x += (mk9.x * RS - camLook.x) * lk;
+  camLook.y += (mk9.h + 0.4 - camLook.y) * lk;
+  camLook.z += (mk9.y * RS - camLook.z) * lk;
+  camera.lookAt(camLook);
 }
 
 // ---------------------------------------------------------------- HUD
@@ -9983,6 +10145,7 @@ function drawHUD(t) {
     hctx.fillRect(mxp + x * sx - r, myp + y * sy - r, r * 2, r * 2);
   }
   for (const ph of phones) blip(ph.x, ph.y, '#3fdc5f', 2);
+  if (atmSpot) blip(atmSpot.x, atmSpot.y, '#7dffa0', 3);
   for (const gs of gunShops) blip(gs.x, gs.y, '#ff9030', 2);
   if (savePoint) blip(savePoint.x, savePoint.y, '#8fffb0', 3);
   if (garagePad) blip(garagePad.x, garagePad.y, '#40b0e0', 3);
@@ -10104,7 +10267,7 @@ function drawHUD(t) {
     hctx.fillText('CHEATER', VW - 18, VH - 18);
   }
   // pointer-lock hint
-  if (!ptrLocked && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !priestOpen) {
+  if (!ptrLocked && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !priestOpen && !bankOpen) {
     hctx.textAlign = 'center';
     hctx.font = 'bold 15px monospace';
     hctx.fillStyle = '#3fdc5f';
@@ -10158,6 +10321,33 @@ function drawHUD(t) {
       hctx.fillText('$' + it.cost, x0 + w - 30, iy);
       hctx.textAlign = 'left';
       iy += 30 + (rows2 - 1) * 21;
+    }
+  }
+  // the ATM
+  if (bankOpen) {
+    const w = 420, h = 290, x0 = VW / 2 - w / 2, y0 = VH / 2 - h / 2;
+    hctx.fillStyle = 'rgba(4,10,6,0.9)';
+    hctx.fillRect(x0, y0, w, h);
+    hctx.strokeStyle = '#3fdc5f';
+    hctx.lineWidth = 2;
+    hctx.strokeRect(x0, y0, w, h);
+    hctx.textAlign = 'center';
+    hctx.font = 'bold 22px monospace';
+    hctx.fillStyle = '#7dffa0';
+    hctx.fillText('FIRST NUVOLA BANK', VW / 2, y0 + 34);
+    hctx.font = '15px monospace';
+    hctx.fillStyle = '#cfe8d4';
+    hctx.fillText('Balance: $' + bankBalance + '    Cash: $' + player.cash, VW / 2, y0 + 62);
+    hctx.fillStyle = '#7a8a7e';
+    hctx.fillText('Banked money is safe from fines.  (E or Esc to leave)', VW / 2, y0 + 84);
+    hctx.textAlign = 'left';
+    const BK = bankItems();
+    let iy = y0 + 120;
+    for (let ii = 0; ii < BK.length; ii++) {
+      hctx.fillStyle = ii === menuSel ? '#7dffa0' : '#e8ece8';
+      hctx.font = 'bold 15px monospace';
+      hctx.fillText((ii === menuSel ? '▶' : ' ') + '[' + BK[ii].key + '] ' + BK[ii].name, x0 + 16, iy);
+      iy += 32;
     }
   }
   // the tune-up garage menu
@@ -12037,3 +12227,4 @@ requestAnimationFrame(frame);
 </script>
 </body>
 </html>
+

@@ -1279,9 +1279,13 @@ function solidAtPx(x, y) {
   const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
   if (!inGrid(ix, iy)) return true;
   if (solid[idx(ix, iy)] === 1) return true;
-  for (const b of blockers) {
-    const dx = x - b.x, dy = y - b.y;
-    if (dx * dx + dy * dy < b.r * b.r) return true;   // inside the circular footprint
+  // only the props whose footprint touches THIS tile — never the whole city
+  const arr = blockGrid.get(ix + ',' + iy);
+  if (arr) for (const b of arr) {
+    if (b.r !== undefined) {
+      const dx = x - b.x, dy = y - b.y;
+      if (dx * dx + dy * dy < b.r * b.r) return true;   // inside the circular footprint
+    } else if (x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1) return true;   // inside the exact box
   }
   return false;
 }
@@ -1370,11 +1374,43 @@ function isBridge(ix, iy) {
   return (ix >= MIL.bcol && ix < MIL.bcol + MIL.bwid) && iy >= MIL.by0 && iy <= MIL.by1;
 }
 const buildings = [], trees = [], pickups = [], phones = [], lamps = [], pads = [], gunShops = [], foodCarts = [];
-const crosswalks = [];   // corner crossing points: { x, y, to: [far corners] }
+const crosswalks = [];   // corner crossing points: { x, y, to: [far corners], key }
+// working traffic signals: one pole per built corner of every live crossing.
+// EVERY light runs on the SAME master loop (one period, one clock); each
+// intersection carries its own PLAN on that loop: phase offset (adjacent
+// crossings alternate — traffic flows in waves) and per-axis green splits
+// (4-way = even; T junction = long through / short single-lane stem).
+const TL_PERIOD = 16, TL_YELLOW = 1.5;           // one loop for the whole city
+const trafficLights = [];                        // { x, y, key } pole spots (logic px)
+const signalized = new Map();                    // 'cx,cy' -> { off, ewG, nsG }
 const props = { cranes: [], tanks: [], stacks: [], conts: [], bills: [], masts: [], ponds: [], gas: [], steeples: [], signs: [], tcranes: [], ships: [], churches: [] };
-// round obstacles collide by their REAL radius, not a square tile block —
-// the mesh is the only contact point, no phantom walls at the corners
-const blockers = [];
+// SOLIDS BY DEFAULT (Tank standing order 2026-07-09): everything placed in
+// the world gets collision the moment its mesh exists. Round props collide
+// by their REAL radius (circles), square furniture by its EXACT footprint
+// (axis-aligned rects) — the mesh is the only contact point, no phantom
+// walls. Both live in one tile-bucketed grid so solidAtPx stays O(bucket).
+const blockers = [];                             // circles { x, y, r } (logic px)
+const blockRects = [];                           // rects { x0, y0, x1, y1 } (logic px)
+const blockGrid = new Map();                     // tile key -> refs from both lists
+function blockGridReg(b, x0, y0, x1, y1) {
+  for (let iy = Math.floor(y0 / TILE); iy <= Math.floor(y1 / TILE); iy++)
+    for (let ix = Math.floor(x0 / TILE); ix <= Math.floor(x1 / TILE); ix++) {
+      const k = ix + ',' + iy;
+      if (!blockGrid.has(k)) blockGrid.set(k, []);
+      blockGrid.get(k).push(b);
+    }
+}
+function addBlocker(x, y, r) {
+  const b = { x, y, r };
+  blockers.push(b);
+  blockGridReg(b, x - r, y - r, x + r, y + r);
+}
+// exact box footprint, given in RENDER units (center + size) like the meshes
+function addBlockRectRU(cx, cz, sx, sz) {
+  const b = { x0: (cx - sx / 2) / RS, y0: (cz - sz / 2) / RS, x1: (cx + sx / 2) / RS, y1: (cz + sz / 2) / RS };
+  blockRects.push(b);
+  blockGridReg(b, b.x0, b.y0, b.x1, b.y1);
+}
 let stadiumPos = null, policeStation = null, DISTRICT_MAP = null;
 let policePads = [];
 // story landmarks: your home, the new hideout, Jason, the Ledger press
@@ -1407,7 +1443,12 @@ function findTileNear(tx, ty, type) {
     for (let iy = ty - r; iy <= ty + r; iy++) {
       for (let ix = tx - r; ix <= tx + r; ix++) {
         if (Math.max(Math.abs(ix - tx), Math.abs(iy - ty)) !== r) continue;
-        if (tileAt(ix, iy) === type) return { x: (ix + 0.5) * TILE, y: (iy + 0.5) * TILE };
+        if (tileAt(ix, iy) !== type) continue;
+        const cx9 = (ix + 0.5) * TILE, cy9 = (iy + 0.5) * TILE;
+        // SOLIDS: never hand out a spot inside a prop's footprint (kiosk,
+        // cart, pole…) — a body spawned inside a solid can't walk out
+        if (type !== T_WATER && solidAtPx(cx9, cy9)) continue;
+        return { x: cx9, y: cy9 };
       }
     }
   }
@@ -1564,11 +1605,11 @@ function genCity() {
         buildings.push({ tx: x0 + 6, ty: y0, tw: 2, th: 2, floors: 1.4, tint: 0x5a5e66, tex: 'conc', style: 'warehouse', store: false });
         for (const [rx, ry] of [[x0 + 5, y0 + 4], [x0 + 1, y0 + 5]]) {
           const tkx = (rx + 1) * TILE, tky = (ry + 1) * TILE;
-          blockers.push({ x: tkx, y: tky, r: 34 });      // fuel tank: 30px cylinder + skin
+          addBlocker(tkx, tky, 34);                      // fuel tank: 30px cylinder + skin
           props.tanks.push({ x: tkx, y: tky });
         }
         const skx = (x0 + 7.5) * TILE, sky = (y0 + 0.5) * TILE;
-        blockers.push({ x: skx, y: sky, r: 14 });         // smokestack: ~10px pole + skin
+        addBlocker(skx, sky, 14);                         // smokestack: ~10px pole + skin
         props.stacks.push({ x: skx, y: sky });
       } else if (kind === 'docks') {
         paveAll(x0, y0);
@@ -1684,7 +1725,7 @@ function genCity() {
         markSolidRect(x0 + 4, y0 + 4, 5, 4);
         buildings.push({ tx: x0 + 4, ty: y0 + 4, tw: 5, th: 4, floors: 4, tint: 0xb8b2a4, tex: 'conc', style: 'civic', sign: 'bank' });
         atmSpot = { x: (x0 + 7.8) * TILE, y: (y0 + 8) * TILE + 10 };
-        blockers.push({ x: atmSpot.x, y: atmSpot.y - 4, r: 5 });   // the machine itself
+        addBlocker(atmSpot.x, atmSpot.y - 4, 5);         // the machine itself
       } else if (kind === 'gas') {
         paveAll(x0, y0);
         markSolidRect(x0 + 5, y0 + 5, 2, 2);
@@ -1782,8 +1823,44 @@ function genCity() {
     }
     for (const [a, b] of [['-1,-1', '2,-1'], ['-1,2', '2,2'], ['-1,-1', '-1,2'], ['2,-1', '2,2']]) {
       if (corners[a] && corners[b]) {
-        cwEntry(corners[a].x, corners[a].y).to.push(corners[b]);
-        cwEntry(corners[b].x, corners[b].y).to.push(corners[a]);
+        const e1 = cwEntry(corners[a].x, corners[a].y);
+        const e2 = cwEntry(corners[b].x, corners[b].y);
+        e1.key = e2.key = cx + ',' + cy;         // ties this crosswalk to its signal
+        e1.to.push(corners[b]);
+        e2.to.push(corners[a]);
+      }
+    }
+    // signalized crossing: live road core + at least 3 ARMS (a bend is not
+    // an intersection) + a built corner. The pole stands 16px in from the
+    // corner tile center, toward the crossing — clear of the lamp AND the
+    // corner-to-corner crosswalk lines.
+    // TIMING PLAN (all on the ONE master loop):
+    //   adjacent crossings ALTERNATE phase (checkerboard by base index) so
+    //   platoons roll through waves instead of the whole city stopping;
+    //   4-way = even split to each direction; T junction = the single-lane
+    //   stem gets a SHORT green while the through road runs long.
+    if (tileAt(cx, cy) === T_ROAD && tileAt(cx + 1, cy + 1) === T_ROAD && Object.keys(corners).length) {
+      const armE = tileAt(cx + 2, cy) === T_ROAD, armW = tileAt(cx - 1, cy) === T_ROAD;
+      const armS = tileAt(cx, cy + 2) === T_ROAD, armN = tileAt(cx, cy - 1) === T_ROAD;
+      const arms = armE + armW + armS + armN;
+      if (arms >= 3) {
+        const key = cx + ',' + cy;
+        const off = ((ROADCOL_BASES.indexOf(cx) + ROADROW_BASES.indexOf(cy)) % 2) * (TL_PERIOD / 2);
+        let ewG = 6.5, nsG = 6.5;                // 4-way: even time to each direction
+        if (arms === 3) {
+          if (armE !== armW) { ewG = 3; nsG = 10; }   // EW is the one-armed stem
+          else { ewG = 10; nsG = 3; }                 // NS is the one-armed stem
+        }
+        signalized.set(key, { off, ewG, nsG });
+        const TOWARD = { '-1,-1': [1, 1], '2,-1': [-1, 1], '-1,2': [1, -1], '2,2': [-1, -1] };
+        for (const k in corners) {
+          // fx/fy: which way each lens FACES — toward the crossing, i.e. at
+          // the far-side approach this corner serves (real-intersection rule)
+          trafficLights.push({
+            x: corners[k].x + TOWARD[k][0] * 16, y: corners[k].y + TOWARD[k][1] * 16,
+            key, fx: TOWARD[k][0], fy: TOWARD[k][1]
+          });
+        }
       }
     }
   }
@@ -2132,7 +2209,14 @@ function resolveBuildingSeams() {
     for (const b of buildings) {
       if (ix + 1 > b.tx && ix - 1 < b.tx + b.tw && iy + 1 > b.ty && iy < b.ty + b.th) { hit = true; break; }
     }
-    if (hit) { dropped++; continue; }
+    if (hit) {
+      dropped++;
+      // COLLISION = MESH both ways: this box's mesh will never be built, so
+      // its markSolidRect tiles must go too — a dropped container used to
+      // leave a 2x1 INVISIBLE wall on the dock (phantom-wall bug)
+      freeIfUnclaimed(ix - 1, iy, 2, 1);
+      continue;
+    }
     kept.push(ct);
   }
   props.conts = kept;
@@ -3291,7 +3375,9 @@ function billTexture(bg, fg, l1, l2) {
 // Motel door sill as a fraction of wall height (from the ground).
 // Texture and 3D stoops BOTH use this — keep them in lockstep.
 const MOTEL_SILL_FRAC = 0.12;   // top of stoop / bottom of painted door
-const MOTEL_DOOR_FRAC = 0.36;   // door height as fraction of wall
+// door height as fraction of wall: 0.5 x 8.25-RU wall = 4.13 RU = 2.06 m —
+// a REAL door; the 3.54-RU character now walks under the lintel (Tank order)
+const MOTEL_DOOR_FRAC = 0.5;
 function motelTexture() {
   // one room per module: door sits ON the stoop band, window above.
   // Canvas y=0 is TOP of wall; y=h is GROUND (Three flipY → v=0 at ground).
@@ -3314,15 +3400,16 @@ function motelTexture() {
       g.fillStyle = 'rgba(0,0,0,0.25)'; g.fillRect(x + 5, doorTopY, 2, doorH); g.fillRect(x + 26, doorTopY, 2, doorH);
       g.fillStyle = '#d8d0be'; g.fillRect(x + 10, doorTopY + 4, 12, 4);
       g.fillStyle = '#c8b060'; g.fillRect(x + 23, doorTopY + Math.floor(doorH * 0.55), 2, 3);
-      // picture window above the door
-      const winTop = 8, winH = Math.max(12, doorTopY - 14);
+      // picture window BESIDE the door (Tank's sketch): top level with the
+      // door head, bottom ~12 inches (5px) above the base-band edge line
+      const winTop = doorTopY, winH = sillY - 5 - doorTopY;
       const lit = Math.random() < 0.28;
-      g.fillStyle = '#847a64'; g.fillRect(x + 34, winTop, 46, winH);
+      g.fillStyle = '#847a64'; g.fillRect(x + 31, winTop, 52, winH);
       g.fillStyle = lit ? '#f0d090' : '#10151d';
-      g.fillRect(x + 37, winTop + 3, 40, winH - 6);
+      g.fillRect(x + 34, winTop + 3, 46, winH - 6);
       g.fillStyle = lit ? 'rgba(170,130,70,0.75)' : 'rgba(180,190,210,0.14)';
-      g.fillRect(x + 37, winTop + 3, 6, winH - 6);
-      g.fillRect(x + 71, winTop + 3, 6, winH - 6);
+      g.fillRect(x + 34, winTop + 3, 6, winH - 6);
+      g.fillRect(x + 74, winTop + 3, 6, winH - 6);
       g.fillStyle = 'rgba(0,0,0,0.35)';
       g.fillRect(x + 56, winTop + 3, 2, winH - 6);
       // AC under the window, above the door head
@@ -3451,6 +3538,10 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
   let crownIdx = 0;
   const stoopMat = new THREE.MeshLambertMaterial({ color: 0x8f887e });
   const stoopPlacements = [];
+  // REAL 3D motel doors: born in the SAME loop as the stoops, so a door and
+  // its steps share geometry and can never read as misaligned from any
+  // angle (flat painted doors parallax-slid against the protruding steps)
+  const doorPlacements = [];
   const garSlabMat = new THREE.MeshLambertMaterial({ color: 0x565a61 });
   const garWallMat = new THREE.MeshLambertMaterial({ color: 0x4a4e55 });
   const garColMat = new THREE.MeshLambertMaterial({ color: 0x62666d });
@@ -4014,7 +4105,7 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
       const riser = Math.max(0.14, sill / 2);
       const loY = riser / 2;
       const hiY = riser + riser / 2;          // mesh center; top = hiY + riser/2 = sill
-      const addStoop = (px, pz, alongX, dir) => {
+      const addStoop = (px, pz, alongX, dir, doorW) => {
         // probe further out — skip any stoop that lands on building solid
         const ox = alongX ? 0 : dir * 1.2, oz = alongX ? dir * 1.2 : 0;
         if (solidAtPx((px + ox) / RS, (pz + oz) / RS)) return;
@@ -4028,18 +4119,22 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
           stoopPlacements.push({ x: px + dir * 0.85, y: loY, z: pz, sx: 1.35, sy: riser, sz: 2.9, top: riser });
           stoopPlacements.push({ x: px + dir * 0.38, y: hiY, z: pz, sx: 0.75, sy: riser, sz: 2.5, top: sill });
         }
+        // the real door rides the same center: slab covers the painted door,
+        // frame behind it, knob on the handle side (face-u aware)
+        doorPlacements.push({ x: px, z: pz, alongX, dir, doorW, sill, doorH: H * MOTEL_DOOR_FRAC });
       };
       // door centers sit at u = (repeat + module/3 + 16/256) / R on each face
       const Rw = Math.max(1, Math.round(b.tw * 0.5)), Rd = Math.max(1, Math.round(b.th * 0.5));
+      const dwW = (23 / 256) * (W / Rw), dwD = (23 / 256) * (D / Rd);   // painted door width per face
       for (let k = 0; k < Rw * 3; k++) {
         const f = (Math.floor(k / 3) + (k % 3) / 3 + 0.0625) / Rw;
-        addStoop(cx - W / 2 + f * W, cz + D / 2, true, 1);    // south face: u runs +x
-        addStoop(cx + W / 2 - f * W, cz - D / 2, true, -1);   // north face: u runs -x
+        addStoop(cx - W / 2 + f * W, cz + D / 2, true, 1, dwW);    // south face: u runs +x
+        addStoop(cx + W / 2 - f * W, cz - D / 2, true, -1, dwW);   // north face: u runs -x
       }
       for (let k = 0; k < Rd * 3; k++) {
         const f = (Math.floor(k / 3) + (k % 3) / 3 + 0.0625) / Rd;
-        addStoop(cx + W / 2, cz + D / 2 - f * D, false, 1);   // east face: u runs -z
-        addStoop(cx - W / 2, cz - D / 2 + f * D, false, -1);  // west face: u runs +z
+        addStoop(cx + W / 2, cz + D / 2 - f * D, false, 1, dwD);   // east face: u runs -z
+        addStoop(cx - W / 2, cz - D / 2 + f * D, false, -1, dwD);  // west face: u runs +z
       }
     }
     // house/shell get a simple parapet; motel massing already carries its own
@@ -4184,16 +4279,17 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
         // motel office: warm wood frame, single-story height (not a cage)
         const frameMat = mo ? new THREE.MeshLambertMaterial({ color: 0x8a7355 }) : pilasterMat;
         const frame = new THREE.Mesh(boxGeo, frameMat);
-        frame.scale.set(across ? 0.18 : (mo ? 2.5 : 2.8), mo ? 3.6 : 4.8, across ? (mo ? 2.5 : 2.8) : 0.18);
-        frame.position.set(dx2, mo ? 1.9 : 2.4, dz2);
+        // motel office: full-height door too, seated ON the sill (Tank order)
+        frame.scale.set(across ? 0.18 : (mo ? 2.5 : 2.8), 4.8, across ? (mo ? 2.5 : 2.8) : 0.18);
+        frame.position.set(dx2, mo ? 3.39 : 2.4, dz2);
         scene.add(frame);
         const door = new THREE.Mesh(boxGeo, doorMat);
-        door.scale.set(across ? 0.22 : 2.0, mo ? 3.1 : 4.25, across ? 2.0 : 0.22);
-        door.position.set(dx2 + out(0.05), mo ? 1.85 : 2.12, dz2 + outZ(0.05));
+        door.scale.set(across ? 0.22 : 2.0, 4.25, across ? 2.0 : 0.22);
+        door.position.set(dx2 + out(0.05), mo ? 3.11 : 2.12, dz2 + outZ(0.05));
         scene.add(door);
         const transom = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: 0xffdf9a }));
         transom.scale.set(across ? 0.24 : 1.7, 0.35, across ? 1.7 : 0.24);
-        transom.position.set(dx2 + out(0.06), mo ? 3.7 : 4.55, dz2 + outZ(0.06));
+        transom.position.set(dx2 + out(0.06), mo ? 5.54 : 4.55, dz2 + outZ(0.06));
         scene.add(transom);
         if (!mo) {
           // two-tier WALKABLE stoop — mesh AND height map, so feet never
@@ -4211,7 +4307,7 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
           registerWalkStep(hi.position.x, 0.64, hi.position.z, hi.scale.x, hi.scale.z);
         }
         const doorLamp = new THREE.Mesh(new THREE.SphereGeometry(0.16, 6, 5), new THREE.MeshBasicMaterial({ color: 0xffe9b0 }));
-        doorLamp.position.set(dx2 + fx2 * 0.35, mo ? 4.15 : 5.15, dz2 + fz2 * 0.35);
+        doorLamp.position.set(dx2 + fx2 * 0.35, mo ? 6.14 : 5.15, dz2 + fz2 * 0.35);
         scene.add(doorLamp);
         // the name over the door, on the WALL where the street reads it —
         // the motel's entry module wears OFFICE (the roof frame carries MOTEL)
@@ -4224,7 +4320,7 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
           const sw = mo ? 3.0 : long ? 6.2 : 3.8;
           const fs = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ map: mo ? TEXS.signs.office : TEXS.signs[b.sign] }));
           fs.scale.set(across ? 0.2 : sw, mo ? 0.7 : (long ? 1.0 : 0.85), across ? sw : 0.2);
-          fs.position.set(dx2 + out(0.07), mo ? 4.25 : (long ? 5.55 : 5.45), dz2 + outZ(0.07));
+          fs.position.set(dx2 + out(0.07), mo ? 6.44 : (long ? 5.55 : 5.45), dz2 + outZ(0.07));
           scene.add(fs);
         }
         // ---- type-true architecture at the entrance
@@ -4236,6 +4332,7 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
             const post = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 1.8, 6), pilasterMat);
             post.position.set(px3, 0.9, pz3);
             scene.add(post);
+            addBlocker(px3 / RS, pz3 / RS, 2);   // precinct globe post
             const globe = new THREE.Mesh(new THREE.SphereGeometry(0.17, 8, 6), new THREE.MeshBasicMaterial({ color: 0x4f86ff }));
             globe.position.set(px3, 1.95, pz3);
             scene.add(globe);
@@ -4285,6 +4382,7 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
               (H + 0.15) / 2,
               dz2 + outZ(1.95) + (across ? s * 2.05 : 0));
             scene.add(post);
+            addBlocker(post.position.x / RS, post.position.z / RS, 2.5);   // porch post
           }
           // concrete apron under the porch only
           const apron = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x9a958c }));
@@ -4331,6 +4429,8 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
           dock.scale.set(across ? 2.2 : 5, 0.9, across ? 5 : 2.2);
           dock.position.set(dx2 + out(1.2) + (across ? 0 : 4), 0.45, dz2 + outZ(1.2) + (across ? 4 : 0));
           scene.add(dock);
+          // hip-high concrete: mesh-true by construction (reads its own mesh)
+          addBlockRectRU(dock.position.x, dock.position.z, dock.scale.x, dock.scale.z);
           const roller = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x5c5f66 }));
           roller.scale.set(across ? 0.2 : 3.4, 2.6, across ? 3.4 : 0.2);
           roller.position.set(dx2 + out(0.04) + (across ? 0 : 4), 2.2, dz2 + outZ(0.04) + (across ? 4 : 0));
@@ -4341,6 +4441,7 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
             roll.rotation.z = Math.PI / 2;
             roll.position.set(dx2 + out(2.4) + (across ? 0 : 4 + rr2), 0.55, dz2 + outZ(2.4) + (across ? 4 + rr2 : 0));
             scene.add(roll);
+            addBlocker(roll.position.x / RS, roll.position.z / RS, 3.5);   // paper roll
           }
           for (let vi = 0; vi < 3; vi++) {
             const vent = new THREE.Mesh(boxGeo, pilasterMat);
@@ -4393,6 +4494,31 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
     });
     console.log('MOTEL STOOPS: ' + (stoopPlacements.length / 2) + ' doors got real steps');
   }
+  if (doorPlacements.length) {
+    // hang the REAL doors: slab covers the painted door (same center, same
+    // math), frame reads as trim, knob on the handle side. Depths staggered
+    // (frame 0.03 < slab 0.07 < knob 0.16 proud) — no coplanar fighting.
+    const slabIM = new THREE.InstancedMesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x7a5f2e }), doorPlacements.length);
+    const frameIM = new THREE.InstancedMesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x8a7355 }), doorPlacements.length);
+    const knobIM = new THREE.InstancedMesh(new THREE.BoxGeometry(0.14, 0.14, 0.14), new THREE.MeshBasicMaterial({ color: 0xc8b060 }), doorPlacements.length);
+    const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), S = new THREE.Vector3(), P = new THREE.Vector3();
+    doorPlacements.forEach((d, i) => {
+      const w = d.doorW + 0.35, h = d.doorH + 0.12;
+      P.set(d.x + (d.alongX ? 0 : d.dir * 0.07), d.sill + d.doorH / 2, d.z + (d.alongX ? d.dir * 0.07 : 0));
+      S.set(d.alongX ? w : 0.1, h, d.alongX ? 0.1 : w);
+      M.compose(P, Q, S); slabIM.setMatrixAt(i, M);
+      P.set(d.x + (d.alongX ? 0 : d.dir * 0.03), d.sill + d.doorH / 2 + 0.06, d.z + (d.alongX ? d.dir * 0.03 : 0));
+      S.set(d.alongX ? w + 0.5 : 0.08, h + 0.35, d.alongX ? 0.08 : w + 0.5);
+      M.compose(P, Q, S); frameIM.setMatrixAt(i, M);
+      // handle side follows the painted knob (right of center in face-u)
+      const ku = 0.28 * d.doorW * (d.alongX ? d.dir : -d.dir);
+      P.set(d.x + (d.alongX ? ku : d.dir * 0.16), d.sill + d.doorH * 0.48, d.z + (d.alongX ? d.dir * 0.16 : ku));
+      S.set(1, 1, 1);
+      M.compose(P, Q, S); knobIM.setMatrixAt(i, M);
+    });
+    scene.add(slabIM); scene.add(frameIM); scene.add(knobIM);
+    console.log('MOTEL DOORS: ' + doorPlacements.length + ' real doors hung on their stoops');
+  }
 }
 // trees (instanced)
 {
@@ -4403,6 +4529,7 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
     const m = new THREE.Matrix4();
     for (let i = 0; i < n; i++) {
       const t = trees[i], x = t.x * RS, z = t.y * RS, r = t.r * RS;
+      addBlocker(t.x, t.y, 3.5);                 // the trunk is wood, not fog
       m.makeTranslation(x, 1.1, z);
       trunk.setMatrixAt(i, m);
       m.makeScale(r, r * 0.9, r);
@@ -4437,6 +4564,93 @@ const lampGrid = new Map();                      // tile key -> lamp indices
     if (lampHeads.instanceColor) lampHeads.instanceColor.needsUpdate = true;
     scene.add(lampPoles); scene.add(lampHeads);
   }
+}
+// ---- traffic signals: instanced pole + a stacked two-axis head. The TOP
+// box is thin in X so its wide faces read down the EW road; the LOWER box
+// is thin in Z and reads down the NS road. Colors flip on cycle transitions
+// only — no per-frame instance writes.
+let tlLampsEW = null, tlLampsNS = null;         // [red, yellow, green] instanced lamps per axis
+// per-intersection state on the shared clock: the EW window opens the plan,
+// the NS window follows the moment EW clears (green + yellow, then swap)
+function tlState(sig, ew) {
+  const t = (gtime + sig.off) % TL_PERIOD;
+  const s = ew ? t : t - (sig.ewG + TL_YELLOW);
+  const gd = ew ? sig.ewG : sig.nsG;
+  if (s >= 0 && s < gd) return 'g';
+  if (s >= gd && s < gd + TL_YELLOW) return 'y';
+  return 'r';
+}
+function tlAt(key, dir) {
+  const sig = signalized.get(key);
+  return sig ? tlState(sig, dir === 0 || dir === 2) : 'g';   // unsignalized: free flow
+}
+{
+  const n = trafficLights.length;
+  if (n) {
+    const tlPoles = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.08, 0.1, 4.4, 5), new THREE.MeshLambertMaterial({ color: 0x22262c }), n);
+    // PROPER heads: a dark housing per axis carrying THREE stacked lamps —
+    // red / yellow / green, top to bottom, one lit at a time — mounted on
+    // ONE face only: the face aimed at the approach this corner serves. A
+    // driver reads his own lamps; cross traffic sees nothing but dark metal.
+    const tlHousingMat = new THREE.MeshLambertMaterial({ color: 0x14161c });
+    const tlBoxEW = new THREE.InstancedMesh(new THREE.BoxGeometry(0.34, 1.3, 0.56), tlHousingMat, n);
+    const tlBoxNS = new THREE.InstancedMesh(new THREE.BoxGeometry(0.56, 1.3, 0.34), tlHousingMat, n);
+    tlLampsEW = [0, 1, 2].map(() => new THREE.InstancedMesh(new THREE.BoxGeometry(0.07, 0.3, 0.34), new THREE.MeshBasicMaterial({ color: 0xffffff }), n));
+    tlLampsNS = [0, 1, 2].map(() => new THREE.InstancedMesh(new THREE.BoxGeometry(0.34, 0.3, 0.07), new THREE.MeshBasicMaterial({ color: 0xffffff }), n));
+    const m = new THREE.Matrix4();
+    const dim0 = [new THREE.Color(0x3a1010), new THREE.Color(0x3a2f0e), new THREE.Color(0x0e3018)];
+    for (let i = 0; i < n; i++) {
+      const s = trafficLights[i], x = s.x * RS, z = s.y * RS;
+      m.makeTranslation(x, 2.2, z); tlPoles.setMatrixAt(i, m);
+      m.makeTranslation(x, 4.95, z); tlBoxEW.setMatrixAt(i, m);
+      m.makeTranslation(x, 3.6, z); tlBoxNS.setMatrixAt(i, m);
+      for (let L9 = 0; L9 < 3; L9++) {
+        const dy9 = (1 - L9) * 0.4;              // red top, yellow mid, green low
+        m.makeTranslation(x + s.fx * 0.21, 4.95 + dy9, z);
+        tlLampsEW[L9].setMatrixAt(i, m);
+        tlLampsEW[L9].setColorAt(i, dim0[L9]);
+        m.makeTranslation(x, 3.6 + dy9, z + s.fy * 0.21);
+        tlLampsNS[L9].setMatrixAt(i, m);
+        tlLampsNS[L9].setColorAt(i, dim0[L9]);
+      }
+      addBlocker(s.x, s.y, 3);                   // the pole is steel (solids by default)
+    }
+    scene.add(tlPoles); scene.add(tlBoxEW); scene.add(tlBoxNS);
+    for (const im of tlLampsEW) scene.add(im);
+    for (const im of tlLampsNS) scene.add(im);
+    let t4 = 0, t3 = 0;
+    for (const sig of signalized.values()) { if (sig.ewG === sig.nsG) t4++; else t3++; }
+    console.log('SIGNALS ' + signalized.size + ' crossings (' + t4 + ' four-way, ' + t3 + ' T), ' + n + ' poles');
+  }
+}
+// lamp order [red, yellow, green]: lit color vs housed-dark color
+const TL_LIT = [new THREE.Color(0xff3838), new THREE.Color(0xffd23f), new THREE.Color(0x30d858)];
+const TL_DIM = [new THREE.Color(0x3a1010), new THREE.Color(0x3a2f0e), new THREE.Color(0x0e3018)];
+const TL_ORDER = 'ryg';
+let tlStamp = '', TL_CFGS = null;
+function updTrafficLights() {
+  if (!tlLampsEW) return;
+  // the distinct timing plans are few (parity x split); repaint every pole
+  // only on the exact frame ANY plan's state pair flips
+  if (!TL_CFGS) {
+    const seen = new Map();
+    for (const sig of signalized.values()) seen.set(sig.off + '|' + sig.ewG + '|' + sig.nsG, sig);
+    TL_CFGS = [...seen.values()];
+  }
+  let stamp = '';
+  for (const cfg of TL_CFGS) stamp += tlState(cfg, true) + tlState(cfg, false);
+  if (stamp === tlStamp) return;
+  tlStamp = stamp;
+  for (let i = 0; i < trafficLights.length; i++) {
+    const sig = signalized.get(trafficLights[i].key);
+    const se = tlState(sig, true), sn = tlState(sig, false);
+    for (let L9 = 0; L9 < 3; L9++) {
+      tlLampsEW[L9].setColorAt(i, TL_ORDER[L9] === se ? TL_LIT[L9] : TL_DIM[L9]);
+      tlLampsNS[L9].setColorAt(i, TL_ORDER[L9] === sn ? TL_LIT[L9] : TL_DIM[L9]);
+    }
+  }
+  for (const im of tlLampsEW) im.instanceColor.needsUpdate = true;
+  for (const im of tlLampsNS) im.instanceColor.needsUpdate = true;
 }
 const _lampM = new THREE.Matrix4(), _lampR = new THREE.Matrix4(), _lampT = new THREE.Matrix4();
 const _lampAxis = new THREE.Vector3();
@@ -4513,6 +4727,30 @@ function updLamps(dt) {
     }
   }
 }
+// SOLIDS ARE SOLID: an upright lamp post stops FEET (player + peds). Cars
+// negotiate posts in checkLampHits (bend/snap physics), so this must stay
+// OUT of solidAtPx or cars could never bend one. A broken post — leaning or
+// felled flat — is stepped past, same as the car rule. fx,fy = where the
+// mover is NOW: a body already inside the radius (bad spawn, push-out) may
+// always move OUTWARD, so nothing can ever be trapped inside a pole.
+function lampBlockAt(x, y, fx, fy) {
+  if (!lampPoles) return false;
+  // lamps sit at tile centers (24px from any edge) and the 4px footprint
+  // never crosses a tile line — the target's own bucket is the only one
+  const arr = lampGrid.get(Math.floor(x / TILE) + ',' + Math.floor(y / TILE));
+  if (!arr) return false;
+  for (const i of arr) {
+    const L = lamps[i];
+    if (L.broken) continue;                    // leaning / felled: walk past
+    const dx = x - L.x, dy = y - L.y;
+    const nd = dx * dx + dy * dy;
+    if (nd >= 16) continue;                    // 4px pole footprint
+    const fdx = fx - L.x, fdy = fy - L.y;
+    if (fdx * fdx + fdy * fdy < nd) continue;  // moving outward: let them out
+    return true;
+  }
+  return false;
+}
 function checkLampHits(c) {
   if ((c.alt || 0) > 4) return;                      // the flying bird clips no lampposts
   if (!lampPoles) return;
@@ -4565,6 +4803,9 @@ function checkLampHits(c) {
       const leg = new THREE.Mesh(new THREE.BoxGeometry(1, 26, 1), craneMat);
       leg.position.set(lx, 13, lz);
       g.add(leg);
+      // 26-unit steel legs are SOLID (rot-aware; the span between stays open)
+      addBlocker(cr.x + (lx * Math.cos(cr.rot) - lz * Math.sin(cr.rot)) / RS,
+        cr.y + (lx * Math.sin(cr.rot) + lz * Math.cos(cr.rot)) / RS, 4);
     }
     for (const lz of [-5, 5]) {
       const beam = new THREE.Mesh(new THREE.BoxGeometry(9, 1.2, 1), craneMat);
@@ -4676,6 +4917,7 @@ function checkLampHits(c) {
     const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.45, 26, 6), mastMat);
     pole.position.set(ms.x * RS, 13, ms.y * RS);
     scene.add(pole);
+    addBlocker(ms.x, ms.y, 3.5);                 // floodlight mast + skin
     const head = new THREE.Mesh(new THREE.BoxGeometry(3.6, 1.8, 0.6), mastHead);
     head.position.set(ms.x * RS, 26.5, ms.y * RS);
     if (stadiumPos) head.lookAt(stadiumPos.x * RS, 8, stadiumPos.y * RS);
@@ -4693,6 +4935,7 @@ function checkLampHits(c) {
     const pole = new THREE.Mesh(new THREE.BoxGeometry(0.5, 9, 0.5), mastMat);
     pole.position.set(bb.x * RS, 4.5, bb.y * RS);
     scene.add(pole);
+    addBlocker(bb.x, bb.y, 3);                   // billboard pole + skin
     const panel = new THREE.Mesh(new THREE.BoxGeometry(10, 5, 0.4), new THREE.MeshBasicMaterial({ map: TEXS.bills[(Math.random() * 3) | 0] }));
     panel.position.set(bb.x * RS, 11, bb.y * RS);
     panel.rotation.y = bb.rot;
@@ -4730,6 +4973,7 @@ function checkLampHits(c) {
       const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 5.2, 6), canopyMat);
       pole.position.set(gx + ox, 2.6, gz + oz);
       scene.add(pole);
+      addBlocker((gx + ox) / RS, (gz + oz) / RS, 3);   // canopy leg + skin — drive-under stays open
     }
     const roof = new THREE.Mesh(new THREE.BoxGeometry(24, 0.8, 16), canopyMat);
     roof.position.set(gx, 5.6, gz);
@@ -4765,7 +5009,7 @@ function checkLampHits(c) {
           hose.position.set(px2 + sx4 * 0.82, 0.85, pz2 - 0.12);
           scene.add(hose);
         }
-        blockers.push({ x: px2 / RS, y: pz2 / RS, r: 5 });   // pump body + skin, mesh-true
+        addBlocker(px2 / RS, pz2 / RS, 5);               // pump body + skin, mesh-true
       }
     }
   }
@@ -4892,6 +5136,7 @@ function checkLampHits(c) {
     const tower = new THREE.Mesh(new THREE.BoxGeometry(5, 15, 5), new THREE.MeshLambertMaterial({ color: 0x6e6258 }));
     tower.position.set(sx3, 7.5, sz3);
     scene.add(tower);
+    addBlockRectRU(sx3, sz3, 5, 5);              // masonry tower: exact 20x20px footprint
     const spire = new THREE.Mesh(new THREE.ConeGeometry(3.4, 8, 6), roofSlopeMat);
     spire.position.set(sx3, 19, sz3);
     scene.add(spire);
@@ -4927,6 +5172,8 @@ function checkLampHits(c) {
       const col = new THREE.Mesh(colGeo, stone);
       col.position.set(cx3 + ci * 1.7, (roofH - 1) / 2 + 0.5, face + 0.9);
       scene.add(col);
+      // stone columns are solid — r kept tight so a body still fits BETWEEN
+      addBlocker((cx3 + ci * 1.7) / RS, (face + 0.9) / RS, 2);
     }
     const pediment = new THREE.Mesh(new THREE.BoxGeometry(12.4, 1.1, 1.6), stone);
     pediment.position.set(cx3, roofH + 0.05, face + 0.9);
@@ -4943,6 +5190,7 @@ function checkLampHits(c) {
     const pole2 = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 12, 6), mastMat);
     pole2.position.set(cx3 - 9, 6, face + 4);
     scene.add(pole2);
+    addBlocker((cx3 - 9) / RS, (face + 4) / RS, 2.5);   // the flag pole
     const flag = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.5, 0.08), new THREE.MeshLambertMaterial({ color: 0x8a1a24 }));
     flag.position.set(cx3 - 9 + 1.4, 10.8, face + 4);
     scene.add(flag);
@@ -4962,6 +5210,7 @@ function checkLampHits(c) {
       body.scale.set(3.2, 1.5, 1.7);
       body.position.set(fx3, 1.25, fz3);
       scene.add(body);
+      addBlockRectRU(fx3, fz3, 3.2, 1.7);        // the cart is steel: exact footprint
       const grill = new THREE.Mesh(cartBox, grillM);
       grill.scale.set(2.2, 0.18, 1.3);
       grill.position.set(fx3 - 0.3, 2.1, fz3);
@@ -5013,11 +5262,13 @@ function checkLampHits(c) {
       back.scale.set(7.6, 4.7, 0.3);
       back.position.set(gx, 2.35, gz - 2.5);
       scene.add(back);
+      addBlockRectRU(gx, gz - 2.5, 7.6, 0.3);    // back wall: exact footprint
       for (const s of [-1, 1]) {
         const side = new THREE.Mesh(kioskBox, wallM);
         side.scale.set(0.3, 4.7, 5.2);
         side.position.set(gx + s * 3.7, 2.35, gz);
         scene.add(side);
+        addBlockRectRU(gx + s * 3.7, gz, 0.3, 5.2);   // side walls: exact footprint
       }
       const roof = new THREE.Mesh(kioskBox, wallM);
       roof.scale.set(8.2, 0.3, 5.8);
@@ -5031,6 +5282,7 @@ function checkLampHits(c) {
       counter.scale.set(6.2, 1.35, 0.9);
       counter.position.set(gx, 0.67, gz + 0.9);
       scene.add(counter);
+      addBlockRectRU(gx, gz + 0.9, 6.2, 0.9);    // hip-high counter: exact footprint
       // the wall rack
       let rx2 = gx - 2.1;
       for (const wk of ['pistol', 'shotgun', 'uzi']) {
@@ -5110,6 +5362,8 @@ function checkLampHits(c) {
           back.scale.set(8, 1.1, 0.35);
           back.position.set(cxr + s * 8.2, 1.4, z0r + Dr * 0.42 + r * 8 + 0.95);
           scene.add(back);
+          // seat + backrest as ONE oak box; the center aisle stays open
+          addBlockRectRU(cxr + s * 8.2, z0r + Dr * 0.42 + r * 8 + 0.06, 8, 2.15);
         }
       }
       const riser = new THREE.Mesh(chBox, stoneM);
@@ -5162,6 +5416,7 @@ function checkLampHits(c) {
     const pole = new THREE.Mesh(new THREE.BoxGeometry(0.4, 7, 0.4), mastMat);
     pole.position.set(px2, 3.5, pz2);
     scene.add(pole);
+    addBlocker(sg.x, sg.y, 3);                   // sign pole + skin
     const panel = new THREE.Mesh(new THREE.BoxGeometry(7, 2, 0.35), new THREE.MeshBasicMaterial({ map: TEXS.signs[sg.tex] }));
     panel.position.set(px2, 7.6, pz2);
     panel.rotation.y = rndf(0, TAU);
@@ -5199,6 +5454,7 @@ function checkLampHits(c) {
     g2.position.set(tc.x * RS, 0, tc.y * RS);
     g2.rotation.y = rndf(0, TAU);
     scene.add(g2);
+    addBlocker(tc.x, tc.y, 4);                   // crane mast (centered, rotation-proof)
   }
 }
 // marker beams
@@ -5249,6 +5505,8 @@ if (garagePad) {
     const post = new THREE.Mesh(new THREE.BoxGeometry(0.5, 4.6, 0.5), postMat);
     post.position.set(sx2 * 7, 2.3, sz2 * 5);
     gg.add(post);
+    // corner posts are steel; the drive-in lane between them stays open
+    addBlocker(garagePad.x + sx2 * 7 / RS, garagePad.y + sz2 * 5 / RS, 3);
   }
   const roof = new THREE.Mesh(new THREE.BoxGeometry(16.4, 0.5, 11.6), new THREE.MeshLambertMaterial({ color: 0x2c3138 }));
   roof.position.y = 4.85;
@@ -7349,6 +7607,15 @@ function updTraffic(c, dt) {
   if (!blocked) for (const o of cars) { if (o !== c && !o.dead && dist(o.x, o.y, ax, ay) < 38) { blocked = true; break; } }
   if (!blocked && !player.car && dist(player.x, player.y, ax, ay) < 30) blocked = true;
   if (!blocked && !c.outlaw) for (const p of peds) { if (!p.dead && !p.rag && dist(p.x, p.y, ax, ay) < 24) { blocked = true; break; } }
+  // RED LIGHT: the look-ahead probe reaching a signalized crossing on a
+  // non-green axis is a stop line — unless the car is ALREADY inside the
+  // box (clear it, never park across the crossing). Outlaws run the red.
+  if (!blocked && !c.outlaw) {
+    const cbx = colBase(Math.floor(ax / TILE)), cby = rowBase(Math.floor(ay / TILE));
+    if (cbx >= 0 && cby >= 0 && tlAt(cbx + ',' + cby, c.dir) !== 'g') {
+      if (!(colBase(Math.floor(c.x / TILE)) === cbx && rowBase(Math.floor(c.y / TILE)) === cby)) blocked = true;
+    }
+  }
   if (blocked) c.speed = Math.max(0, c.speed - 320 * dt);
   else c.speed = Math.min(kmax, c.speed + 110 * dt);
   const dv = DIRV[c.dir];
@@ -7368,6 +7635,13 @@ function updTraffic(c, dt) {
         if (d === (c.dir + 2) % 4) continue;
         const probe = [[cx + 3, cy], [cx, cy + 3], [cx - 2, cy], [cx, cy - 2]][d];
         if (tileAt(probe[0], probe[1]) === T_ROAD) valid.push(d);
+      }
+      // signalized: NEVER turn LEFT across the live oncoming green — straight
+      // or right only. A lone left exit (T stem) stays legal: the cross flow
+      // is red while the stem has its green, so nothing is oncoming.
+      if (valid.length > 1 && signalized.has(ikey)) {
+        const li = valid.indexOf((c.dir + 3) % 4);
+        if (li >= 0) valid.splice(li, 1);
       }
       if (valid.length) {
         let nd = valid.includes(c.dir) && Math.random() < 0.55 ? c.dir : valid[Math.floor(Math.random() * valid.length)];
@@ -7686,7 +7960,12 @@ function canSwimTo(x, y) {
   const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
   if (!inGrid(ix, iy)) return false;
   if (tiles[idx(ix, iy)] === T_WATER) return true;
-  return solid[idx(ix, iy)] !== 1;               // any walkable shore = climb out
+  // SOLIDS ARE SOLID: route land movement through solidAtPx so the player
+  // honors the round-prop blocker circles (ATM, fuel tanks, smokestacks)
+  // exactly like peds and cars do — tile check alone let the player ghost
+  // through every circle-blocker prop after the swim rework. Upright lamp
+  // posts stop feet the same way (broken ones are stepped past).
+  return !solidAtPx(x, y) && !lampBlockAt(x, y, player.x, player.y);
 }
 function updSwim(dt) {
   const fwd = cutscene ? 0 : (key('KeyW') || key('ArrowUp') ? 1 : 0) - (key('KeyS') || key('ArrowDown') ? 1 : 0);
@@ -8480,8 +8759,8 @@ function carCollisions() {
 
 // ---------------------------------------------------------------- peds (ported)
 function moveCircle(o, dx, dy) {
-  if (!solidAtPx(o.x + dx, o.y)) o.x += dx;
-  if (!solidAtPx(o.x, o.y + dy)) o.y += dy;
+  if (!solidAtPx(o.x + dx, o.y) && !lampBlockAt(o.x + dx, o.y, o.x, o.y)) o.x += dx;
+  if (!solidAtPx(o.x, o.y + dy) && !lampBlockAt(o.x, o.y + dy, o.x, o.y)) o.y += dy;
 }
 // characters are solid against vehicles: circle-vs-oriented-rect with push-out.
 // Returns the car touched (or null) so callers can decide about impacts.
@@ -8865,7 +9144,14 @@ function updPed(p, dt) {
     p.thinkT -= dt;
     if (p.thinkT > 0) return;
     p.thinkT = 0.4;
-    if (!carApproaching(p) || p.bold) p.state = 'crossing';
+    // signalized corner: wait for the WALK — the axis being crossed must be
+    // fully red. The bold ones still play chicken with live traffic.
+    let lightHolds = false;
+    if (!p.bold && p.crossKey && signalized.has(p.crossKey)) {
+      const carAxis = Math.abs(p.crossTo.x - p.x) > Math.abs(p.crossTo.y - p.y) ? 1 : 0;
+      lightHolds = tlAt(p.crossKey, carAxis) !== 'r';
+    }
+    if ((!carApproaching(p) && !lightHolds) || p.bold) p.state = 'crossing';
     return;
   }
   if (p.state === 'crossing') {
@@ -8889,6 +9175,7 @@ function updPed(p, dt) {
         const dest = best.to[(Math.random() * best.to.length) | 0];
         p.crossAt = { x: best.x, y: best.y };
         p.crossTo = { x: dest.x, y: dest.y };
+        p.crossKey = best.key || null;           // the signal that owns this corner
         p.state = 'toCross';
         return;
       }
@@ -9145,7 +9432,13 @@ function fireWeapon() {
   // recoil: camera kicks + brief aim punch so guns have weight
   const kick = W.pellets ? 0.055 : player.weapon === 'uzi' ? 0.012 : player.weapon === 'm4' ? 0.02 : 0.028;
   player.recoil = Math.min(0.14, (player.recoil || 0) + kick);
-  mousePitch = clamp(mousePitch - kick * 0.85, -1.45, 1.45);
+  // DEFER the aim kick to the START of the next frame. If we moved mousePitch
+  // right here, syncScene (which frames the camera AFTER update() this frame)
+  // would read the recoiled pitch and lift the crosshair off the shot we just
+  // fired — the bullet would land below the triangle by the kick every time.
+  // Queuing it means the camera frames THIS shot at the pitch it left the
+  // barrel; the kick lands next frame, so recoil still climbs, in lockstep.
+  player.recoilPending = (player.recoilPending || 0) + kick * 0.85;
   const n = W.pellets || 1;
   // Barrel starts at eye height on the look ray; vertical speed hits mark M at range ctD.
   // Camera lookAt(M) uses the same M — reticle and impact are the same point.
@@ -10605,6 +10898,10 @@ function update(dt) {
   }
   if (milArmed && islandOfPx(player.x, player.y) !== 3 && Math.floor(player.y / TILE) < MIL.by0) milArmed = false;
   updEngine();
+  // deferred recoil from last frame's shot lands NOW — after that shot's
+  // reticle was already framed by syncScene — so every bullet impacts under
+  // the triangle, and the crosshair still climbs with sustained fire.
+  if (player.recoilPending) { mousePitch = clamp(mousePitch - player.recoilPending, -1.45, 1.45); player.recoilPending = 0; }
   if (state === 'menu') {
     // no game inputs on the title screen — Enter/click to play, slot key to load
     // A / ← → toggles aim assist (same control as pause menu)
@@ -11518,6 +11815,7 @@ function syncScene(dt, t) {
       }
     }
   }
+  updTrafficLights();
   // barrier blink
   for (const grp of barrierGroups) {
     if (!grp.visible) continue;
@@ -12485,6 +12783,242 @@ if (location.hash === '#docks') {
   mouseYaw = camYaw = player.angle;
   mousePitch = 0.3;
 }
+if (location.hash === '#aimtest') {
+  // AIM RECEIPT: the crosshair (screen center) must sit on the bullet's mark,
+  // with NO within-frame recoil desync. Numeric only — no render needed.
+  window._noRender = true;
+  startGame();
+  player.weapon = 'pistol'; player.ammo.pistol = 99;
+  mouseYaw = camYaw = player.angle = 0;
+  aimTarget = null;
+  function aimProbe(pitch, label) {
+    mousePitch = pitch;
+    player.fireT = 0;
+    const p0 = mousePitch;
+    const mark = aimMark();                     // where THIS bullet is aimed
+    fireWeapon();
+    const p1 = mousePitch;                       // must equal p0 (recoil deferred)
+    syncScene(1 / 60, gtime);                    // frame the shot
+    camera.updateMatrixWorld(true);              // render is skipped — refresh by hand
+    camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+    const v = new THREE.Vector3(mark.x * RS, mark.h, mark.y * RS).project(camera);
+    const sx = (v.x * 0.5 + 0.5) * VW, sy = (-v.y * 0.5 + 0.5) * VH;
+    console.log('AIMDBG ' + label + ' recoilThisFrame=' + (p0 - p1).toFixed(4)
+      + ' markDxPx=' + Math.round(sx - VW / 2) + ' markDyPx=' + Math.round(sy - VH / 2)
+      + '  (0,0 = bullet mark sits exactly on the crosshair)');
+  }
+  aimProbe(0.0, 'level');
+  aimProbe(0.22, 'down ');
+  // the deferred kick DOES land next frame (recoil still climbs, in step)
+  const beforeKick = mousePitch;
+  update(1 / 60);
+  console.log('AIMDBG deferredKickAppliedNextFrame=' + (beforeKick - mousePitch).toFixed(4));
+}
+if (location.hash === '#solids') {
+  // SOLIDS RECEIPT: upright lamp posts + blocker props stop feet; broken
+  // posts and outward escapes stay open; no phantom walls. Numeric only.
+  window._noRender = true;
+  startGame();
+  const L = lamps[0];
+  player.x = L.x - 8; player.y = L.y;
+  const lampEnterBlocked = !canSwimTo(L.x - 2, L.y);       // walking INTO the pole
+  const lampNoPhantom = canSwimTo(L.x - 10, L.y);          // clear ground stays clear
+  player.x = L.x; player.y = L.y;                          // body stuck inside (bad spawn)
+  const lampEscapes = canSwimTo(L.x + 1, L.y) && !lampBlockAt(L.x + 1, L.y, L.x, L.y);
+  L.broken = true;
+  player.x = L.x - 8;
+  const brokenWalksPast = canSwimTo(L.x - 2, L.y);         // leaning post yields to feet
+  L.broken = false;
+  const tp = mkPed(L.x - 8, L.y);                          // peds hit the same wall
+  moveCircle(tp, 6, 0);
+  const pedBlocked = tp.x === L.x - 8;
+  moveCircle(tp, -6, 0);
+  const pedWalksAway = tp.x === L.x - 14;
+  player.x = atmSpot.x; player.y = atmSpot.y + 20;
+  const atmSolid = !canSwimTo(atmSpot.x, atmSpot.y - 4);   // the machine itself
+  const atmApproach = canSwimTo(atmSpot.x, atmSpot.y + 8); // where you stand to use it
+  console.log('SOLDBG lampEnterBlocked=' + lampEnterBlocked + ' lampNoPhantom=' + lampNoPhantom
+    + ' lampEscapes=' + lampEscapes + ' brokenWalksPast=' + brokenWalksPast
+    + ' pedBlocked=' + pedBlocked + ' pedWalksAway=' + pedWalksAway
+    + ' atmSolid=' + atmSolid + ' atmApproach=' + atmApproach
+    + '  (all true = solids are solid, nothing traps, no phantom walls)');
+}
+if (location.hash === '#solids2') {
+  // SWEEP RECEIPT: every prop class from the ghost audit is solid, the
+  // interiors / lanes / aisles beside them stay open, spawns avoid props.
+  window._noRender = true;
+  startGame();
+  const R = [];
+  const ck = (name, v) => R.push(name + '=' + v);
+  const gs = gunShops[0];
+  ck('kioskBack', !canSwimTo(gs.x, gs.y - 10));
+  ck('kioskSide', !canSwimTo(gs.x + 14.8, gs.y));
+  ck('kioskCounter', !canSwimTo(gs.x, gs.y + 3.6));
+  ck('kioskInside', canSwimTo(gs.x, gs.y - 4));        // where the armorer stands
+  ck('kioskApproach', canSwimTo(gs.x, gs.y + 10));     // where the customer stands
+  const fc = foodCarts[0];
+  ck('cartSolid', !canSwimTo(fc.x, fc.y));
+  ck('cartVendorSpot', canSwimTo(fc.x, fc.y - 10));
+  const st = props.steeples[0];
+  ck('steepleSolid', !canSwimTo(st.x, st.y));
+  ck('steepleEdgeOpen', canSwimTo(st.x + 14, st.y));
+  const cr = props.cranes[0];
+  ck('craneLegSolid', !canSwimTo(cr.x + 16, cr.y + 20));
+  ck('craneSpanOpen', canSwimTo(cr.x, cr.y));
+  const gp = props.gas[0];
+  ck('canopyPoleSolid', !canSwimTo(gp.x - 36, gp.y - 24));
+  ck('pumpLaneOpen', canSwimTo(gp.x, gp.y));
+  const tr = trees[0];
+  ck('treeTrunkSolid', !canSwimTo(tr.x, tr.y));
+  ck('treeEdgeOpen', canSwimTo(tr.x + 12, tr.y));
+  const sg = props.signs[0];
+  ck('signPoleSolid', !canSwimTo(sg.x, sg.y));
+  const bb = props.bills[0];
+  ck('billPoleSolid', !canSwimTo(bb.x, bb.y));
+  const ch = props.churches[0];
+  const cxr9 = (ch.tx + ch.tw / 2) * TILE;
+  const pz9 = (ch.ty + ch.th * 0.42) * TILE;
+  ck('pewSolid', !canSwimTo(cxr9 + 32.8, pz9));
+  ck('aisleOpen', canSwimTo(cxr9, pz9));
+  const cap = props.capitol;
+  ck('capColumnSolid', !canSwimTo(cap.x, cap.y + 2 * TILE + 3.6));
+  const ms9 = props.masts[0];
+  ck('mastSolid', !canSwimTo(ms9.x, ms9.y));
+  ck('garagePostSolid', !canSwimTo(garagePad.x + 28, garagePad.y + 20));
+  ck('garageLaneOpen', canSwimTo(garagePad.x, garagePad.y));
+  const fs9 = findSidewalkNear(Math.floor(gs.x / TILE), Math.floor(gs.y / TILE));
+  ck('spawnAvoidsProps', !solidAtPx(fs9.x, fs9.y));
+  const tp2 = mkPed(fc.x, fc.y - 10);
+  moveCircle(tp2, 0, 8);                               // walk south INTO the cart
+  ck('pedStopsAtCart', tp2.y === fc.y - 10);
+  console.log('SOL2DBG ' + R.join(' '));
+  console.log('SOL2DBG fails=' + R.filter(s => s.slice(-6) === '=false').length
+    + ' circles=' + blockers.length + ' rects=' + blockRects.length + ' gridTiles=' + blockGrid.size);
+}
+if (location.hash === '#lights') {
+  // TRAFFIC PLAN RECEIPT: ONE master loop, checkerboard offsets between
+  // neighbors, T stems squeezed, 4-ways even, AI + ped behavior — all
+  // synchronous ticks, gtime pinned relative to each plan's offset.
+  window._noRender = true;
+  startGame();
+  const R = [];
+  const ck = (name, v) => R.push(name + '=' + v);
+  let n4 = 0, nT = 0;
+  for (const sig of signalized.values()) { if (sig.ewG === sig.nsG) n4++; else nT++; }
+  ck('crossings', signalized.size > 0);
+  ck('fourWays', n4 > 0);
+  R.push('tCount=' + nT);
+  // EVERY plan rides the same loop: offset 0 or half-period, and each plan's
+  // green+green+2 yellows fills the period EXACTLY
+  let sameLoop = true;
+  for (const sig of signalized.values()) {
+    if (sig.off !== 0 && sig.off !== TL_PERIOD / 2) sameLoop = false;
+    if (Math.abs(sig.ewG + sig.nsG + 2 * TL_YELLOW - TL_PERIOD) > 0.001) sameLoop = false;
+  }
+  ck('oneMasterLoop', sameLoop);
+  // adjacent crossings alternate phase (the wave)
+  let adjAlternates = false;
+  outer9: for (const [key, sig] of signalized) {
+    const kk = key.split(',').map(Number);
+    const ci = ROADCOL_BASES.indexOf(kk[0]);
+    for (const cb2 of [ROADCOL_BASES[ci + 1], ROADCOL_BASES[ci - 1]]) {
+      const sig2 = cb2 !== undefined ? signalized.get(cb2 + ',' + kk[1]) : null;
+      if (sig2) { adjAlternates = Math.abs(sig.off - sig2.off) === TL_PERIOD / 2; break outer9; }
+    }
+  }
+  ck('adjacentAlternate', adjAlternates);
+  // pick a 4-way for the cycle table + a drive-test 4-way with 3 road tiles west
+  let fwKey = null, fwSig = null, tSig = null, aiKey = null, aiSig = null;
+  for (const [k, s] of signalized) {
+    const kk = k.split(',').map(Number);
+    if (s.ewG === s.nsG) {
+      if (!fwKey) { fwKey = k; fwSig = s; }
+      if (!aiKey && tileAt(kk[0] - 3, kk[1]) === T_ROAD && tileAt(kk[0] - 3, kk[1] + 1) === T_ROAD) { aiKey = k; aiSig = s; }
+    } else if (!tSig) tSig = s;
+  }
+  const setT = (local, sig) => { gtime = (local - sig.off + 2 * TL_PERIOD) % TL_PERIOD + TL_PERIOD; };
+  setT(1, fwSig);  ck('fwEwGreen', tlAt(fwKey, 0) === 'g' && tlAt(fwKey, 2) === 'g');
+  ck('fwNsRed', tlAt(fwKey, 1) === 'r');
+  setT(7, fwSig);  ck('fwEwYellow', tlAt(fwKey, 0) === 'y');
+  setT(9, fwSig);  ck('fwEwRed', tlAt(fwKey, 0) === 'r');
+  ck('fwNsGreen', tlAt(fwKey, 1) === 'g');
+  setT(15, fwSig); ck('fwNsYellow', tlAt(fwKey, 1) === 'y');
+  // T junction: integrate green over one full loop — stem 3s, through 10s
+  if (tSig) {
+    let gEW = 0, gNS = 0;
+    for (let s9 = 0.125; s9 < TL_PERIOD; s9 += 0.25) {
+      gtime = TL_PERIOD + s9 - tSig.off;
+      if (tlState(tSig, true) === 'g') gEW += 0.25;
+      if (tlState(tSig, false) === 'g') gNS += 0.25;
+    }
+    ck('tStemShort', Math.min(gEW, gNS) === 3 && Math.max(gEW, gNS) === 10);
+  } else R.push('tStemShort=skipped(no-T-on-map)');
+  // TANK'S LAW: east+west sit at RED while north+south move. The two axes
+  // are never green-or-yellow together — checked at EVERY crossing, every
+  // quarter-second of the loop.
+  let exclusive = true;
+  for (const sig of signalized.values()) {
+    for (let s9 = 0.125; s9 < TL_PERIOD; s9 += 0.25) {
+      gtime = 2 * TL_PERIOD + s9 - sig.off;
+      if (tlState(sig, true) !== 'r' && tlState(sig, false) !== 'r') { exclusive = false; break; }
+    }
+    if (!exclusive) break;
+  }
+  ck('axesExclusive', exclusive);
+  // ---- AI: eastbound sedan approaches ITS red, holds the line, goes on green
+  for (const o of cars) o.dead = true;
+  for (const p of peds) p.dead = true;
+  const ak = (aiKey || fwKey).split(',').map(Number);
+  const as9 = aiSig || fwSig;
+  const kx = ak[0], ky = ak[1];
+  const c9 = mkCar((kx - 3) * TILE, (ky + 1) * TILE + TILE / 2, 0, 'sedan', 'ai');
+  c9.dir = 0; c9.laneY = c9.y; c9.angle = 0;
+  cars.push(c9);
+  setT(9, as9);                                // EW red at THIS crossing
+  for (let i = 0; i < 300; i++) updTraffic(c9, 1 / 60);
+  ck('stopsAtRed', Math.abs(c9.speed) < 4 && c9.x < kx * TILE);
+  ck('droveToTheLine', c9.x > (kx - 3) * TILE + 40);
+  setT(1, as9);                                // EW green — clear the box
+  let path9 = 0, lx9 = c9.x, ly9 = c9.y;
+  for (let i = 0; i < 240; i++) { updTraffic(c9, 1 / 60); path9 += dist(lx9, ly9, c9.x, c9.y); lx9 = c9.x; ly9 = c9.y; }
+  ck('goesOnGreen', path9 > 150);
+  // every lens plate faces ONE approach (the boxed-head order)
+  ck('lensFacings', trafficLights.every(s2 => Math.abs(s2.fx) === 1 && Math.abs(s2.fy) === 1));
+  // 30 green crossings eastbound: the AI must never pick the LEFT turn
+  // (dir 3, north) across the oncoming westbound green
+  let leftPicked = false;
+  for (let tr = 0; tr < 30 && !leftPicked; tr++) {
+    c9.dead = false; c9.x = (kx - 3) * TILE; c9.y = (ky + 1) * TILE + TILE / 2;
+    c9.dir = 0; c9.angle = 0; c9.speed = 0; c9.latV = 0; c9.laneY = c9.y; c9.lastInter = null;
+    setT(1, as9);
+    for (let i = 0; i < 150; i++) updTraffic(c9, 1 / 60);
+    if (c9.dir === 3) leftPicked = true;
+  }
+  ck('noLeftAcrossGreen', !leftPicked);
+  c9.dead = true;
+  // ---- ped: waits while the crossed axis flows, walks when it goes red
+  const pw = mkPed((kx - 0.5) * TILE, (ky - 0.5) * TILE);
+  pw.bold = false;
+  pw.state = 'crossWait';
+  pw.crossAt = { x: pw.x, y: pw.y };
+  pw.crossTo = { x: (kx + 2.5) * TILE, y: pw.y };   // across the NS-flow road
+  pw.crossKey = kx + ',' + ky;
+  pw.thinkT = 0;
+  peds.push(pw);
+  setT(9, as9);                                // NS green -> DON'T WALK
+  updPed(pw, 1 / 60);
+  ck('pedWaitsOnGreen', pw.state === 'crossWait');
+  setT(1, as9);                                // NS fully red -> WALK
+  pw.thinkT = 0;
+  updPed(pw, 1 / 60);
+  ck('pedWalksOnRed', pw.state === 'crossing');
+  // visual repainter reacts to the clock; heads are true 3-lamp stacks
+  ck('threeLampHeads', !tlLampsEW || (tlLampsEW.length === 3 && tlLampsNS.length === 3));
+  setT(1, fwSig); updTrafficLights(); const st1 = tlStamp;
+  setT(9, fwSig); updTrafficLights();
+  ck('visualRepaints', !tlLampsEW || tlStamp !== st1);
+  console.log('TLDBG ' + R.join(' ') + ' fails=' + R.filter(s => s.slice(-6) === '=false').length);
+}
 if (location.hash === '#chopper') {
   // chopper test: 3 stars, bird placed close, camera looking up at it
   startGame();
@@ -12782,6 +13316,79 @@ if (location.hash.startsWith('#view-') || location.hash.startsWith('#door-')) {
     scene.add(demoD.target);
     console.log('VIEWDBG ' + key2 + ' block=' + Math.round(tx2) + ',' + Math.round(ty2) + ' [demo lights ON]');
   } else console.log('VIEWDBG ' + key2 + ' NOT FOUND');
+}
+if (location.hash === '#moteldbg') {
+  // MOTEL ALIGNMENT AUDIT: painted-door centers (texture math) vs the stoops
+  // actually registered in stoopRects, per building + face, with deltas in RU
+  startGame();
+  const T9 = TILE * RS;
+  for (const b of buildings) {
+    if (b.tex !== 'motel') continue;
+    const ins = b.inset || { n: 0.14, s: 0.14, e: 0.14, w: 0.14 };
+    const W = Math.max(0.8, b.tw * T9 - ins.w - ins.e);
+    const D = Math.max(0.8, b.th * T9 - ins.n - ins.s);
+    const cx = b.tx * T9 + ins.w + W / 2;
+    const cz = b.ty * T9 + ins.n + D / 2;
+    const Rw = Math.max(1, Math.round(b.tw * 0.5)), Rd = Math.max(1, Math.round(b.th * 0.5));
+    console.log('MOTDBG bldg tx=' + b.tx + ',' + b.ty + ' tw=' + b.tw + 'x' + b.th
+      + ' sign=' + (b.sign || '-') + ' ins=' + JSON.stringify(ins)
+      + ' W=' + W.toFixed(1) + ' D=' + D.toFixed(1) + ' Rw=' + Rw + ' Rd=' + Rd);
+    // painted door centers, south face (u runs +x): x = cx - W/2 + f*W
+    const doorsS = [];
+    for (let rep = 0; rep < Rw; rep++) for (let s2 = 0; s2 < 3; s2++)
+      doorsS.push((cx - W / 2 + ((rep + s2 / 3 + 16.5 / 256) / Rw) * W).toFixed(1));
+    // stoops registered along the south face line (upper step z = face+0.38)
+    const faceZ = cz + D / 2;
+    const stS = stoopRects
+      .filter(r => Math.abs((r.y0 + r.y1) / 2 * RS - (faceZ + 0.6)) < 1.4
+        && (r.x0 + r.x1) / 2 * RS > cx - W / 2 - 2 && (r.x0 + r.x1) / 2 * RS < cx + W / 2 + 2)
+      .map(r => ((r.x0 + r.x1) / 2 * RS).toFixed(1));
+    console.log('MOTDBG southFace doorX=[' + doorsS.join(',') + ']');
+    console.log('MOTDBG southFace stoopX=[' + stS.join(',') + ']  faceZ=' + faceZ.toFixed(1));
+    // east face (u runs -z): z = cz + D/2 - f*D
+    const doorsE = [];
+    for (let rep = 0; rep < Rd; rep++) for (let s2 = 0; s2 < 3; s2++)
+      doorsE.push((cz + D / 2 - ((rep + s2 / 3 + 16.5 / 256) / Rd) * D).toFixed(1));
+    const faceX = cx + W / 2;
+    const stE = stoopRects
+      .filter(r => Math.abs((r.x0 + r.x1) / 2 * RS - (faceX + 0.6)) < 1.4
+        && (r.y0 + r.y1) / 2 * RS > cz - D / 2 - 2 && (r.y0 + r.y1) / 2 * RS < cz + D / 2 + 2)
+      .map(r => ((r.y0 + r.y1) / 2 * RS).toFixed(1));
+    console.log('MOTDBG eastFace doorZ=[' + doorsE.join(',') + ']');
+    console.log('MOTDBG eastFace stoopZ=[' + stE.join(',') + ']  faceX=' + faceX.toFixed(1));
+  }
+  console.log('MOTDBG stoopRects total=' + stoopRects.length);
+  // VISUAL PROOF: magenta pegs at the COMPUTED door centers on the signed
+  // motel's south face — if pegs sit dead-center on the painted doors, the
+  // u-math matches the texture; if they sit beside them, the face is off.
+  {
+    const b = buildings.find(bb => bb.sign === 'motel');
+    const ins = b.inset || { n: 0.14, s: 0.14, e: 0.14, w: 0.14 };
+    const W = Math.max(0.8, b.tw * T9 - ins.w - ins.e);
+    const D = Math.max(0.8, b.th * T9 - ins.n - ins.s);
+    const cx = b.tx * T9 + ins.w + W / 2;
+    const faceZ = b.ty * T9 + ins.n + D;
+    const Rw = Math.max(1, Math.round(b.tw * 0.5));
+    const pegMat = new THREE.MeshBasicMaterial({ color: 0xff20ff });
+    for (let rep = 0; rep < Rw; rep++) for (let s2 = 0; s2 < 3; s2++) {
+      const dx9 = cx - W / 2 + ((rep + s2 / 3 + 16.5 / 256) / Rw) * W;
+      const peg = new THREE.Mesh(new THREE.BoxGeometry(0.25, 7.2, 0.25), pegMat);
+      peg.position.set(dx9, 3.6, faceZ + 0.35);
+      scene.add(peg);
+    }
+    player.x = cx / RS;
+    player.y = faceZ / RS + 130;
+    godMode = true;
+    mousePitch = -0.06;
+    camZoom = 2.4;
+    mouseYaw = camYaw = player.angle = -Math.PI / 2;   // look due north at the face
+    scene.fog = null;
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    const dl9 = new THREE.DirectionalLight(0xffffff, 0.9);
+    dl9.position.set(cx, 60, faceZ + 90);
+    dl9.target.position.set(cx, 3, faceZ);
+    scene.add(dl9); scene.add(dl9.target);
+  }
 }
 if (location.hash === '#modshop') {
   // menu-layout receipt: truck in the bay, all five rows + prices visible

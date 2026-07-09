@@ -4584,6 +4584,17 @@ function tlAt(key, dir) {
   const sig = signalized.get(key);
   return sig ? tlState(sig, dir === 0 || dir === 2) : 'g';   // unsignalized: free flow
 }
+// THE LANE LAW — every road lane carries its legal flow (right-hand traffic):
+// row roads run WEST in the north lane / EAST in the south; col roads run
+// SOUTH in the west lane / NORTH in the east. -1 = intersection box / off-road.
+function laneDirAt(x, y) {
+  const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
+  if (tileAt(ix, iy) !== T_ROAD) return -1;
+  const cb = colBase(ix), rb = rowBase(iy);
+  if (rb >= 0 && cb < 0) return iy === rb ? 2 : 0;
+  if (cb >= 0 && rb < 0) return ix === cb ? 1 : 3;
+  return -1;
+}
 {
   const n = trafficLights.length;
   if (n) {
@@ -4621,6 +4632,50 @@ function tlAt(key, dir) {
     let t4 = 0, t3 = 0;
     for (const sig of signalized.values()) { if (sig.ewG === sig.nsG) t4++; else t3++; }
     console.log('SIGNALS ' + signalized.size + ' crossings (' + t4 + ' four-way, ' + t3 + ' T), ' + n + ' poles');
+  }
+}
+// LANE FLOW ARROWS — every lane wears its direction on the asphalt, so the
+// installed flow (laneDirAt) is readable at a glance from the driver's seat
+let laneArrowCount = 0;
+{
+  const spots = [];
+  for (const rb9 of ROADROW_BASES) {
+    for (let ix = 2; ix < GRID_W - 2; ix += 5) {
+      if (colBase(ix) >= 0) continue;              // never inside the boxes
+      for (const li of [[rb9, 2], [rb9 + 1, 0]]) {
+        if (tileAt(ix, li[0]) !== T_ROAD) continue;
+        spots.push([(ix + 0.5) * TILE, (li[0] + 0.5) * TILE, li[1]]);
+      }
+    }
+  }
+  for (const cb9 of ROADCOL_BASES) {
+    for (let iy = 2; iy < GRID_H - 2; iy += 5) {
+      if (rowBase(iy) >= 0) continue;
+      for (const li of [[cb9, 1], [cb9 + 1, 3]]) {
+        if (tileAt(li[0], iy) !== T_ROAD) continue;
+        spots.push([(li[0] + 0.5) * TILE, (iy + 0.5) * TILE, li[1]]);
+      }
+    }
+  }
+  if (spots.length) {
+    const sh9 = new THREE.Shape();                 // arrow pointing +X, road-paint scale
+    sh9.moveTo(2, 0); sh9.lineTo(0.2, 0.8); sh9.lineTo(0.2, 0.3);
+    sh9.lineTo(-2, 0.3); sh9.lineTo(-2, -0.3); sh9.lineTo(0.2, -0.3);
+    sh9.lineTo(0.2, -0.8); sh9.closePath();
+    const ag9 = new THREE.ShapeGeometry(sh9);
+    ag9.rotateX(-Math.PI / 2);                     // flat on the asphalt
+    const am9 = new THREE.InstancedMesh(ag9, new THREE.MeshBasicMaterial({ color: 0xc8ced6, transparent: true, opacity: 0.42 }), spots.length);
+    const M9 = new THREE.Matrix4(), Q9 = new THREE.Quaternion(), P9 = new THREE.Vector3(), SV9 = new THREE.Vector3(1, 1, 1);
+    const UP9 = new THREE.Vector3(0, 1, 0);
+    spots.forEach((s9, i) => {
+      Q9.setFromAxisAngle(UP9, -dirAng(s9[2]));    // mesh yaw = -logic angle
+      P9.set(s9[0] * RS, 0.04, s9[1] * RS);
+      M9.compose(P9, Q9, SV9);
+      am9.setMatrixAt(i, M9);
+    });
+    scene.add(am9);
+    laneArrowCount = spots.length;
+    console.log('LANEARROWS ' + laneArrowCount + ' painted');
   }
 }
 // lamp order [red, yellow, green]: lit color vs housed-dark color
@@ -7599,7 +7654,58 @@ function stepPlayerCar(c, dt) {
     }
   }
 }
+// the pursued driver quits the car: a RUNNER rabbits on foot with the force
+// on his heels; a GUNMAN plants his feet and opens up on the law
+function bailDriver(c, gunman) {
+  c.outlaw = false;                            // the car is done; the MAN is the case now
+  c.keep = false;
+  c.speed *= 0.2;
+  const bx = c.x + Math.cos(c.angle + Math.PI / 2) * 20;
+  const by = c.y + Math.sin(c.angle + Math.PI / 2) * 20;
+  const p = mkPed(bx, by, gunman ? { hp: 80, spd: 95 } : { spd: 95 });
+  p.pedOutlaw = true;
+  p.outlawT = gunman ? 60 : 45;
+  attachPedMesh(p);
+  if (gunman) {
+    p.gunman = true;
+    p.mesh.userData.gun.visible = true;
+    say(p, 'You want me? COME GET ME!', 3);
+  } else {
+    p.state = 'flee';
+    p.fleeT = 12;
+    p.angle = c.angle + Math.PI + rndf(-0.6, 0.6);   // away from the chase
+    say(p, 'I\'m not going back inside!', 3);
+  }
+  peds.push(p);
+  // the force answers: two officers on the man, out of the cruiser
+  for (const s of [-1, 1]) {
+    const cop = mkPed(c.x + s * 26, c.y + 20, { cop: true, hp: 50, spd: 78, shirt: 0x20306a });
+    attachPedMesh(cop);
+    cop.mesh.userData.gun.visible = true;
+    peds.push(cop);
+  }
+  c.driver = null;
+}
 function updTraffic(c, dt) {
+  // a pursued driver plays his personality card once the law closes in
+  if (c.outlaw && c.reaction && !c.reacted) {
+    c.reactT -= dt;
+    let close9 = false;
+    for (const o of cars) if (o.driver === 'cop' && !o.dead && o.quarry === c && dist(o.x, o.y, c.x, c.y) < 150) { close9 = true; break; }
+    if (c.reactT <= 0 || close9) {
+      c.reacted = true;
+      if (c.reaction === 'pullover') c.pullover = true;
+      else bailDriver(c, c.reaction === 'gunman');
+    }
+  }
+  if (c.pullover) {
+    // the good citizen: brakes in lane, hands on the wheel, takes the collar
+    c.speed = Math.max(0, c.speed - 240 * dt);
+    const dv9 = DIRV[c.dir];
+    c.x += dv9[0] * c.speed * dt;
+    c.y += dv9[1] * c.speed * dt;
+    return;
+  }
   const kmax = c.outlaw ? 150 : (c.kind === 'truck' ? 72 : 100);
   const ax = c.x + Math.cos(c.angle) * (c.len / 2 + 30);
   const ay = c.y + Math.sin(c.angle) * (c.len / 2 + 30);
@@ -7686,15 +7792,20 @@ function updCopCar(c, dt) {
     }
   }
   const d = dist(c.x, c.y, t.x, t.y);
-  const ta = Math.atan2(t.y - c.y, t.x - c.x);
-  steerCar(c, clamp(angDiff(c.angle, ta), -2.3 * dt, 2.3 * dt));   // cops obey the same tire physics
+  // eyes lost = drive to the LAST KNOWN spot; either way the cruiser follows
+  // the fastest tile path around the blocks, whiskers handling the close-in
+  let tx9 = t.x, ty9 = t.y;
+  if (!c.quarry && !hasLOS(c.x, c.y, t.x, t.y)) { tx9 = lastSeenX; ty9 = lastSeenY; }
+  const wp9 = chaseWaypoint(c, tx9, ty9, dt, 4);
+  chaseSteer(c, wp9 ? wp9.x : tx9, wp9 ? wp9.y : ty9, dt, 2.3);   // cops obey the same tire physics
   tireGrip(c, dt, 1);
   if (c.revT > 0) {
     c.revT -= dt;
     c.speed = Math.max(c.speed - 200 * dt, -80);
+    steerCar(c, (c.revSide || 1) * 1.6 * dt);   // back out on a TURN — never re-ram the same wall
   } else if (d > (c.quarry ? 55 : combatMission() ? 300 : 55)) {   // cruisers park outside an active firefight
     c.speed = Math.min(c.speed + 170 * dt, CAR_KINDS.cop.max);
-    if (Math.abs(c.speed) < 18) { c.stuck += dt; if (c.stuck > 1.2) { c.revT = 0.8; c.stuck = 0; } }
+    if (Math.abs(c.speed) < 18) { c.stuck += dt; if (c.stuck > 1.2) { c.revT = 1.0; c.revSide = Math.random() < 0.5 ? -1 : 1; c.stuck = 0; } }
     else c.stuck = 0;
   } else c.speed *= Math.pow(0.2, dt);
   moveCar(c, dt);
@@ -7720,6 +7831,15 @@ function updCopCar(c, dt) {
     attachPedMesh(cop);
     cop.mesh.userData.gun.visible = true;
     peds.push(cop);
+  }
+  // THE TRAFFIC STOP (1-4 stars): sit STOPPED in your car with a cruiser on
+  // you and the run ends — cuffs through the window. Roll on and it's a
+  // chase; 5+ stars nobody bothers with cuffs; mission firefights exempt.
+  if (player.car && !player.car.dead && stars() >= 1 && stars() < 5 && !combatMission()) {
+    if (d < 60 && Math.abs(c.speed) < 30 && Math.abs(player.car.speed) < 15) {
+      c.stopT = (c.stopT || 0) + dt;
+      if (c.stopT > 1.2) { busted(); return; }
+    } else c.stopT = 0;
   }
   if (!player.car && Math.abs(c.speed) > 120 && d < 24 && player.hurtT <= 0) { hurtPlayer(35); player.hurtT = 0.6; }
 }
@@ -8918,6 +9038,84 @@ function hasLOS(x0, y0, x1, y1) {
   }
   return true;
 }
+// ---- PURSUIT NAVIGATION (Tank order): the law takes the FASTEST PATH to
+// the suspect's last known location, routed AROUND buildings — a breadth-
+// first sweep over the tile grid (uniform streets: BFS = shortest), cached
+// per pursuer and refreshed sub-second. No more ramming the same wall.
+const _pfPrev = new Int32Array(GRID_W * GRID_H);
+const _pfSeen = new Uint16Array(GRID_W * GRID_H);
+const _pfQ = new Int32Array(GRID_W * GRID_H);
+let _pfStamp = 0;
+function pathNext(fx, fy, tx, ty, lookahead) {
+  const si = Math.floor(fx / TILE), sj = Math.floor(fy / TILE);
+  const gi = Math.floor(tx / TILE), gj = Math.floor(ty / TILE);
+  if (!inGrid(si, sj) || !inGrid(gi, gj)) return null;
+  if (si === gi && sj === gj) return { x: tx, y: ty };
+  if (++_pfStamp === 65535) { _pfSeen.fill(0); _pfStamp = 1; }
+  let qh = 0, qt = 0;
+  const start = sj * GRID_W + si, goal = gj * GRID_W + gi;
+  _pfQ[qt++] = start; _pfSeen[start] = _pfStamp; _pfPrev[start] = -1;
+  let found = -1, guard = 0;
+  while (qh < qt && guard++ < 6000) {
+    const cur = _pfQ[qh++];
+    if (cur === goal) { found = cur; break; }
+    const ci = cur % GRID_W, cj = (cur / GRID_W) | 0;
+    for (let k9 = 0; k9 < 4; k9++) {
+      const ni = ci + (k9 === 0 ? 1 : k9 === 1 ? -1 : 0);
+      const nj = cj + (k9 === 2 ? 1 : k9 === 3 ? -1 : 0);
+      if (ni < 0 || nj < 0 || ni >= GRID_W || nj >= GRID_H) continue;
+      const n = nj * GRID_W + ni;
+      if (_pfSeen[n] === _pfStamp) continue;
+      if (solid[n] === 1 && n !== goal) continue;    // buildings are walls; route around
+      _pfSeen[n] = _pfStamp;
+      _pfPrev[n] = cur;
+      _pfQ[qt++] = n;
+    }
+  }
+  if (found < 0) return null;
+  const chain = [];
+  for (let n = found; n !== -1; n = _pfPrev[n]) chain.push(n);
+  chain.reverse();
+  const k = Math.min(lookahead || 3, chain.length - 1);
+  const n2 = chain[k];
+  return { x: ((n2 % GRID_W) + 0.5) * TILE, y: (((n2 / GRID_W) | 0) + 0.5) * TILE };
+}
+// per-pursuer waypoint cache: repath ~1/s or when the target changes tiles
+function chaseWaypoint(o, tx, ty, dt, look) {
+  o.pfT = (o.pfT || 0) - dt;
+  const gi = Math.floor(tx / TILE), gj = Math.floor(ty / TILE);
+  if (o.pfT <= 0 || o.pfGi !== gi || o.pfGj !== gj) {
+    o.pfT = 0.8 + Math.random() * 0.4;
+    o.pfGi = gi; o.pfGj = gj;
+    o.pfWp = pathNext(o.x, o.y, tx, ty, look || 3);
+  }
+  if (o.pfWp && dist(o.x, o.y, o.pfWp.x, o.pfWp.y) < 30) o.pfT = 0;   // leg done: next
+  return o.pfWp;
+}
+// feet: walk the path leg by leg (moveCircle soaks up props on the way)
+function chaseWalk(p, tx, ty, spd, dt) {
+  const wp = chaseWaypoint(p, tx, ty, dt, 3);
+  const ax = wp ? wp.x : tx, ay = wp ? wp.y : ty;
+  const a = Math.atan2(ay - p.y, ax - p.x);
+  p.angle = a;
+  moveCircle(p, Math.cos(a) * spd * dt, Math.sin(a) * spd * dt);
+}
+// wheels: steer at the path leg with WHISKERS — probe the nose and both
+// shoulders, swing around whatever the probes touch instead of grinding it
+function chaseSteer(c, tx, ty, dt, turnRate) {
+  const ta = Math.atan2(ty - c.y, tx - c.x);
+  let want = ta;
+  const look = c.len / 2 + 34;
+  const probe = (da) => solidAtPx(c.x + Math.cos(c.angle + da) * look, c.y + Math.sin(c.angle + da) * look);
+  const fwd = probe(0), sL = probe(-0.55), sR = probe(0.55);
+  if (fwd || sL || sR) {
+    if (fwd && !sL && sR) want = c.angle - 1.1;
+    else if (fwd && sL && !sR) want = c.angle + 1.1;
+    else if (fwd) want = c.angle + (angDiff(c.angle, ta) >= 0 ? 1.4 : -1.4);
+    else want = c.angle + (sR ? -0.5 : 0.5);
+  }
+  steerCar(c, clamp(angDiff(c.angle, want), -turnRate * dt, turnRate * dt));
+}
 function updPed(p, dt) {
   if (p.rag) {
     if (!updRag(p, dt)) {
@@ -8938,6 +9136,27 @@ function updPed(p, dt) {
     if (p.hp <= 0) killPed(p, p.ignP);
     return;
   }
+  if (p.gunman) {
+    // the don't-give-a-damn: stands his ground and trades with the law
+    let nc9 = null, nd9 = 520;
+    for (const q of peds) {
+      if (!q.cop || q.dead) continue;
+      const d9 = dist(q.x, q.y, p.x, p.y);
+      if (d9 < nd9) { nd9 = d9; nc9 = q; }
+    }
+    if (nc9) {
+      p.angle = Math.atan2(nc9.y - p.y, nc9.x - p.x);
+      p.cool = (p.cool || 0) - dt;
+      if (p.cool <= 0 && hasLOS(p.x, p.y, nc9.x, nc9.y)) {
+        p.cool = rndf(0.4, 0.8);
+        const a9 = p.angle + rndf(-0.06, 0.06);
+        spawnBullet(p.x + Math.cos(a9) * 12, p.y + Math.sin(a9) * 12, Math.cos(a9) * 700, Math.sin(a9) * 700, 0.65, 9, 0, 'a');
+        sfx('pistol', p.x, p.y);
+        addPart(p.x + Math.cos(a9) * 14, p.y + Math.sin(a9) * 14, 2.2, 0, 0, 0, 0.05, 0xffe9a0, 1.4, true);
+      }
+    }
+    return;
+  }
   if (p.cop) {
     // an armed-and-firing NPC outranks a low-heat player: hunt the shooter
     if (!p.copTarget || p.copTarget.dead || !p.copTarget.pedOutlaw) {
@@ -8953,7 +9172,7 @@ function updPed(p, dt) {
       const q = p.copTarget;
       p.angle = Math.atan2(q.y - p.y, q.x - p.x);
       const dq = dist(p.x, p.y, q.x, q.y);
-      if (dq > 60) moveCircle(p, Math.cos(p.angle) * p.spd * dt, Math.sin(p.angle) * p.spd * dt);
+      if (dq > 60) chaseWalk(p, q.x, q.y, p.spd, dt);   // fastest path around the blocks
       pedShoot(p, dt, q);
       return;
     }
@@ -8970,11 +9189,22 @@ function updPed(p, dt) {
         const killLine = s >= 5 && hasLOS(p.x, p.y, player.x, player.y) ? 150 : 0;
         const hold = Math.max(cordon ? 170 : 0, killLine);
         if (d > hold) {
-          moveCircle(p, Math.cos(p.angle) * p.spd * dt, Math.sin(p.angle) * p.spd * dt);
+          // eyes on: run at the man. Eyes lost: fastest path to where the
+          // law LAST SAW him, routed around the buildings — not through them
+          const seen9 = d < 650 && hasLOS(p.x, p.y, player.x, player.y);
+          chaseWalk(p, seen9 ? player.x : lastSeenX, seen9 ? player.y : lastSeenY, p.spd, dt);
         } else if (hold > 0 && d < hold - 10) {
           // already inside the cordon / firing line — FALL BACK, don't freeze
-          // in the player's pocket (job start on a cop, alley squeeze, etc.)
-          moveCircle(p, -Math.cos(p.angle) * p.spd * dt, -Math.sin(p.angle) * p.spd * dt);
+          // in the player's pocket. A blocked back-step slides around the
+          // obstacle (same IQ as the approach — no grinding props in reverse)
+          const back9 = p.angle + Math.PI, step9 = p.spd * dt;
+          for (const da9 of [0, 0.9, -0.9, 1.6, -1.6]) {
+            const dx9 = Math.cos(back9 + da9) * step9, dy9 = Math.sin(back9 + da9) * step9;
+            if (!solidAtPx(p.x + dx9, p.y + dy9) && !lampBlockAt(p.x + dx9, p.y + dy9, p.x, p.y)) {
+              moveCircle(p, dx9, dy9);
+              break;
+            }
+          }
         }
         // 5+ stars: nobody reads you your rights anymore — kill only.
         // Mid-firefight: no cuffs either; they wait outside the scene.
@@ -9309,6 +9539,42 @@ function gunfireWitnessed() {
     msg('Shots fired in front of the law!', 8);
   }
 }
+// TRAFFIC LAW (Tank order): run a RED at a signalized crossing, or drive
+// INTO ONCOMING for more than a second, with any officer's eyes on you —
+// that's a star. Yellow is legal; empty streets tell no tales.
+function updTrafficLaw(pc, dt) {
+  if (pardonMode || pc.kind === 'boat' || pc.kind === 'helo') return;
+  pc.redCdT = (pc.redCdT || 0) - dt;
+  const moving = Math.abs(pc.speed) > 30;
+  const travelA = pc.angle + (pc.speed < 0 ? Math.PI : 0);
+  const tdir = ((Math.round(travelA / (Math.PI / 2)) % 4) + 4) % 4;
+  const ix = Math.floor(pc.x / TILE), iy = Math.floor(pc.y / TILE);
+  const cb = colBase(ix), rb = rowBase(iy);
+  const coreKey = cb >= 0 && rb >= 0 ? cb + ',' + rb : null;
+  // RED LIGHT: the frame the car ENTERS a signalized box against its red.
+  // TICKET CAP (Tank order): reckless driving only ever writes the FIRST
+  // star — at 1+ stars the law stops ticketing and starts chasing. Only
+  // a body under your wheels escalates past it.
+  if (coreKey && pc._coreKey !== coreKey && moving && pc.redCdT <= 0 && stars() < 1
+    && signalized.has(coreKey) && tlAt(coreKey, tdir) === 'r' && policeCanSee()) {
+    pc.redCdT = 5;                             // one run, one ticket
+    addHeat(1);
+    msg('RAN A RED LIGHT in front of the law!', 7);
+  }
+  pc._coreKey = coreKey;
+  // ONCOMING: driving AGAINST the lane's installed flow past the 1s grace
+  // (heading perpendicular = crossing/turning, that's legal)
+  const legal9 = laneDirAt(pc.x, pc.y);
+  const wrong = moving && legal9 >= 0 && tdir === (legal9 + 2) % 4;
+  if (wrong) {
+    pc.wrongT = (pc.wrongT || 0) + dt;
+    if (pc.wrongT > 1 && stars() < 1 && policeCanSee()) {   // same one-star cap
+      pc.wrongT = -4;                          // ticketed — grace before the next one
+      addHeat(1);
+      msg('DRIVING INTO ONCOMING in front of the law!', 7);
+    }
+  } else pc.wrongT = Math.min(pc.wrongT || 0, 0);
+}
 // AIM TRIANGLE (do not re-break):
 //   1) mark M = where the look ray hits the world (crosshairPoint)
 //   2) 3rd-person camera sits above the character and lookAt(M)  → reticle ON M
@@ -9591,7 +9857,7 @@ function ensureCops(dt) {
   const swatQ = s >= 4 ? 4 : 0;             // 4 stars: SWAT
   const ciaQ = s >= 5 ? 3 : 0;              // 5 stars: + CIA operatives
   const milQ = s >= 6 ? 4 : 0;              // 6 stars: + the military
-  const carQ = s >= 2 ? s - 1 : 0;
+  const carQ = s >= 2 ? s - 1 : (s >= 1 ? 1 : 0);   // ONE star: a cruiser comes to pull you over
   const tankQ = s >= 6 ? 1 : 0;
   let foot = 0, swat = 0, cia = 0, mil = 0, cruis = 0, tanks = 0, pFoot = 0, pCars = 0, stationCars = 0, anyQuarry = false;
   for (const p of peds) {
@@ -9658,7 +9924,7 @@ function ensureCops(dt) {
   let sirenD = 1e9;
   for (const c of cars) {
     if (c.dead || c.driver !== 'cop' || c.kind === 'tank') continue;
-    if (!c.quarry && s < 2) continue;                    // only chasing cruisers sing
+    if (!c.quarry && s < 1) continue;                    // pursuing cruisers sing — the pull-over included
     const d3 = dist(c.x, c.y, player.x, player.y);
     if (d3 < sirenD) { sirenD = d3; sirenSrcX = c.x; sirenSrcY = c.y; }
   }
@@ -11112,6 +11378,7 @@ function update(dt) {
     if (pc.kind === 'helo') stepPlayerHelo(pc, dt); else if (pc.kind === 'boat') stepPlayerBoat(pc, dt); else stepPlayerCar(pc, dt);
     player.x = pc.x; player.y = pc.y;
     player.angle = pc.angle;
+    updTrafficLaw(pc, dt);
     if (pc.kind === 'tank') {
       pc.turret += angDiff(pc.turret, mouseYaw) * Math.min(1, dt * 6);   // mouse aims the turret
       pc.fireT -= dt;
@@ -11268,6 +11535,7 @@ function update(dt) {
     const sp = Math.hypot(hc.speed, hc.latV);        // sideways momentum counts
     const tank = hc.kind === 'tank';
     if (sp > 55 || (tank && sp > 20)) {
+      const fresh9 = !p.rag;                         // first contact, not a re-launch
       p.hp -= tank ? 500 : sp * 0.45;
       if (hc.driver === 'player' && p.hp <= 0) STATS.pedsRunOver++;
       p.ragBy = hc.driver === 'player';
@@ -11275,10 +11543,23 @@ function update(dt) {
       hc.speed *= 0.94;
       scare(p.x, p.y, 200);
       if (hc.driver === 'player') sayNear(p.x, p.y, 260, CHATTER.pedAlmostHit, 2.6);
+      // a HUMAN under your wheels is never a "traffic violation" — witnessed,
+      // it escalates PAST the one-star ticket cap; an OFFICER is worse.
+      // (killPed bills the death on top if they don't get up.)
+      if (hc.driver === 'player' && fresh9 && !p.combine && !p.goon && !p.guard
+        && !p.target && !p.warTarget && !p.ally && policeCanSee()) {
+        addHeat(p.cop ? 2 : 1);
+        msg(p.cop ? 'OFFICER DOWN under your wheels!' : 'Pedestrian run down in front of the law!', 6);
+      }
       // NPC hit-and-run witnessed by the law: the driver becomes the quarry
       if (hc.driver === 'ai' && hc.kind !== 'cop' && !hc.outlaw && crimeWitnessed(hc.x, hc.y)) {
         hc.outlaw = true;
         hc.keep = true;
+        // the driver has a PERSONALITY: most pull over and take the collar,
+        // some rabbit on foot — and the rare one steps out shooting
+        const roll9 = Math.random();
+        hc.reaction = roll9 < 0.6 ? 'pullover' : roll9 < 0.9 ? 'runner' : 'gunman';
+        hc.reactT = rndf(2.5, 5);
         spawnCopCarFor(hc);
         if (dist(hc.x, hc.y, player.x, player.y) < 700) msg('Hit and run — police pursue the driver.', 6);
       }
@@ -11419,8 +11700,11 @@ function update(dt) {
       if (pk.type === 'cash') { player.cash += pk.val; STATS.cashEarned += pk.val; saveBest(); msg('+$' + pk.val); sfx('cash'); }
       else if (pk.type === 'health') { player.hp = Math.min(100, player.hp + 50); msg('+50 Health'); sfx('pickup'); }
       else if (pk.type === 'armor') { player.armor = Math.min(100, player.armor + 50); msg('+50 Armor'); sfx('pickup'); }
-      else if (pk.type === 'pistol') { player.ammo.pistol += 12; msg('Pistol rounds +12'); sfx('pickup'); if (player.weapon === 'fist') player.weapon = 'pistol'; }
-      else if (pk.type === 'uzi') { player.ammo.uzi += 60; msg('UZI ammo +60'); sfx('pickup'); if (player.weapon === 'fist') player.weapon = 'uzi'; }
+      // picked-up iron goes in the COAT, not the hand (Tank order): grabbing
+      // a gun in front of a cop must never read as drawing it — equip is
+      // always the player's own move (wheel / digits / scroll)
+      else if (pk.type === 'pistol') { player.ammo.pistol += 12; msg('Pistol rounds +12 — stowed'); sfx('pickup'); }
+      else if (pk.type === 'uzi') { player.ammo.uzi += 60; msg('UZI ammo +60 — stowed'); sfx('pickup'); }
       else if (pk.type === 'shotgun') { player.ammo.shotgun += 12; msg('Shotgun shells +12'); sfx('pickup'); }
       else if (pk.type === 'flame') { player.ammo.flame += 120; msg('Flamer fuel +120'); sfx('pickup'); }
       else if (pk.type === 'grenade') { player.ammo.grenade += 6; msg('Grenades +6'); sfx('pickup'); }
@@ -13389,6 +13673,245 @@ if (location.hash === '#moteldbg') {
     dl9.target.position.set(cx, 3, faceZ);
     scene.add(dl9); scene.add(dl9.target);
   }
+}
+if (location.hash === '#trafficlaw') {
+  // TRAFFIC LAW RECEIPT: witnessed red-run + oncoming = stars (unseen = no
+  // star, green = legal); pursued-NPC personalities: pullover -> collar,
+  // runner -> foot chase + force, gunman -> stands and shoots.
+  window._noRender = true;
+  startGame();
+  const R = [];
+  const ck = (n9, v) => R.push(n9 + '=' + v);
+  for (const o of cars) o.dead = true;
+  for (const p of peds) p.dead = true;
+  let K = null, S9 = null;
+  for (const [k, s] of signalized) {
+    const kk = k.split(',').map(Number);
+    if (s.ewG === s.nsG && tileAt(kk[0] - 3, kk[1]) === T_ROAD && tileAt(kk[0] - 3, kk[1] + 1) === T_ROAD) { K = kk; S9 = s; break; }
+  }
+  const setT = (local) => { gtime = (local - S9.off + 2 * TL_PERIOD) % TL_PERIOD + TL_PERIOD; };
+  const pcar = mkCar((K[0] - 2) * TILE, (K[1] + 1) * TILE + TILE / 2, 0, 'sedan', 'player');
+  pcar.keep = true;
+  attachCarMesh(pcar);
+  cars.push(pcar);
+  player.car = pcar;
+  const wcop = mkPed((K[0] - 1.5) * TILE, (K[1] - 0.5) * TILE, { cop: true, hp: 50, spd: 0, shirt: 0x20306a, patrol: true });
+  attachPedMesh(wcop);
+  peds.push(wcop);
+  const drive = (x9, y9) => { pcar.x = x9; pcar.y = y9; pcar.angle = 0; pcar.speed = 120; player.x = pcar.x; player.y = pcar.y; };
+  const lane = (K[1] + 1) * TILE + TILE / 2;
+  // 1) run the red under the officer's eyes
+  heat = 0; wantedClearT = 0; copSeen = false;
+  setT(9);                                     // EW red at this crossing
+  drive((K[0] - 2) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
+  drive((K[0] + 0.5) * TILE, lane); updTrafficLaw(pcar, 1 / 60);   // ENTER the box
+  ck('redRunStar', stars() === 1);
+  // 2) green is legal
+  heat = 0; pcar._coreKey = null; pcar.redCdT = 0;
+  setT(1);
+  drive((K[0] - 2) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
+  drive((K[0] + 0.5) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
+  ck('greenNoStar', stars() === 0);
+  // 3) nobody watching = no ticket
+  wcop.dead = true;
+  heat = 0; pcar._coreKey = null; pcar.redCdT = 0;
+  setT(9);
+  drive((K[0] - 2) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
+  drive((K[0] + 0.5) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
+  ck('unseenNoStar', stars() === 0);
+  wcop.dead = false;
+  // 4) oncoming: NORTH lane heading EAST (legal flow is west), 1s grace
+  heat = 0; pcar.wrongT = 0;
+  drive((K[0] - 5) * TILE, K[1] * TILE + TILE / 2);
+  pcar.speed = 100;
+  for (let i = 0; i < 54; i++) updTrafficLaw(pcar, 1 / 60);   // 0.9s in
+  ck('under1sNoStar', stars() === 0);
+  for (let i = 0; i < 12; i++) updTrafficLaw(pcar, 1 / 60);   // past the second
+  ck('oncomingStar', stars() === 1);
+  heat = 0; pcar.wrongT = 0;
+  drive((K[0] - 5) * TILE, lane);                             // legal lane eastbound
+  pcar.speed = 100;
+  for (let i = 0; i < 90; i++) updTrafficLaw(pcar, 1 / 60);
+  ck('rightLaneNoStar', stars() === 0);
+  heat = 0;
+  // ---- NPC personalities, one forced run per archetype
+  const mkOutlaw = (reaction) => {
+    const c9 = mkCar((K[0] - 3) * TILE, lane, 0, 'sedan', 'ai');
+    c9.dir = 0; c9.laneY = c9.y; c9.outlaw = true; c9.keep = true;
+    c9.reaction = reaction; c9.reactT = 0.01;
+    attachCarMesh(c9);
+    cars.push(c9);
+    return c9;
+  };
+  const c1 = mkOutlaw('pullover');
+  c1.speed = 100;
+  for (let i = 0; i < 120; i++) updTraffic(c1, 1 / 60);
+  ck('pulloverStops', c1.pullover === true && Math.abs(c1.speed) < 2);
+  const cruz = mkCar(c1.x - 30, c1.y, 0, 'cop', 'cop');
+  cruz.quarry = c1; cruz.chaseT = 30;
+  attachCarMesh(cruz); cars.push(cruz);
+  updCopCar(cruz, 1 / 60);
+  ck('pulloverCollared', c1.outlaw === false && c1.driver === null);
+  cruz.dead = true;
+  const c2 = mkOutlaw('runner');
+  for (let i = 0; i < 10; i++) updTraffic(c2, 1 / 60);
+  const runner = peds.find(p2 => !p2.dead && p2.pedOutlaw && !p2.gunman);
+  const runCops = peds.filter(p2 => !p2.dead && p2.cop && p2 !== wcop).length;
+  ck('runnerBails', !!runner && c2.outlaw === false && c2.driver === null);
+  ck('runnerForce', runCops >= 2);
+  const c3 = mkOutlaw('gunman');
+  for (let i = 0; i < 10; i++) updTraffic(c3, 1 / 60);
+  const gm = peds.find(p2 => !p2.dead && p2.gunman);
+  ck('gunmanStands', !!gm && gm.pedOutlaw === true);
+  if (gm) {
+    const shotsBefore = bullets.length;
+    const tc = mkPed(gm.x + 60, gm.y, { cop: true, hp: 50, spd: 75, shirt: 0x20306a });
+    attachPedMesh(tc); peds.push(tc);
+    for (let i = 0; i < 90; i++) updPed(gm, 1 / 60);
+    ck('gunmanShoots', bullets.length > shotsBefore);
+  } else ck('gunmanShoots', false);
+  // ---- LIVE LOOP: the real update() chain writes the ticket (Tank's field
+  // test failed because his save had the PARDON on — prove both directions)
+  pardonMode = false; godMode = true;
+  heat = 0; pcar._coreKey = null; pcar.redCdT = 0; pcar.wrongT = 0;
+  drive((K[0] - 2) * TILE, lane);
+  pcar.speed = 0;
+  keys['KeyW'] = true;
+  for (let i = 0; i < 150; i++) { setT(9); update(1 / 60); }
+  keys['KeyW'] = false;
+  ck('liveLoopRedStar', stars() >= 1);
+  pardonMode = true;                           // the pardon really waives it
+  heat = 0; pcar._coreKey = null; pcar.redCdT = 0;
+  drive((K[0] - 2) * TILE, lane);
+  pcar.speed = 0;
+  keys['KeyW'] = true;
+  for (let i = 0; i < 150; i++) { setT(9); update(1 / 60); }
+  keys['KeyW'] = false;
+  ck('pardonWaivesTicket', stars() === 0);
+  pardonMode = false;
+  // ---- TICKET CAP: at 1 star the law stops writing — a second witnessed
+  // red run adds NOTHING
+  heat = 1; wantedClearT = 30; copSeen = true;
+  pcar._coreKey = null; pcar.redCdT = 0; pcar.wrongT = 0;
+  setT(9);
+  drive((K[0] - 2) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
+  drive((K[0] + 0.5) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
+  ck('ticketCapAtOne', stars() === 1);
+  // ---- but a body under the wheels escalates — and an officer is WORSE
+  const mow = (copHit) => {
+    heat = 1; wantedClearT = 30; copSeen = true;
+    drive((K[0] - 5) * TILE, lane);
+    pcar.speed = 130;
+    // a dedicated witness at the scene — the wandering beat cop from the
+    // earlier probes may have chased out of eyeshot by now
+    const wit = mkPed(pcar.x + 46, pcar.y - 90, { cop: true, hp: 50, spd: 75, shirt: 0x20306a });
+    attachPedMesh(wit);
+    peds.push(wit);
+    const vic = mkPed(pcar.x + 46, pcar.y, copHit ? { cop: true, hp: 50, spd: 75, shirt: 0x20306a } : undefined);
+    attachPedMesh(vic);
+    peds.push(vic);
+    keys['KeyW'] = true;
+    for (let i = 0; i < 40; i++) { setT(1); update(1 / 60); }
+    keys['KeyW'] = false;
+    wit.dead = true;
+    vic.dead = true;
+    return stars();
+  };
+  ck('runOverEscalates', mow(false) >= 2);
+  ck('copRunOverWorse', mow(true) >= 3);
+  // ---- picked-up iron stays STOWED: hands keep what they had
+  player.car.driver = null; player.car = null;
+  player.x = (K[0] - 5) * TILE; player.y = lane;
+  player.weapon = 'fist';
+  const ammo0 = player.ammo.pistol;
+  pickups.push({ x: player.x, y: player.y, type: 'pistol', val: 0, active: true, t: 0, temp: false });
+  update(1 / 60);
+  ck('pickupStaysStowed', player.ammo.pistol === ammo0 + 12 && player.weapon === 'fist');
+  ck('laneArrowsPainted', laneArrowCount > 400);
+  ck('laneLawSane', laneDirAt((K[0] - 5 + 0.5) * TILE, K[1] * TILE + 24) === 2
+    && laneDirAt((K[0] - 5 + 0.5) * TILE, (K[1] + 1) * TILE + 24) === 0);
+  console.log('TLAWDBG ' + R.join(' ') + ' fails=' + R.filter(s9 => s9.slice(-6) === '=false').length);
+}
+if (location.hash === '#copnav') {
+  // PURSUIT NAV RECEIPT: foot cop + cruiser each reach a target hidden
+  // BEHIND a building (straight line blocked = the old stuck case), and
+  // the law hunts LAST KNOWN when eyes are lost. Synchronous ticks.
+  window._noRender = true;
+  startGame();
+  const R = [];
+  const ck = (n9, v) => R.push(n9 + '=' + v);
+  for (const o of cars) o.dead = true;
+  for (const p of peds) p.dead = true;
+  godMode = true;
+  const b = buildings.find(bb => bb.tw === 2 && bb.th === 2
+    && !solidAtPx((bb.tx + 1) * TILE, (bb.ty - 0.6) * TILE)
+    && !solidAtPx((bb.tx + 1) * TILE, (bb.ty + 2.6) * TILE))
+    || buildings.find(bb => bb.tw === 2 && bb.th === 2);
+  const bx = (b.tx + 1) * TILE;
+  const northY = (b.ty - 0.6) * TILE, southY = (b.ty + 2.6) * TILE;
+  ck('wallBetween', !hasLOS(bx, northY, bx, southY));
+  // player south of the house, officer north — old AI ground the north wall
+  player.x = bx; player.y = southY;
+  lastSeenX = bx; lastSeenY = southY;
+  heat = 1; wantedClearT = 30; copSeen = true;
+  const cop = mkPed(bx, northY, { cop: true, hp: 50, spd: 80, shirt: 0x20306a });
+  attachPedMesh(cop);
+  peds.push(cop);
+  for (let i = 0; i < 12 * 60 && dist(cop.x, cop.y, player.x, player.y) > 40; i++) updPed(cop, 1 / 60);
+  ck('footAroundBuilding', dist(cop.x, cop.y, player.x, player.y) <= 40);
+  cop.dead = true;
+  // cruiser west of the house, suspect east — drive the fastest way around
+  const midY = (b.ty + 1) * TILE;
+  player.x = (b.tx + 3.5) * TILE; player.y = midY;
+  lastSeenX = player.x; lastSeenY = player.y;
+  const cruz = mkCar((b.tx - 1.5) * TILE, midY, 0, 'cop', 'cop');
+  attachCarMesh(cruz);
+  cars.push(cruz);
+  for (let i = 0; i < 18 * 60 && dist(cruz.x, cruz.y, player.x, player.y) > 170; i++) updCopCar(cruz, 1 / 60);
+  ck('carAroundBuilding', dist(cruz.x, cruz.y, player.x, player.y) <= 170);
+  cruz.dead = true;
+  // eyes lost: the officer works the LAST KNOWN spot, not the man's real one
+  lastSeenX = bx; lastSeenY = southY;
+  player.x = bx + 14 * TILE; player.y = southY + 10 * TILE;
+  const cop2 = mkPed(bx, northY, { cop: true, hp: 50, spd: 80, shirt: 0x20306a });
+  attachPedMesh(cop2);
+  peds.push(cop2);
+  for (let i = 0; i < 10 * 60; i++) updPed(cop2, 1 / 60);
+  ck('copsHuntLastKnown', dist(cop2.x, cop2.y, bx, southY) < dist(cop2.x, cop2.y, player.x, player.y));
+  console.log('CNAVDBG ' + R.join(' ') + ' fails=' + R.filter(s9 => s9.slice(-6) === '=false').length);
+}
+if (location.hash === '#pullover') {
+  // TRAFFIC STOP RECEIPT: one star sends a cruiser; rolling = chase only,
+  // stopping under the cruiser = cuffs through the window.
+  window._noRender = true;
+  startGame();
+  const R = [];
+  const ck = (n9, v) => R.push(n9 + '=' + v);
+  for (const o of cars) o.dead = true;
+  for (const p of peds) p.dead = true;
+  heat = 1; wantedClearT = 30; copSeen = true;
+  ensureCops(2);
+  ck('cruiserAtOneStar', cars.some(c9 => !c9.dead && c9.driver === 'cop'));
+  const pcar = mkCar(player.x, player.y, 0, 'sedan', 'player');
+  pcar.keep = true;
+  attachCarMesh(pcar);
+  cars.push(pcar);
+  player.car = pcar;
+  const cruz = mkCar(pcar.x - 40, pcar.y, 0, 'cop', 'cop');
+  cruz.speed = 0;
+  attachCarMesh(cruz);
+  cars.push(cruz);
+  // rolling: the law chases, nobody reaches through the window
+  pcar.speed = 100;
+  for (let i = 0; i < 120; i++) { updCopCar(cruz, 1 / 60); pcar.x = cruz.x + 40; pcar.y = cruz.y; player.x = pcar.x; player.y = pcar.y; }
+  ck('noCuffsRolling', state === 'play');
+  // stopped: the traffic stop ends it
+  pcar.speed = 0;
+  cruz.speed = 0; cruz.x = pcar.x - 40; cruz.y = pcar.y;
+  let overAt = -1;
+  for (let i = 0; i < 120; i++) { updCopCar(cruz, 1 / 60); if (state === 'over') { overAt = i; break; } }
+  ck('stoppedGetsBusted', state === 'over' && overAt > 60);   // ~1.2s of the stop clock
+  console.log('PULLDBG ' + R.join(' ') + ' fails=' + R.filter(s9 => s9.slice(-6) === '=false').length);
 }
 if (location.hash === '#modshop') {
   // menu-layout receipt: truck in the bay, all five rows + prices visible

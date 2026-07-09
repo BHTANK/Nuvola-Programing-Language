@@ -2,10 +2,12 @@
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no">
 <title>GTA 3: Nuvola City Stories</title>
 <style>
-  html,body{margin:0;padding:0;overflow:hidden;background:#05050a;height:100%;}
+  html,body{margin:0;padding:0;overflow:hidden;background:#05050a;height:100%;
+    touch-action:none;-ms-content-zooming:none;overscroll-behavior:none;
+    -webkit-text-size-adjust:100%;text-size-adjust:100%;}
   #gl{display:block;position:absolute;top:0;left:0;}
   #hud{display:block;position:absolute;top:0;left:0;pointer-events:none;}
   #console{display:none;position:absolute;left:50%;transform:translateX(-50%);bottom:14px;
@@ -13,6 +15,65 @@
     border:1px solid #3fdc5f;outline:none;font:bold 15px monospace;z-index:10;border-radius:4px;}
   #console::placeholder{color:#2a8f42;}
 </style>
+<!-- Block browser page-zoom only. Game registers camZoom via __gta3CamWheel. -->
+<script>
+(function () {
+  // Game code assigns this: function(deltaY) { camZoom = ... }
+  window.__gta3CamWheel = null;
+  function onWheel(e) {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    // MUST preventDefault or Chrome zooms the whole page/UI
+    e.preventDefault();
+    // Do NOT stopImmediatePropagation — we still need to run camera zoom below
+    if (typeof window.__gta3CamWheel === 'function') {
+      try { window.__gta3CamWheel(e.deltaY); } catch (err) {}
+    }
+    if (typeof window.__gta3ForcePageScale === 'function') window.__gta3ForcePageScale();
+  }
+  function blockZoomKey(e) {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    if (e.key === '0' || e.code === 'Digit0' || e.code === 'Numpad0') return;
+    if (e.key === '+' || e.key === '=' || e.key === '-' || e.key === '_' ||
+        e.code === 'Equal' || e.code === 'Minus' || e.code === 'NumpadAdd' || e.code === 'NumpadSubtract') {
+      e.preventDefault();
+    }
+  }
+  // One capture listener (non-passive) — kills page zoom AND drives camera once
+  document.addEventListener('wheel', onWheel, { passive: false, capture: true });
+  document.addEventListener('keydown', blockZoomKey, { capture: true });
+  document.addEventListener('gesturestart', function (e) { e.preventDefault(); }, { passive: false });
+  document.addEventListener('gesturechange', function (e) { e.preventDefault(); }, { passive: false });
+  var baseDPR = window.devicePixelRatio || 1;
+  window.__gta3ForcePageScale = function () {
+    var z = 1;
+    try {
+      if (window.visualViewport && window.visualViewport.scale)
+        z = window.visualViewport.scale;
+      var dpr = window.devicePixelRatio || 1;
+      if (Math.abs(z - 1) < 0.02 && baseDPR > 0) {
+        var dprRatio = dpr / baseDPR;
+        if (dprRatio > 1.08 || dprRatio < 0.92) z = dprRatio;
+      }
+    } catch (err) {}
+    if (z > 0 && Math.abs(z - 1) > 0.02)
+      document.documentElement.style.zoom = String(1 / z);
+    else
+      document.documentElement.style.zoom = '';
+    return z;
+  };
+  window.addEventListener('resize', function () {
+    try {
+      if (!window.visualViewport || Math.abs(window.visualViewport.scale - 1) < 0.02)
+        baseDPR = window.devicePixelRatio || 1;
+    } catch (err) { baseDPR = window.devicePixelRatio || 1; }
+    window.__gta3ForcePageScale();
+  });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', function () { window.__gta3ForcePageScale(); });
+  }
+  setInterval(function () { window.__gta3ForcePageScale(); }, 250);
+})();
+</script>
 </head>
 <body>
 <canvas id="gl"></canvas>
@@ -407,19 +468,31 @@ window.addEventListener('mousemove', e => {
   mousePitch = clamp(mousePitch + (e.movementY || 0) * 0.0022, -1.45, 1.45);   // near-vertical both ways
   lastMouseMove = performance.now();
 });
+// Ctrl+wheel → player camera distance (page zoom blocked in <head>)
+window.__gta3CamWheel = function (deltaY) {
+  // Always allow view zoom while in play (including driving); skip menus/pause
+  if (state !== 'play' || paused) return;
+  if (shopOpen || saveHouseOpen || modShopOpen || priestOpen || bankOpen || cutscene) return;
+  camZoom = clamp(camZoom * (deltaY > 0 ? 1.12 : 0.89), 0.45, 2.8);
+};
+// Plain wheel (no Ctrl) still cycles weapons
 window.addEventListener('wheel', e => {
-  if (e.ctrlKey) {
-    // Ctrl + wheel: camera distance (works on foot and in vehicles)
-    e.preventDefault();
-    if (state !== 'play') return;
-    camZoom = clamp(camZoom * (e.deltaY > 0 ? 1.1 : 0.9), 0.5, 2.4);
-    return;
-  }
+  if (e.ctrlKey || e.metaKey) return; // handled by head script → __gta3CamWheel
   if (state !== 'play' || paused || shopOpen || saveHouseOpen || modShopOpen || priestOpen || player.car) return;
   const i = WORDER.indexOf(player.weapon);
   const step = e.deltaY > 0 ? 1 : WORDER.length - 1;
   player.weapon = WORDER[(i + step) % WORDER.length];
 }, { passive: false });
+function pageZoomScale() {
+  try {
+    if (typeof window.__gta3ForcePageScale === 'function') {
+      const z = window.__gta3ForcePageScale();
+      if (z && z !== 1) return z;
+    }
+    if (window.visualViewport && window.visualViewport.scale) return window.visualViewport.scale;
+  } catch (err) {}
+  return 1;
+}
 // ---------------------------------------------------------------- cheat console
 const consoleEl = document.getElementById('console');
 let godMode = false;
@@ -1221,20 +1294,19 @@ function garAt(x, y) {
   return null;
 }
 function gWalkable(g, x, y, deck, ent) {
-  const M = 4;
-  // perimeter wall — the only gap is the entrance lane at deck 0 (south face)
+  const M = 5;
+  // perimeter wall — only gap is the entrance lane at deck 0 (south face)
   if (x < g.x0 + M || x >= g.x1 - M || y < g.y0 + M || y >= g.y1 - M) {
     if (!(deck === 0 && y >= g.y1 - M && x >= g.ex0 && x < g.ex1)) return false;
   }
-  // ramp side rail: no hopping onto the slope mid-run (open at both ends)
-  if (Math.abs(x - g.rx0) < 3 && y >= g.ry0 - 2 && y < g.ry1 - 8) return false;
-  // stack-end walls, deck-tagged and placed beyond corner reach of the
-  // transition line (center-vs-corner gates deadlock a crossing car):
-  // ground floor walls off the space under the first ramp's high end,
-  // the roof walls off the open well at the last ramp's low end
+  // ramp side rails (open at both ends so cars can enter/exit the slope)
+  const rw = Math.max(8, (g.rx1 - g.rx0) * 0.08);
+  if (x >= g.rx0 - rw && x < g.rx0 + 2 && y >= g.ry0 + 6 && y < g.ry1 - 10) return false;
+  if (x > g.rx1 - 2 && x <= g.rx1 + rw && y >= g.ry0 + 6 && y < g.ry1 - 10) return false;
+  // stack-end walls under first ramp high end / roof well at last low end
   if (x >= g.rx0 && x < g.rx1) {
-    if (deck === 0 && y >= g.ry0 - 26 && y < g.ry0 - 20) return false;
-    if (deck === g.top && y >= g.ry1 - 26 && y < g.ry1 - 20) return false;
+    if (deck === 0 && y >= g.ry0 - 28 && y < g.ry0 - 18) return false;
+    if (deck === g.top && y >= g.ry1 - 28 && y < g.ry1 - 18) return false;
   }
   // columns + parked cars (deck-tagged blockers)
   for (const b of g.blk) {
@@ -1247,10 +1319,11 @@ function gWalkable(g, x, y, deck, ent) {
 function gHeightAt(ent) {
   if (!ent || ent.gDeck == null || !ent.gGar) return 0;
   const g = ent.gGar;
+  const dh = g.deckH || FLOOR_H;
   let h = ent.gDeck;
   if (ent.x >= g.rx0 && ent.x < g.rx1 && ent.y >= g.ry0 && ent.y < g.ry1)
     h += clamp((g.ry1 - ent.y) / (g.ry1 - g.ry0), 0, 1);
-  return h * FLOOR_H;
+  return h * dh;
 }
 function updGarDeck(ent) {
   const g0 = ent.gGar;
@@ -1394,7 +1467,8 @@ function genCity() {
     '4,28': 'tenement', '16,28': 'police', '28,28': 'tenement', '40,28': 'docks',
     '4,40': 'motel', '16,40': 'hospital', '28,40': 'bank', '40,40': 'docks',
     '4,52': 'industry', '16,52': 'tenement', '28,52': 'rowhouse', '40,52': 'docks',
-    '4,64': 'industry', '16,64': 'construction', '28,64': 'tenement', '40,64': 'docks',
+    // multi-storey parkade on the industrial strip (island 0 — was missing)
+    '4,64': 'garage', '16,64': 'construction', '28,64': 'tenement', '40,64': 'docks',
     '4,76': 'gas', '16,76': 'industry', '28,76': 'rowhouse', '40,76': 'docks',
     // Nuvola Heights (east island): downtown core, civic, mall, projects, stadium
     '84,4': 'commercial', '96,4': 'towers', '108,4': 'garage', '120,4': 'rowhouse',
@@ -1578,16 +1652,31 @@ function genCity() {
         markSolidRect(x0 + 1, y0 + 1, 6, 5);
         buildings.push({ tx: x0 + 1, ty: y0 + 1, tw: 6, th: 5, floors: 2.6, tint: 0x565a63, tex: 'conc', style: 'mall', store: true, sign: 'mall' });
       } else if (kind === 'garage') {
+        // Full-block multi-storey parkade: 6×6 tiles, tall decks, 2-tile
+        // ramp bay with a long gentle run so cars can climb without scraping.
         paveAll(x0, y0);
-        markSolidRect(x0 + 1, y0 + 1, 5, 5);
-        buildings.push({ tx: x0 + 1, ty: y0 + 1, tw: 5, th: 5, floors: 5, tint: 0x62656c, tex: 'garage' });
+        markSolidRect(x0 + 1, y0 + 1, 6, 6);
+        const deckH = 6.4;                       // headroom to look around
+        const top = 5;                           // decks 0..5 (roof)
         const ggx = (x0 + 1) * TILE, ggy = (y0 + 1) * TILE;
+        const gw = 6 * TILE, gh = 6 * TILE;
+        const garIdx = garages.length;
         garages.push({
-          x0: ggx, y0: ggy, x1: ggx + 5 * TILE, y1: ggy + 5 * TILE,
-          ex0: ggx + 2 * TILE + 4, ex1: ggx + 3 * TILE - 4,   // entrance lane, south face
-          rx0: ggx + 4 * TILE, rx1: ggx + 5 * TILE,           // ramp column (east)
-          ry0: ggy + TILE, ry1: ggy + 4 * TILE,               // ramp run, 3 tiles
-          top: 4, blk: []
+          x0: ggx, y0: ggy, x1: ggx + gw, y1: ggy + gh,
+          // 2-tile wide entrance on the south face (cars are ~40px long)
+          ex0: ggx + 2 * TILE - 4, ex1: ggx + 4 * TILE + 4,
+          // 2-tile wide ramp bay on the east — room for sedan + wall clearance
+          rx0: ggx + 4 * TILE, rx1: ggx + 6 * TILE,
+          // long ramp run (≈4.5 tiles) — gentle climb between decks
+          ry0: ggy + Math.floor(0.6 * TILE),
+          ry1: ggy + Math.floor(5.2 * TILE),
+          top, deckH, blk: []
+        });
+        // garIdx ties the mesh to the garage even if footprint shrinks later
+        buildings.push({
+          tx: x0 + 1, ty: y0 + 1, tw: 6, th: 6,
+          floors: Math.ceil((top + 0.4) * deckH / FLOOR_H),
+          tint: 0x62656c, tex: 'garage', style: 'garage', garIdx
         });
       } else if (kind === 'bank') {
         // FIRST NUVOLA BANK: stone civic block with a walk-up ATM by the door
@@ -1643,10 +1732,14 @@ function genCity() {
           });
         }
       } else if (kind === 'construction') {
-        // unfinished concrete frame + tower crane
+        // unfinished concrete frame + tower crane — NOT parking texture
+        // (garage tex on a solid shell read as a sealed "fake" parkade)
         paveAll(x0, y0);
         markSolidRect(x0 + 2, y0 + 2, 4, 4);
-        buildings.push({ tx: x0 + 2, ty: y0 + 2, tw: 4, th: 4, floors: 5, tint: 0x6a6a66, tex: 'garage', style: 'shell' });
+        buildings.push({
+          tx: x0 + 2, ty: y0 + 2, tw: 4, th: 4, floors: 5,
+          tint: 0x8a8680, tex: 'conc', style: 'shell'
+        });
         props.tcranes.push({ x: (x0 + 1) * TILE, y: (y0 + 1) * TILE });
       } else if (kind === 'capitol') {
         // the state house: pale-stone neoclassical slab, dome + portico added as props
@@ -2115,6 +2208,17 @@ function rebuildLandmarks() {
     });
   }
   if (stadiumPos) landmarks.push({ x: stadiumPos.x, y: stadiumPos.y, name: 'STADIUM', letter: 'S', color: '#a0e0ff', sign: 'stadium' });
+  // multi-storey parkades (no b.sign — mesh carries PARKING plate)
+  for (const g of garages) {
+    landmarks.push({
+      x: (g.x0 + g.x1) / 2,
+      y: (g.y0 + g.y1) / 2,
+      name: 'PARKING GARAGE',
+      letter: 'R',
+      color: '#c8b080',
+      sign: 'garage'
+    });
+  }
   console.log('LANDMARKS ' + landmarks.length + ' [' + landmarks.map(L => L.letter + ':' + L.name).join(', ') + ']');
 }
 rebuildLandmarks();
@@ -2129,8 +2233,9 @@ function placeLabelAt(x, y) {
   const block = kind ? (DISTRICT_LABELS[kind] || kind) : null;
   // standing on a named district (hospital / police / bank…) — lead with that
   if (kind === 'hospital' || kind === 'police' || kind === 'bank' || kind === 'mall'
-    || kind === 'motel' || kind === 'gas' || kind === 'church' || kind === 'capitol' || kind === 'stadium') {
-    if (near && nd < 3.5 * TILE && near.sign === kind) return near.name;
+    || kind === 'motel' || kind === 'gas' || kind === 'church' || kind === 'capitol'
+    || kind === 'stadium' || kind === 'garage') {
+    if (near && nd < 3.5 * TILE && (near.sign === kind || (kind === 'garage' && near.sign === 'garage'))) return near.name;
     return (block || kind).toUpperCase();
   }
   // on/inside a landmark footprint (within ~2.5 tiles of center) → its name
@@ -3354,7 +3459,9 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
   const GAR_CAR_TINTS = [0x8a2f2f, 0x2f4d8a, 0x777d85, 0x3f6b3f, 0x6b5a3f, 0x50355e];
   let garCarIdx = 0;
   function buildGarage(g) {
+    const dh = g.deckH || FLOOR_H;
     const add = (mat, sx, sy, sz, px, py, pz, rx) => {
+      if (sx < 0.2 || sy < 0.15 || sz < 0.2) return null;
       const m = new THREE.Mesh(boxGeo, mat);
       m.scale.set(sx, sy, sz);
       m.position.set(px, py, pz);
@@ -3364,66 +3471,122 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
     };
     const X0 = g.x0 * RS, X1 = g.x1 * RS, Z0 = g.y0 * RS, Z1 = g.y1 * RS;
     const SX0 = g.rx0 * RS, SX1 = g.rx1 * RS, RY0 = g.ry0 * RS, RY1 = g.ry1 * RS;
-    const gcx = (X0 + X1) / 2, gcz = (Z0 + Z1) / 2, scx = (SX0 + SX1) / 2;
-    // deck slabs with the ramp well left open
-    for (let d = 1; d <= g.top; d++) {
-      const y = d * FLOOR_H - 0.25;
-      add(garSlabMat, SX0 - X0 - 0.6, 0.5, Z1 - Z0 - 0.6, (X0 + SX0) / 2, y, gcz);
-      add(garSlabMat, SX1 - SX0 - 0.6, 0.5, RY0 - Z0 - 0.6, scx, y, (Z0 + RY0) / 2);
-      add(garSlabMat, SX1 - SX0 - 0.6, 0.5, Z1 - RY1 - 0.6, scx, y, (RY1 + Z1) / 2);
-    }
-    // ramps (north end high) + a rail on the open side
-    const rampLen = Math.hypot(RY1 - RY0, FLOOR_H), rampAng = Math.atan2(FLOOR_H, RY1 - RY0);
-    for (let d = 0; d < g.top; d++) {
-      add(garRampMat, SX1 - SX0 - 0.6, 0.4, rampLen, scx, d * FLOOR_H + FLOOR_H / 2, (RY0 + RY1) / 2, rampAng);
-      add(garWallMat, 0.5, 1.1, rampLen, SX0 + 0.25, d * FLOOR_H + FLOOR_H / 2 + 0.7, (RY0 + RY1) / 2, rampAng);
-    }
-    // perimeter: taller street wall at ground (split at the entrance), knee
-    // parapets above
     const EX0 = g.ex0 * RS, EX1 = g.ex1 * RS;
-    for (let d = 0; d <= g.top; d++) {
-      const h = d === 0 ? 2.6 : 1.1, y = d * FLOOR_H + h / 2 + 0.05;
-      add(garWallMat, X1 - X0 - 0.6, h, 0.6, gcx, y, Z0 + 0.6);
-      if (d === 0) {
-        add(garWallMat, EX0 - X0 - 0.6, h, 0.6, (X0 + EX0) / 2, y, Z1 - 0.6);
-        add(garWallMat, X1 - EX1 - 0.6, h, 0.6, (EX1 + X1) / 2, y, Z1 - 0.6);
-      } else {
-        add(garWallMat, X1 - X0 - 0.6, h, 0.6, gcx, y, Z1 - 0.6);
-      }
-      add(garWallMat, 0.6, h, Z1 - Z0 - 0.6, X0 + 0.6, y, gcz);
-      add(garWallMat, 0.6, h, Z1 - Z0 - 0.6, X1 - 0.6, y, gcz);
-    }
-    // columns on the interior tile grid (the ramp run stays clear)
-    for (let i = 1; i <= 4; i++) for (let j = 1; j <= 4; j++) {
-      if (i === 4 && j >= 1 && j <= 3) continue;
-      add(garColMat, 0.9, g.top * FLOOR_H + 0.4, 0.9, X0 + i * TILE * RS, (g.top * FLOOR_H + 0.4) / 2, Z0 + j * TILE * RS);
-      g.blk.push({ x: g.x0 + i * TILE, y: g.y0 + j * TILE, r: 5, deck: null });
-    }
-    // residents: parked cars on decks 1..3 along the WEST wall — clear of
-    // the ramp circulation (entrance lane, east strip, north crossover)
-    for (let d = 1; d <= 3; d++) for (const s of [0, 1]) {
-      const pxl = g.x0 + 16, pyl = g.y0 + 60 + s * 92;
-      const tint = new THREE.MeshLambertMaterial({ color: GAR_CAR_TINTS[garCarIdx++ % GAR_CAR_TINTS.length] });
-      add(tint, 4.2, 1.5, 9, pxl * RS, d * FLOOR_H + 0.95, pyl * RS);
-      add(tint, 3.6, 1.1, 4.6, pxl * RS, d * FLOOR_H + 2.1, pyl * RS);
-      g.blk.push({ x: pxl, y: pyl - 9, r: 9, deck: d });
-      g.blk.push({ x: pxl, y: pyl + 9, r: 9, deck: d });
-    }
-    // ceiling tubes under each slab
+    const gcx = (X0 + X1) / 2, gcz = (Z0 + Z1) / 2, scx = (SX0 + SX1) / 2;
+    const bodyW = X1 - X0, bodyD = Z1 - Z0;
+    const rampW = SX1 - SX0, rampRun = RY1 - RY0;
+    const westW = SX0 - X0;
+    const paintMat = new THREE.MeshBasicMaterial({ color: 0xffd23f });
+    // ---- deck slabs (U-shape): full west bay + east pockets N/S of the ramp well
     for (let d = 1; d <= g.top; d++) {
-      add(garLightMat, 2.6, 0.14, 1.0, gcx - 12, d * FLOOR_H - 0.6, gcz);
-      add(garLightMat, 2.6, 0.14, 1.0, gcx + 12, d * FLOOR_H - 0.6, gcz);
+      const y = d * dh - 0.22;
+      add(garSlabMat, westW - 0.5, 0.55, bodyD - 0.5, (X0 + SX0) / 2, y, gcz);
+      const northD = Math.max(0.8, RY0 - Z0 - 0.4);
+      const southD = Math.max(0.8, Z1 - RY1 - 0.4);
+      if (northD > 1) add(garSlabMat, rampW - 0.5, 0.55, northD, scx, y, Z0 + northD / 2 + 0.2);
+      if (southD > 1) add(garSlabMat, rampW - 0.5, 0.55, southD, scx, y, Z1 - southD / 2 - 0.2);
+      // yellow lane stripe down the main drive aisle (west of ramp)
+      add(paintMat, 0.35, 0.06, bodyD - 4, SX0 - 1.2, y + 0.32, gcz);
     }
-    // the stack-end walls the physics enforces: solid infill under the first
-    // ramp's high end at ground level, and a guard rail across the roof well
-    add(garWallMat, SX1 - SX0 - 0.6, 4.6, 1.5, scx, 2.3, (g.ry0 - 23) * RS);
-    add(garWallMat, SX1 - SX0 - 0.6, 1.1, 1.5, scx, g.top * FLOOR_H + 0.6, (g.ry1 - 23) * RS);
-    // the name over the way in
+    // ---- ramps: one wide slab per deck rise (north end high)
+    const rampLen = Math.hypot(rampRun, dh);
+    const rampAng = Math.atan2(dh, rampRun);
+    for (let d = 0; d < g.top; d++) {
+      const midY = d * dh + dh / 2;
+      const midZ = (RY0 + RY1) / 2;
+      add(garRampMat, rampW - 0.7, 0.45, rampLen, scx, midY, midZ, rampAng);
+      // side curbs so cars stay on the ramp
+      add(garWallMat, 0.35, 0.55, rampLen, SX0 + 0.35, midY + 0.35, midZ, rampAng);
+      add(garWallMat, 0.35, 0.55, rampLen, SX1 - 0.35, midY + 0.35, midZ, rampAng);
+      // yellow edge paint
+      add(paintMat, 0.18, 0.08, rampLen * 0.95, SX0 + 0.55, midY + 0.28, midZ, rampAng);
+      add(paintMat, 0.18, 0.08, rampLen * 0.95, SX1 - 0.55, midY + 0.28, midZ, rampAng);
+    }
+    // ---- perimeter: solid ground walls (entrance gap), open rails above for views
+    for (let d = 0; d <= g.top; d++) {
+      const isGround = d === 0;
+      const h = isGround ? 3.2 : 1.15;
+      const y = d * dh + h / 2 + 0.06;
+      // north wall full
+      add(garWallMat, bodyW - 0.5, h, 0.55, gcx, y, Z0 + 0.4);
+      // south wall — split for entrance on ground only
+      if (isGround) {
+        add(garWallMat, EX0 - X0 - 0.4, h, 0.55, (X0 + EX0) / 2, y, Z1 - 0.4);
+        add(garWallMat, X1 - EX1 - 0.4, h, 0.55, (EX1 + X1) / 2, y, Z1 - 0.4);
+      } else {
+        // open rail on south so you can look out over the street
+        add(garWallMat, bodyW - 0.5, h, 0.45, gcx, y, Z1 - 0.4);
+      }
+      // west wall — rails with gaps for view / light
+      if (isGround) {
+        add(garWallMat, 0.55, h, bodyD - 0.5, X0 + 0.4, y, gcz);
+      } else {
+        for (const t of [-0.32, 0, 0.32]) {
+          add(garWallMat, 0.45, h, bodyD * 0.22, X0 + 0.4, y, gcz + t * bodyD);
+        }
+      }
+      // east wall outside the ramp bay (full at ground; rail above)
+      if (isGround) {
+        add(garWallMat, 0.55, h, bodyD - 0.5, X1 - 0.4, y, gcz);
+      } else {
+        add(garWallMat, 0.45, h, bodyD * 0.28, X1 - 0.4, y, gcz - bodyD * 0.3);
+        add(garWallMat, 0.45, h, bodyD * 0.28, X1 - 0.4, y, gcz + bodyD * 0.3);
+      }
+    }
+    // ---- structural columns (skip the ramp bay)
+    const nColX = Math.max(2, Math.round((g.x1 - g.x0) / TILE) - 1);
+    const nColZ = Math.max(2, Math.round((g.y1 - g.y0) / TILE) - 1);
+    const colH = g.top * dh + 0.5;
+    for (let i = 1; i <= nColX; i++) {
+      for (let j = 1; j <= nColZ; j++) {
+        const cxp = g.x0 + i * TILE, czp = g.y0 + j * TILE;
+        // keep ramp bay clear
+        if (cxp >= g.rx0 - 6 && cxp <= g.rx1 + 6 && czp >= g.ry0 - 6 && czp <= g.ry1 + 6) continue;
+        add(garColMat, 1.0, colH, 1.0, cxp * RS, colH / 2, czp * RS);
+        g.blk.push({ x: cxp, y: czp, r: 6, deck: null });
+      }
+    }
+    // ---- parked cars on decks 1..top-1 along the west bays (clear of drive aisle)
+    const maxPark = Math.min(g.top - 1, 4);
+    for (let d = 1; d <= maxPark; d++) {
+      for (let s = 0; s < 3; s++) {
+        const pxl = g.x0 + 22;
+        const pyl = g.y0 + 50 + s * 70;
+        if (pyl > g.y1 - 50) continue;
+        const tint = new THREE.MeshLambertMaterial({ color: GAR_CAR_TINTS[garCarIdx++ % GAR_CAR_TINTS.length] });
+        add(tint, 4.4, 1.55, 9.2, pxl * RS, d * dh + 1.0, pyl * RS);
+        add(tint, 3.7, 1.15, 4.8, pxl * RS, d * dh + 2.2, pyl * RS);
+        g.blk.push({ x: pxl, y: pyl - 10, r: 10, deck: d });
+        g.blk.push({ x: pxl, y: pyl + 10, r: 10, deck: d });
+      }
+    }
+    // ---- ceiling lights under each deck
+    for (let d = 1; d <= g.top; d++) {
+      const ly = d * dh - 0.55;
+      for (const ox of [-westW * 0.25, westW * 0.15]) {
+        add(garLightMat, 3.2, 0.16, 1.1, (X0 + SX0) / 2 + ox, ly, gcz - bodyD * 0.22);
+        add(garLightMat, 3.2, 0.16, 1.1, (X0 + SX0) / 2 + ox, ly, gcz + bodyD * 0.22);
+      }
+    }
+    // ---- physics walls matching gWalkable stack-ends
+    add(garWallMat, rampW - 0.5, dh * 0.85, 1.6, scx, dh * 0.4, (g.ry0 - 23) * RS);
+    add(garWallMat, rampW - 0.5, 1.15, 1.6, scx, g.top * dh + 0.65, (g.ry1 - 23) * RS);
+    // roof parapet ring so the top deck feels finished
+    const roofY = g.top * dh + 0.5;
+    add(garWallMat, bodyW - 0.3, 1.0, 0.5, gcx, roofY, Z0 + 0.35);
+    add(garWallMat, bodyW - 0.3, 1.0, 0.5, gcx, roofY, Z1 - 0.35);
+    add(garWallMat, 0.5, 1.0, bodyD - 0.3, X0 + 0.35, roofY, gcz);
+    add(garWallMat, 0.5, 1.0, bodyD - 0.3, X1 - 0.35, roofY, gcz);
+    // PARKING sign over the entrance
     const sign = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ map: TEXS.signs.parking }));
-    sign.scale.set(10, 2, 0.35);
-    sign.position.set((EX0 + EX1) / 2, 4.4, Z1 - 0.25);
+    sign.scale.set(12, 2.2, 0.4);
+    sign.position.set((EX0 + EX1) / 2, 5.2, Z1 - 0.2);
     scene.add(sign);
-    console.log('GARAGE built @' + g.x0 + ',' + g.y0 + ' decks=' + (g.top + 1) + ' blk=' + g.blk.length);
+    // entrance canopy so the mouth reads clearly from the street
+    add(garSlabMat, EX1 - EX0 + 2, 0.35, 3.2, (EX0 + EX1) / 2, 4.6, Z1 + 1.2);
+    add(garColMat, 0.4, 4.5, 0.4, EX0 - 0.2, 2.25, Z1 + 2.0);
+    add(garColMat, 0.4, 4.5, 0.4, EX1 + 0.2, 2.25, Z1 + 2.0);
+    console.log('GARAGE built @' + g.x0 + ',' + g.y0 + ' decks=' + (g.top + 1) + ' deckH=' + dh + ' rampW=' + Math.round(g.rx1 - g.rx0) + 'px run=' + Math.round(g.ry1 - g.ry0) + 'px blk=' + g.blk.length);
   }
 
   const T2 = TILE * RS;
@@ -3479,7 +3642,37 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
       return st;
     }
     if (st === 'shell') {
-      addMass(mats, W, H, D, cx, 0, cz);
+      // Construction frame: open floors, columns, beams — never a sealed
+      // solid with parking stripes (that looked like a broken garage).
+      const raw = new THREE.MeshLambertMaterial({ color: 0x9a968c });
+      const rebar = new THREE.MeshLambertMaterial({ color: 0x6a6860 });
+      // ground slab
+      addMass(raw, W + 0.2, 0.45, D + 0.2, cx, 0, cz);
+      // vertical columns on a 3×3 grid (corners + edges + center)
+      const colH = H * 0.92;
+      for (const u of [-0.38, 0, 0.38]) for (const v of [-0.38, 0, 0.38]) {
+        addMass(raw, 0.85, colH, 0.85, cx + u * W, 0.45, cz + v * D);
+      }
+      // floor plates every story — incomplete, with a missing SE corner bite
+      const stories = Math.max(2, Math.round(H / FH));
+      for (let s = 1; s <= stories; s++) {
+        const y = Math.min(H - 0.3, s * FH);
+        const bite = (s % 2 === 0);
+        if (bite) {
+          addMass(raw, W * 0.7, 0.35, D * 0.7, cx - W * 0.1, y, cz - D * 0.1);
+        } else {
+          addMass(raw, W * 0.92, 0.35, D * 0.92, cx, y, cz);
+        }
+        // edge beams
+        addMass(rebar, W * 0.95, 0.4, 0.35, cx, y + 0.3, cz - D * 0.46);
+        addMass(rebar, W * 0.95, 0.4, 0.35, cx, y + 0.3, cz + D * 0.46);
+        addMass(rebar, 0.35, 0.4, D * 0.95, cx - W * 0.46, y + 0.3, cz);
+        addMass(rebar, 0.35, 0.4, D * 0.95, cx + W * 0.46, y + 0.3, cz);
+      }
+      // scaffold poles on one corner
+      for (const t of [0, 0.33, 0.66, 1]) {
+        addMass(rebar, 0.18, H * 0.95, 0.18, cx + W * 0.48, 0, cz + D * 0.48 - t * D * 0.15);
+      }
       return st;
     }
     if (st === 'motel') {
@@ -3783,9 +3976,13 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
     const H = b.floors * FLOOR_H;
     const cx = b.tx * T2 + ins.w + W / 2;
     const cz = b.ty * T2 + ins.n + D / 2;
-    if (b.tex === 'garage') {
-      const gg = garages.find(g => g.x0 === b.tx * TILE && g.y0 === b.ty * TILE);
+    // Real parkades only (style garage + garIdx). Construction shells must
+    // never fall into this path with parking texture.
+    if (b.style === 'garage' || (b.tex === 'garage' && b.garIdx != null)) {
+      const gg = (b.garIdx != null && garages[b.garIdx])
+        || garages.find(g => g.x0 === b.tx * TILE && g.y0 === b.ty * TILE);
       if (gg) { buildGarage(gg); continue; }
+      console.log('GARAGE MISS building @' + b.tx + ',' + b.ty + ' garIdx=' + b.garIdx);
     }
     const base = b.tex === 'glass' ? TEXS.glass : b.tex === 'garage' ? TEXS.garage
       : b.tex === 'motel' ? TEXS.motel : b.tex === 'wood' ? TEXS.wood
@@ -8825,28 +9022,23 @@ function gunfireWitnessed() {
     msg('Shots fired in front of the law!', 8);
   }
 }
-// The crosshair is the CAMERA's ray, and that ray runs through a pivot at
-// 3.2 — above the 1.9 muzzle. A shot fired merely PARALLEL to it lands
-// below the mark at every range. Converge instead: find the point the
-// crosshair actually covers (chest plane when aiming down, the ground when
-// steep, a 500px sight-in otherwise) and aim the muzzle AT that point.
+// AIM TRIANGLE (do not re-break):
+//   1) mark M = where the look ray hits the world (crosshairPoint)
+//   2) 3rd-person camera sits above the character and lookAt(M)  → reticle ON M
+//   3) bullet leaves the barrel aimed AT M (same M)            → impact ON M
 let lastPivotY = 3.2;
 function aimPivotY() {
-  // the character's eye height RIGHT NOW (same formula the camera uses)
-  // player.gh = walkable stoop/step top so aim tracks you on a doorstep
+  // eye / barrel height (same base the camera pivot uses)
   return (player.car ? 4 : swim ? 0.9 : 3.2)
     + gHeightAt(player.car || player)
     + (player.car ? 0 : (player.gh || 0))
     + (player.car && player.car.alt ? player.car.alt : 0);
 }
 function crosshairPoint() {
-  // the aim TRIANGLE: the camera looks from above through the character's
-  // eyes; this ray, marched against real world heights, is what the
-  // crosshair marks. Weapons fire from the character TO this point — so the
-  // crosshair stays true without shooting through the character or the bird.
+  // March the look ray from the eyes into the world — this is mark M.
   const f = focus();
   const cvp = Math.max(0.05, Math.cos(mousePitch));
-  const slope = -Math.sin(mousePitch) / cvp;         // render units of height per render unit forward
+  const slope = -Math.sin(mousePitch) / cvp;         // render Δh per render-unit forward
   const hx = Math.cos(mouseYaw), hz = Math.sin(mouseYaw);
   const p0 = aimPivotY();
   let x = f.x, y = f.y, hh = p0, prevH = p0;
@@ -8854,37 +9046,35 @@ function crosshairPoint() {
     x += hx * 10; y += hz * 10; prevH = hh; hh += slope * 10 * RS;
     const th = Math.max(0, tileHeight(x, y));
     if (hh <= th) {
-      // refine to the actual surface: came down THROUGH the roof plane, or
-      // straight into a wall face
       if (prevH >= th && hh < th) {
         const t9 = (prevH - th) / Math.max(0.001, prevH - hh);
         return { x: x - hx * 10 * (1 - t9), y: y - hz * 10 * (1 - t9), h: th, d: d9 - 10 * (1 - t9) };
       }
       return { x, y, h: clamp(hh, 0, th), d: d9 };
     }
-    if (hh > 120) return { x, y, h: hh, d: d9 };     // aimed at the sky: point ON the ray, where it left the world
+    if (hh > 120) return { x, y, h: hh, d: d9 };
   }
   return { x: f.x + hx * 1400, y: f.y + hz * 1400, h: Math.max(0.5, hh), d: 1400 };
 }
-function aimVh(spd, h0) {
-  let dRef = 500;
-  if (mousePitch > 0.03) {
-    dRef = (3.2 - 1.5) / (Math.tan(mousePitch) * RS);
-    if (dRef < 45) dRef = (3.2 - 0.2) / (Math.tan(mousePitch) * RS);
-    dRef = clamp(dRef, 25, 900);
+// Soft-lock mark: ped chest on the same height system as free-aim marks
+function aimMark() {
+  if (aimTarget && !aimTarget.dead) {
+    const gH = gHeightAt(aimTarget) || 0;
+    return { x: aimTarget.x, y: aimTarget.y, h: 2.1 + gH, d: dist(player.x, player.y, aimTarget.x, aimTarget.y) };
   }
-  const gy = 3.2 - Math.tan(mousePitch) * dRef * RS;
-  return ((gy - h0) / dRef) * spd;
+  return crosshairPoint();
 }
 function fireWeapon() {
   const W = WEAPONS[player.weapon];
   if (player.fireT > 0) return;
   if (!W.melee) STATS.ammoSpent++;           // every trigger pull goes in the ledger
-  const ct9 = (aimTarget || W.melee) ? null : crosshairPoint();
-  const ctD = ct9 ? Math.max(8, dist(player.x, player.y, ct9.x, ct9.y) - 16) : 0;   // from the MUZZLE (16px out)
-  const gunH = gHeightAt(player) + (player.gh || 0);   // hand height includes doorsteps
-  const aimAng = aimTarget ? Math.atan2(aimTarget.y - player.y, aimTarget.x - player.x)
-    : ct9 ? Math.atan2(ct9.y - player.y, ct9.x - player.x) : mouseYaw;
+  // One mark for everything: barrel AND camera reticle
+  const ct9 = W.melee ? null : aimMark();
+  const eyeH = aimPivotY();
+  const aimAng = ct9 ? Math.atan2(ct9.y - player.y, ct9.x - player.x) : mouseYaw;
+  // range from barrel (16px out) to the mark
+  const bx0 = player.x + Math.cos(aimAng) * 16, by0 = player.y + Math.sin(aimAng) * 16;
+  const ctD = ct9 ? Math.max(8, dist(bx0, by0, ct9.x, ct9.y)) : 0;
   if (W.melee) {
     player.fireT = W.rate;
     if (player.mesh && player.mesh.userData) player.mesh.userData.meleeSwing = 0.28;
@@ -8943,7 +9133,8 @@ function fireWeapon() {
     player.fireT = W.rate;
     player.ammo.rpg--;
     rumble(0.7, 0.4, 220);
-    fireRocket(player.x, player.y, aimAng, aimTarget ? 0 : clamp((ct9.h - (1.6 + gunH)) * 430 / ctD, -400, 400));
+    // rocket vertical: barrel (eyeH) → same mark M
+    fireRocket(player.x, player.y, aimAng, clamp((ct9.h - eyeH) * 430 / ctD, -400, 400));
     scare(player.x, player.y, 280);
     gunfireWitnessed();
     return;
@@ -8956,14 +9147,14 @@ function fireWeapon() {
   player.recoil = Math.min(0.14, (player.recoil || 0) + kick);
   mousePitch = clamp(mousePitch - kick * 0.85, -1.45, 1.45);
   const n = W.pellets || 1;
-  // shots land ON the crosshair, not under it (locked targets aim level):
-  // the drop is computed to the marked point itself — roof, wall or street
-  const vh0 = aimTarget ? 0 : clamp((ct9.h - (1.9 + gunH)) * W.spd / ctD, -W.spd, W.spd);
+  // Barrel starts at eye height on the look ray; vertical speed hits mark M at range ctD.
+  // Camera lookAt(M) uses the same M — reticle and impact are the same point.
+  const vh0 = clamp((ct9.h - eyeH) * W.spd / ctD, -W.spd, W.spd);
   for (let i = 0; i < n; i++) {
     const ang = aimAng + (Math.random() - 0.5) * 2 * W.spread;
-    spawnBullet(player.x + Math.cos(aimAng) * 16, player.y + Math.sin(aimAng) * 16, Math.cos(ang) * W.spd, Math.sin(ang) * W.spd, W.life, W.dmg, W.cdmg, 'p', 1.9 + gunH, vh0);
+    spawnBullet(bx0, by0, Math.cos(ang) * W.spd, Math.sin(ang) * W.spd, W.life, W.dmg, W.cdmg, 'p', eyeH, vh0);
   }
-  addPart(player.x + Math.cos(aimAng) * 18, player.y + Math.sin(aimAng) * 18, 2.1 + gunH, 0, 0, 0, 0.05, 0xffe9a0, 1.4, true);
+  addPart(bx0 + Math.cos(aimAng) * 2, by0 + Math.sin(aimAng) * 2, eyeH, 0, 0, 0, 0.05, 0xffe9a0, 1.4, true);
   sfx(W.sfx);
   scare(player.x, player.y, 280);
   gunfireWitnessed();
@@ -11423,11 +11614,10 @@ function syncScene(dt, t) {
   camPos.y += (dy - camPos.y) * Math.min(1, dt * 10);
   camPos.z += (dz - camPos.z) * Math.min(1, dt * 14);
   camera.position.copy(camPos);
-  const mk9 = crosshairPoint();
-  const lk = Math.min(1, dt * 16);           // eased so depth pops don't snap the view
-  camLook.x += (mk9.x * RS - camLook.x) * lk;
-  camLook.y += (mk9.h + 0.4 - camLook.y) * lk;
-  camLook.z += (mk9.y * RS - camLook.z) * lk;
+  // AIM TRIANGLE step 2: camera ABOVE character looks straight at mark M.
+  // No lag, no +Y bias — screen center IS M; bullets also go to M.
+  const mk9 = aimMark();
+  camLook.set(mk9.x * RS, mk9.h, mk9.y * RS);
   camera.lookAt(camLook);
 }
 
@@ -11439,7 +11629,8 @@ const CONTROLS = [
   'E .................... nearest action: car / phone / shop / chapel / tune-up / save door',
   'Space / Enter / E / click / pad A ... advance cut-scene dialog',
   'Wheel or 1-8 / Q ..... weapons      Shift ... sprint      Space ... jump',
-  'Ctrl + Wheel ......... camera distance',
+  'Ctrl + Wheel ......... camera distance (not page zoom)',
+  'Ctrl + 0 ............. reset page zoom if UI looks huge',
   'Space handbrake   R radio   P pause   M mute   Esc frees mouse',
   'Respray shop: drive in, $200 clears your stars',
   '50 jobs vs the Combine and the State — crossings open at jobs 3 / 17 / 30 / 40'
@@ -12155,6 +12346,18 @@ function drawHUD(t) {
     hctx.font = 'bold 48px monospace';
     hctx.fillStyle = '#fff';
     hctx.fillText('PAUSED', VW / 2, VH * 0.14);
+    // Browser page-zoom warning (Ctrl+wheel outside the game / before preventDefault)
+    {
+      const zs = pageZoomScale();
+      if (zs > 1.05 || zs < 0.95) {
+        hctx.font = 'bold 20px monospace';
+        hctx.fillStyle = (performance.now() / 400 | 0) % 2 === 0 ? '#ff4040' : '#ffd23f';
+        hctx.fillText('UI ZOOMED — press  Ctrl + 0  to reset page size', VW / 2, VH * 0.14 + 28);
+        hctx.font = '13px monospace';
+        hctx.fillStyle = '#c8c8d0';
+        hctx.fillText('(browser zoom, not camera — scale ≈ ' + zs.toFixed(2) + '×)', VW / 2, VH * 0.14 + 48);
+      }
+    }
     hctx.font = '15px monospace';
     hctx.fillStyle = '#aaa';
     let py = VH * 0.20;
@@ -12166,7 +12369,7 @@ function drawHUD(t) {
     py += 22;
     hctx.font = '12px monospace';
     hctx.fillStyle = '#9aa3b8';
-    hctx.fillText('MAP  □ you   H hospital  P police  B bank  M mall  T motel  G gas  A apartments  C capitol  + chapel  L press  S stadium', VW / 2, py);
+    hctx.fillText('MAP  □ you   H hospital  P police  B bank  M mall  T motel  G gas  R parking  A apartments  C capitol  + chapel  L press  S stadium', VW / 2, py);
     py += 18;
     // the pad's CURRENT mapping, always in sync with the selected preset
     {

@@ -3151,12 +3151,12 @@ const ripIM = new THREE.InstancedMesh(new THREE.RingGeometry(0.42, 0.55, 12), ne
 ripIM.frustumCulled = false;
 ripIM.renderOrder = 4;
 const rips9 = [];
+const _ripM9 = new THREE.Matrix4(), _ripR9 = new THREE.Matrix4().makeRotationX(-Math.PI / 2);
 {
-  const M9 = new THREE.Matrix4();
   for (let i9 = 0; i9 < RIP_N; i9++) {
     rips9.push({ x: 0, z: 0, age: Math.random() });
-    M9.makeScale(0.001, 0.001, 0.001);
-    ripIM.setMatrixAt(i9, M9);
+    _ripM9.makeScale(0.001, 0.001, 0.001);
+    ripIM.setMatrixAt(i9, _ripM9);
   }
   scene.add(ripIM);
 }
@@ -3168,7 +3168,7 @@ const DEEP_C = 4;                                // dig cells per tile
 const DEEP_W = GRID_W * DEEP_C, DEEP_H = GRID_H * DEEP_C;
 const DEEP_CELL = TILE / DEEP_C;                 // logic px per cell
 const deepDig = new Float32Array(DEEP_W * DEEP_H).fill(1);
-let deepCur9 = 0;
+let deepCur9 = 0, _deepOX9 = 1e9, _deepOZ9 = 1e9, _deepF9 = 0;
 function deepAt(x9, y9) {                        // bilinear field sample, 1 = virgin drift
   const fx9 = x9 / DEEP_CELL - 0.5, fy9 = y9 / DEEP_CELL - 0.5;
   const x09 = Math.floor(fx9), y09 = Math.floor(fy9);
@@ -3194,7 +3194,11 @@ function digSnow(x9, y9, r9, press9) {           // press the powder down to (1-
       if (deepDig[i9] > t9) deepDig[i9] = t9;
     }
 }
+// REAL simulated drift lives 110 units around the player (dig field,
+// trails, wading). Beyond it: the PLACEBO ring (Tank's order) — fake
+// baked dunes to the fog line that cost a position-set per frame.
 const DEEP_SEG = 80, DEEP_SPAN = 110;
+const FAR_SEG = 40, FAR_SPAN = 340;
 const deepGeo = new THREE.PlaneGeometry(DEEP_SPAN, DEEP_SPAN, DEEP_SEG, DEEP_SEG);
 deepGeo.rotateX(-Math.PI / 2);
 const deepMesh = new THREE.Mesh(deepGeo, new THREE.MeshLambertMaterial({ color: 0xeef2fa }));
@@ -3202,12 +3206,42 @@ deepMesh.receiveShadow = true;
 deepMesh.frustumCulled = false;
 deepMesh.visible = false;
 scene.add(deepMesh);
+// the placebo: virgin-looking dunes with NO field reads and NO per-frame
+// rebuild — re-baked only on a coarse camera snap or a real depth change
+const farGeo9 = new THREE.PlaneGeometry(FAR_SPAN, FAR_SPAN, FAR_SEG, FAR_SEG);
+farGeo9.rotateX(-Math.PI / 2);
+const farMesh9 = new THREE.Mesh(farGeo9, new THREE.MeshLambertMaterial({ color: 0xeef2fa }));
+farMesh9.receiveShadow = true;
+farMesh9.frustumCulled = false;
+farMesh9.visible = false;
+scene.add(farMesh9);
+let _farOX9 = 1e9, _farOZ9 = 1e9, _farDeep9 = -1, farBakes9 = 0;
+function bakeFar9(ox9, oz9, dh9) {
+  const pa9 = farGeo9.attributes.position;
+  const half9 = DEEP_SPAN / 2 - 2;               // inner box hides under the REAL drift
+  for (let i9 = 0; i9 < pa9.count; i9++) {
+    const vx9 = pa9.getX(i9), vz9 = pa9.getZ(i9);
+    let y9;
+    if (Math.abs(vx9) < half9 && Math.abs(vz9) < half9) y9 = -0.6;
+    else {
+      const wpx9 = (ox9 + vx9) / RS, wpy9 = (oz9 + vz9) / RS;
+      const tx9 = Math.floor(wpx9 / TILE), ty9 = Math.floor(wpy9 / TILE);
+      if (tx9 < 0 || ty9 < 0 || tx9 >= GRID_W || ty9 >= GRID_H
+        || tiles[ty9 * GRID_W + tx9] === T_WATER || solid[ty9 * GRID_W + tx9] === 1) y9 = -0.6;
+      else y9 = dh9 * (0.93 + 0.07 * Math.sin(wpx9 * 0.11) * Math.cos(wpy9 * 0.13));   // virgin dunes, same formula
+    }
+    pa9.setY(i9, y9);
+  }
+  pa9.needsUpdate = true;
+  farGeo9.computeVertexNormals();
+  farBakes9++;
+}
 function updDeepSnow(dt) {
   const W9 = WEATHER;
   if (W9.mode === 'blizzard' && W9.inten > 0.3) W9.deep = Math.min(1, W9.deep + dt / 35);
   else W9.deep = Math.max(0, W9.deep - dt / (W9.mode === 'rain' ? 25 : 60));
   if (W9.deep <= 0.02) {
-    if (deepMesh.visible) { deepMesh.visible = false; snowSheet.position.y = 0; snowSheet.updateMatrix(); }
+    if (deepMesh.visible) { deepMesh.visible = false; farMesh9.visible = false; snowSheet.position.y = 0; snowSheet.updateMatrix(); }
     return;
   }
   const dh9 = W9.deep * 1.7;                     // waist on the 3.54-unit frame
@@ -3238,26 +3272,45 @@ function updDeepSnow(dt) {
     }
     deepCur9 = (deepCur9 + N9) % deepDig.length;
   }
-  // the drift rides the camera, snapped to the dig grid so it never swims
+  // the drift rides the camera, snapped to the dig grid so it never swims.
+  // FPS: vertex rebuild and normal recompute ALTERNATE frames (each is the
+  // pass's heavy half; a one-frame lag on powder is invisible) — except on
+  // snap moves, which take both to avoid tearing.
   deepMesh.visible = true;
   const snap9 = DEEP_CELL * RS;
   const ox9 = Math.round(camera.position.x / snap9) * snap9;
   const oz9 = Math.round(camera.position.z / snap9) * snap9;
+  const snapped9 = ox9 !== _deepOX9 || oz9 !== _deepOZ9;
+  _deepOX9 = ox9; _deepOZ9 = oz9;
+  _deepF9 ^= 1;
   deepMesh.position.set(ox9, 0, oz9);
-  const pa9 = deepGeo.attributes.position;
-  for (let i9 = 0; i9 < pa9.count; i9++) {
-    const vx9 = pa9.getX(i9), vz9 = pa9.getZ(i9);
-    const wpx9 = (ox9 + vx9) / RS, wpy9 = (oz9 + vz9) / RS;
-    const tx9 = Math.floor(wpx9 / TILE), ty9 = Math.floor(wpy9 / TILE);
-    let y9;
-    if (tx9 < 0 || ty9 < 0 || tx9 >= GRID_W || ty9 >= GRID_H
-      || tiles[ty9 * GRID_W + tx9] === T_WATER || solid[ty9 * GRID_W + tx9] === 1) y9 = -0.6;
-    else y9 = dh9 * (0.12 + 0.88 * deepAt(wpx9, wpy9)) * (0.93 + 0.07 * Math.sin(wpx9 * 0.11) * Math.cos(wpy9 * 0.13));
-    pa9.setY(i9, y9);
+  if (snapped9 || _deepF9) {
+    const pa9 = deepGeo.attributes.position;
+    for (let i9 = 0; i9 < pa9.count; i9++) {
+      const vx9 = pa9.getX(i9), vz9 = pa9.getZ(i9);
+      const wpx9 = (ox9 + vx9) / RS, wpy9 = (oz9 + vz9) / RS;
+      const tx9 = Math.floor(wpx9 / TILE), ty9 = Math.floor(wpy9 / TILE);
+      let y9;
+      if (tx9 < 0 || ty9 < 0 || tx9 >= GRID_W || ty9 >= GRID_H
+        || tiles[ty9 * GRID_W + tx9] === T_WATER || solid[ty9 * GRID_W + tx9] === 1) y9 = -0.6;
+      else y9 = dh9 * (0.12 + 0.88 * deepAt(wpx9, wpy9)) * (0.93 + 0.07 * Math.sin(wpx9 * 0.11) * Math.cos(wpy9 * 0.13));
+      pa9.setY(i9, y9);
+    }
+    pa9.needsUpdate = true;
   }
-  pa9.needsUpdate = true;
-  deepGeo.computeVertexNormals();
-  snowSheet.position.y = W9.deep * 1.2;          // the distance keeps the illusion
+  if (snapped9 || !_deepF9) deepGeo.computeVertexNormals();
+  // the placebo ring: near-free — re-baked only on a coarse snap or a
+  // visible depth change, otherwise it just rides along
+  farMesh9.visible = true;
+  const fsnap9 = (FAR_SPAN / FAR_SEG);
+  const fox9 = Math.round(camera.position.x / fsnap9) * fsnap9;
+  const foz9 = Math.round(camera.position.z / fsnap9) * fsnap9;
+  if (fox9 !== _farOX9 || foz9 !== _farOZ9 || Math.abs(W9.deep - _farDeep9) > 0.04) {
+    _farOX9 = fox9; _farOZ9 = foz9; _farDeep9 = W9.deep;
+    bakeFar9(fox9, foz9, dh9);
+  }
+  farMesh9.position.set(fox9, 0, foz9);
+  snowSheet.position.y = W9.deep * 1.2;          // beyond the fog the flat sheet still carries
   snowSheet.updateMatrix();
 }
 // THE MOON (Tank order): Earth's near side, hung where the light comes
@@ -3352,16 +3405,19 @@ function lightningStrike(x9, y9, victim9) {
   if (victim9 === player) {
     hurtPlayer(70);
     if (player.car) carDamage(player.car, 25, null);
+    msg(player.dead ? 'KILLED BY LIGHTNING.' : 'STRUCK BY LIGHTNING!', 6);
   } else if (victim9 && victim9.hp !== undefined) {
     victim9.hp -= 260;
     launchRagFrom(victim9, x9 + rndf(-6, 6), y9 + rndf(-6, 6), 120);
+    const who9 = victim9.cop ? 'An officer' : 'A bystander';
+    msg(who9 + (victim9.hp <= 0 ? ' was struck DEAD by lightning.' : ' was struck by lightning!'), 6);
   }
 }
 // ---- MARKS (Tank order): footprints + tire tracks in the snow, wet
 // prints in the rain — and pools of blood (fallen peds) and oil (dead
 // cars) that feet and tires TRACK AWAY with them. One instanced quad
 // recycler, per-instance color, shrink-out at end of life.
-const MARK_N = 1024;
+const MARK_N = 2048;                             // four ribbons per car need the headroom
 const markIM = new THREE.InstancedMesh(
   new THREE.PlaneGeometry(1, 1),
   new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.85, depthWrite: false }),
@@ -3398,15 +3454,26 @@ const _mkM = new THREE.Matrix4(), _mkQ = new THREE.Quaternion(), _mkQ2 = new THR
 const _mkP = new THREE.Vector3(), _mkS = new THREE.Vector3(), _mkC = new THREE.Color();
 const _mkUP = new THREE.Vector3(0, 1, 0);
 const _mkQX = new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0));   // flat-on-ground, once
-const MARK_COLS = { snow: 0x8e99b2, wet: 0x0b1220, blood: 0x7a1212, oil: 0x101216 };   // prints must READ on white
+const MARK_COLS = { snow: 0x8e99b2, wet: 0x46536b, blood: 0x7a1212, oil: 0x101216 };   // snow reads on white; wet is a sheen, not tar
+function composeMark9(m9, i9, fade9) {
+  // the rig rule maps local X to the heading — marks carry their LENGTH
+  // in local Y, so the yaw needs the extra quarter turn
+  _mkQ.setFromAxisAngle(_mkUP, -(m9.yaw + Math.PI / 2));
+  _mkQ.multiply(_mkQX);
+  _mkS.set(m9.sx * fade9, m9.sy * fade9, 1);
+  _mkM.compose(_mkP.set(m9.x, m9.h, m9.z), _mkQ, _mkS);
+  (m9.foot ? footIM : markIM).setMatrixAt(i9, _mkM);
+}
 function stampMark(x9, y9, ang9, sx9, sy9, kind9, life9, h9, foot9) {
   const i9 = markHead9;
   markHead9 = (markHead9 + 1) % MARK_N;
   if (!marks9[i9]) marksLive9++;
-  marks9[i9] = { x: x9 * RS, z: y9 * RS, yaw: ang9, sx: sx9, sy: sy9, kind: kind9, t: 0, life: life9, h: h9, foot: !!foot9 };
+  const m9 = marks9[i9] = { x: x9 * RS, z: y9 * RS, yaw: ang9, sx: sx9, sy: sy9, kind: kind9, t: 0, life: life9, h: h9, foot: !!foot9 };
   const own9 = foot9 ? footIM : markIM, sib9 = foot9 ? markIM : footIM;
   own9.setColorAt(i9, _mkC.setHex(MARK_COLS[kind9]));
   if (own9.instanceColor) own9.instanceColor.needsUpdate = true;
+  composeMark9(m9, i9, 1);                       // composed ONCE here; aging only touches faders
+  own9.instanceMatrix.needsUpdate = true;
   _mkM.compose(_mkP.set(0, -10, 0), _mkQ.identity(), _mkS.set(0.0001, 0.0001, 0.0001));
   sib9.setMatrixAt(i9, _mkM);                    // the slot lives in ONE mesh at a time
   sib9.instanceMatrix.needsUpdate = true;
@@ -3414,7 +3481,10 @@ function stampMark(x9, y9, ang9, sx9, sy9, kind9, life9, h9, foot9) {
 function trackKind9(ent9) {
   if (ent9._mkBlood > 0) { ent9._mkBlood--; return 'blood'; }
   if (ent9._mkOil > 0) { ent9._mkOil--; return 'oil'; }
-  if (WEATHER.snow > 0.25) return 'snow';
+  // the DOMINANT ground layer owns the track — rain melting a snow cover
+  // was still stamping light snow lines on a dark soaked road (Tank:
+  // "snow tracks in the rain")
+  if (WEATHER.snow > 0.25 && WEATHER.snow >= WEATHER.wet) return 'snow';
   if (WEATHER.wet > 0.35) return 'wet';
   return null;
 }
@@ -3470,45 +3540,45 @@ function updMarks(dt) {
     // consecutive segments touch, so the track reads as one drawn line
     if (k9) {
       const hw9 = c9.w * 0.42;
-      for (const s9 of [-1, 1]) {
-        const wx09 = px9 - Math.cos(pA9) * c9.len * 0.3 + Math.cos(pA9 + Math.PI / 2) * s9 * hw9;
-        const wy09 = py9 - Math.sin(pA9) * c9.len * 0.3 + Math.sin(pA9 + Math.PI / 2) * s9 * hw9;
-        const wx19 = c9.x - Math.cos(c9.angle) * c9.len * 0.3 + Math.cos(c9.angle + Math.PI / 2) * s9 * hw9;
-        const wy19 = c9.y - Math.sin(c9.angle) * c9.len * 0.3 + Math.sin(c9.angle + Math.PI / 2) * s9 * hw9;
-        const seg9 = dist(wx09, wy09, wx19, wy19);
-        if (seg9 < 1) continue;
-        stampMark((wx09 + wx19) / 2, (wy09 + wy19) / 2, Math.atan2(wy19 - wy09, wx19 - wx09),
-          0.32, seg9 * RS * 1.14, k9, k9 === 'wet' ? 6 : k9 === 'snow' ? 45 : 20, 0.18);
-      }
+      for (const ax9 of [-0.3, 0.3])             // rear axle AND front axle (Tank: fronts were missing)
+        for (const s9 of [-1, 1]) {
+          const wx09 = px9 + Math.cos(pA9) * c9.len * ax9 + Math.cos(pA9 + Math.PI / 2) * s9 * hw9;
+          const wy09 = py9 + Math.sin(pA9) * c9.len * ax9 + Math.sin(pA9 + Math.PI / 2) * s9 * hw9;
+          const wx19 = c9.x + Math.cos(c9.angle) * c9.len * ax9 + Math.cos(c9.angle + Math.PI / 2) * s9 * hw9;
+          const wy19 = c9.y + Math.sin(c9.angle) * c9.len * ax9 + Math.sin(c9.angle + Math.PI / 2) * s9 * hw9;
+          const seg9 = dist(wx09, wy09, wx19, wy19);
+          if (seg9 < 1) continue;
+          stampMark((wx09 + wx19) / 2, (wy09 + wy19) / 2, Math.atan2(wy19 - wy09, wx19 - wx09),
+            0.32, seg9 * RS * 1.14, k9, k9 === 'wet' ? 6 : k9 === 'snow' ? 45 : 20, 0.18);
+        }
     }
     c9._mkPX = c9.x; c9._mkPY = c9.y; c9._mkPA = c9.angle;
   }
-  // age + draw: hold, then shrink out; snow prints die with the melt
-  let any9 = false;
+  // aging: a mark's matrix is STATIC until it starts fading at 72% life —
+  // only faders and expirees recompose (was 2048 full composes per frame)
+  let any9 = false, dirty9 = false;
   for (let i9 = 0; i9 < MARK_N; i9++) {
     const m9 = marks9[i9];
     if (!m9) continue;
-    const im9 = m9.foot ? footIM : markIM;
     m9.t += dt;
-    const melt9 = m9.kind === 'snow' && WEATHER.snow < 0.05;
+    const melt9 = m9.kind === 'snow' && WEATHER.snow < 0.2;   // tracks die WITH the visible sheet, not after
     if (m9.t >= m9.life || melt9) {
       marks9[i9] = null;
       _mkS.set(0.0001, 0.0001, 0.0001);
       _mkM.compose(_mkP.set(0, -10, 0), _mkQ.identity(), _mkS);
-      im9.setMatrixAt(i9, _mkM);
+      (m9.foot ? footIM : markIM).setMatrixAt(i9, _mkM);
+      dirty9 = true;
       continue;
     }
     any9 = true;
-    const fade9 = m9.t > m9.life * 0.72 ? 1 - (m9.t - m9.life * 0.72) / (m9.life * 0.28) : 1;
-    _mkQ.setFromAxisAngle(_mkUP, -m9.yaw);
-    _mkQ.multiply(_mkQX);
-    _mkS.set(m9.sx * fade9, m9.sy * fade9, 1);
-    _mkM.compose(_mkP.set(m9.x, m9.h, m9.z), _mkQ, _mkS);
-    im9.setMatrixAt(i9, _mkM);
+    if (m9.t > m9.life * 0.72) {
+      composeMark9(m9, i9, 1 - (m9.t - m9.life * 0.72) / (m9.life * 0.28));
+      dirty9 = true;
+    }
   }
   markIM.visible = any9;
   footIM.visible = any9;
-  if (any9) { markIM.instanceMatrix.needsUpdate = true; footIM.instanceMatrix.needsUpdate = true; }
+  if (dirty9) { markIM.instanceMatrix.needsUpdate = true; footIM.instanceMatrix.needsUpdate = true; }
 }
 function ensureRainLoop9() {
   if (!AC || WEATHER.rainSrc) return;
@@ -3585,7 +3655,10 @@ function updWeather(dt) {
       x9 += wvx9 * dt; z9 += wvz9 * dt;
       if (y9 < 0) { y9 += RAIN_H; x9 = (Math.random() - 0.5) * RAIN_BOX; z9 = (Math.random() - 0.5) * RAIN_BOX; }
       rainPts[i9 * 3] = x9; rainPts[i9 * 3 + 1] = y9; rainPts[i9 * 3 + 2] = z9;
-      rainPos.set([x9, y9, z9, x9 + wvx9 * 0.02, y9 + 3.4, z9 + wvz9 * 0.02], i9 * 6);
+      // direct writes — an array literal here is 850 allocations PER FRAME
+      const b9 = i9 * 6;
+      rainPos[b9] = x9; rainPos[b9 + 1] = y9; rainPos[b9 + 2] = z9;
+      rainPos[b9 + 3] = x9 + wvx9 * 0.02; rainPos[b9 + 4] = y9 + 3.4; rainPos[b9 + 5] = z9 + wvz9 * 0.02;
     }
     rainGeo.attributes.position.needsUpdate = true;
   }
@@ -3606,8 +3679,8 @@ function updWeather(dt) {
   ripIM.material.opacity = W9.wet * 0.5 * (raining9 ? 1 : 0.25);
   ripIM.visible = W9.wet > 0.05;
   if (ripIM.visible) {
-    const M9 = new THREE.Matrix4(), R9 = new THREE.Matrix4().makeRotationX(-Math.PI / 2);
-    for (const r9 of rips9) {
+    for (let ri9 = 0; ri9 < rips9.length; ri9++) {   // indexed — no indexOf scans
+      const r9 = rips9[ri9];
       r9.age += dt * 1.4;
       if (r9.age >= 1) {
         if (!raining9) { r9.age = 1; continue; }
@@ -3618,9 +3691,9 @@ function updWeather(dt) {
         r9.age = 0;
       }
       const s9 = 0.2 + r9.age * 2.6;
-      M9.makeScale(s9, s9, s9).multiply(R9);
-      M9.setPosition(r9.x, 0.17, r9.z);
-      ripIM.setMatrixAt(rips9.indexOf(r9), M9);
+      _ripM9.makeScale(s9, s9, s9).multiply(_ripR9);
+      _ripM9.setPosition(r9.x, 0.17, r9.z);
+      ripIM.setMatrixAt(ri9, _ripM9);
     }
     ripIM.instanceMatrix.needsUpdate = true;
   }
@@ -8939,13 +9012,67 @@ function buildPedMesh(shirt, headCol) {
   gun.visible = false;
   armR.userData.hand.add(gun);
   g.userData = {
-    shirtMat, gun, legL, legR, armL, armR,
+    shirtMat, gun, legL, legR, armL, armR, torso, head, pantMat,
     kneeL: legL.userData.knee, kneeR: legR.userData.knee,
     elbowL: armL.userData.elbow, elbowR: armR.userData.elbow,
     handL: armL.userData.hand, handR: armR.userData.hand,
     phase: 0, lx: 0, ly: 0
   };
   return g;
+}
+// ---- BYSTANDER WARDROBE (Tank order): the street can't be one sexy red
+// panda in a suit. Civilians roll sex, skin, hair, hats, glasses, beards,
+// skirts, pants — all cheap boxes on the same rig, ragdoll-safe.
+const PED_SKINS9 = [0xf0c8a0, 0xe0b090, 0xc68e6a, 0x9c6b4a, 0x6e4a30];
+const PED_HAIRC9 = [0x191512, 0x2e2013, 0x5a3a1c, 0xb8862e, 0xa03a22, 0x8a8a8e];
+const PED_HATC9 = [0x203a6e, 0x6e1a1a, 0x1d4a26, 0x14161c, 0x6e5a1a, 0x4a1a5e];
+const PED_PANTS9 = [0x1c1e26, 0x2a3050, 0x3a3226, 0x44464e, 0x4a3a28, 0x263a4e];
+function decoratePed(p9) {
+  const ud9 = p9.mesh.userData, R9 = Math.random;
+  const hm9 = (w9, h9, d9, col9, x9, y9, z9) => {
+    const m9 = new THREE.Mesh(new THREE.BoxGeometry(w9, h9, d9), new THREE.MeshLambertMaterial({ color: col9 }));
+    m9.position.set(x9, y9, z9);
+    m9.castShadow = true; m9.receiveShadow = true;   // markShadows already ran
+    p9.mesh.add(m9);
+    return m9;
+  };
+  const look9 = { female: R9() < 0.45, hair: 'none', hat: null, glasses: false, beard: false, skirt: false };
+  p9.look = look9;
+  if (look9.female) ud9.torso.scale.set(0.84, 1, 0.8);
+  ud9.pantMat.color.setHex(PED_PANTS9[(R9() * PED_PANTS9.length) | 0]);
+  const hairC9 = PED_HAIRC9[(R9() * PED_HAIRC9.length) | 0];
+  const roll9 = R9();
+  if (look9.female) look9.hair = roll9 < 0.35 ? 'bob' : roll9 < 0.6 ? 'pony' : roll9 < 0.85 ? 'short' : 'afro';
+  else look9.hair = roll9 < 0.14 ? 'none' : roll9 < 0.6 ? 'short' : roll9 < 0.8 ? 'afro' : 'pony';
+  if (look9.hair === 'short') hm9(0.82, 0.26, 0.82, hairC9, -0.06, 3.4, 0);
+  else if (look9.hair === 'bob') { hm9(0.66, 0.62, 0.94, hairC9, -0.16, 3.18, 0); hm9(0.8, 0.3, 0.86, hairC9, -0.04, 3.42, 0); }
+  else if (look9.hair === 'afro') {
+    const af9 = new THREE.Mesh(new THREE.SphereGeometry(0.55, 7, 6), new THREE.MeshLambertMaterial({ color: hairC9 }));
+    af9.position.set(-0.03, 3.3, 0);
+    af9.castShadow = true;
+    p9.mesh.add(af9);
+  } else if (look9.hair === 'pony') { hm9(0.8, 0.26, 0.8, hairC9, -0.06, 3.4, 0); hm9(0.16, 0.72, 0.16, hairC9, -0.44, 2.98, 0); }
+  if (R9() < 0.3) {
+    const hc9 = PED_HATC9[(R9() * PED_HATC9.length) | 0];
+    look9.hat = R9() < 0.5 ? 'beanie' : 'cap';
+    if (look9.hat === 'beanie') {
+      const b9 = new THREE.Mesh(new THREE.CylinderGeometry(0.46, 0.48, 0.3, 9), new THREE.MeshLambertMaterial({ color: hc9 }));
+      b9.position.y = 3.42; b9.castShadow = true;
+      p9.mesh.add(b9);
+    } else {
+      const c9 = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.47, 0.22, 9), new THREE.MeshLambertMaterial({ color: hc9 }));
+      c9.position.y = 3.44; c9.castShadow = true;
+      p9.mesh.add(c9);
+      hm9(0.32, 0.05, 0.5, hc9, 0.42, 3.38, 0);   // visor forward (+X with the rig)
+    }
+  }
+  if (R9() < 0.16) { look9.glasses = true; hm9(0.1, 0.09, 0.62, 0x14161c, 0.38, 3.16, 0); }
+  if (!look9.female && R9() < 0.22) { look9.beard = true; hm9(0.3, 0.26, 0.46, hairC9, 0.3, 2.84, 0); }
+  if (look9.female && R9() < 0.5) {
+    look9.skirt = true;
+    hm9(0.78, 0.42, 1.05, PED_HATC9[(R9() * PED_HATC9.length) | 0], 0, 1.42, 0);
+    ud9.pantMat.color.setHex(p9._skin9 || 0xe0b090);   // bare legs match the skin
+  }
 }
 // ---- THE GHOST: X.com red-panda geo splat as the player body.
 // Same limb pivots / gun socket as buildPedMesh so gait, ragdoll, weapons
@@ -9151,9 +9278,13 @@ function ragPose(m, rag, t) {
   if (elbowR) elbowR.rotation.z = 0.35 + Math.abs(Math.sin(t * 15 + 0.7)) * 0.8 * fl;
 }
 function attachPedMesh(p) {
-  const headCol = p.cop ? (UNITS[p.unit] || UNITS.cop).head : 0xe0b090;
+  const uniform9 = p.cop || p.shopkeep || p.priest || p.prayer || p.combine || p.goon || p.guard;
+  const skin9 = uniform9 ? 0xe0b090 : PED_SKINS9[(Math.random() * PED_SKINS9.length) | 0];
+  const headCol = p.cop ? (UNITS[p.unit] || UNITS.cop).head : skin9;
   p.mesh = buildPedMesh(p.shirt, headCol);
+  p._skin9 = skin9;
   markShadows(p.mesh);
+  if (!uniform9) decoratePed(p);                 // bystanders roll their own look
   if (p.shopkeep) {
     // the house minigun, out of sight under the counter until provoked
     const ud2 = p.mesh.userData;
@@ -14210,6 +14341,33 @@ function update(dt) {
     if (p.pedOutlaw) {
       p.outlawT -= dt;
       if (p.outlawT <= 0) p.pedOutlaw = false;   // the trail goes cold
+      else if (!p.dead && npcCarryTick <= 0) {
+        // COP-KILLER ESCALATION (Tank: a gunman wiped the responders and
+        // nobody came): a live outlaw with NO officer left within reach
+        // draws a fresh wave — and every wave keeps the case hot. Waves
+        // only re-up after the last one is dead, so no pile-ups.
+        p.backupCool = (p.backupCool || 0) - 0.5;
+        let engaged9 = false;
+        for (const q of peds) {
+          if (q.dead || !q.cop) continue;
+          if (dist(q.x, q.y, p.x, p.y) < 620) { engaged9 = true; break; }
+        }
+        if (!engaged9)
+          for (const c2 of cars)
+            if (!c2.dead && c2.driver === 'cop' && dist(c2.x, c2.y, p.x, p.y) < 620) { engaged9 = true; break; }
+        if (!engaged9 && p.backupCool <= 0) {
+          p.backupCool = 14;
+          p.outlawT = Math.max(p.outlawT, 30);
+          const sp9 = findSidewalkNear(Math.floor(p.x / TILE) + 3, Math.floor(p.y / TILE) - 2);
+          for (const s9 of [-1, 1]) {
+            const cop9 = mkPed(sp9.x + s9 * 14, sp9.y + rndf(-8, 8), { cop: true, hp: 50, spd: 80, shirt: 0x20306a });
+            attachPedMesh(cop9);
+            cop9.mesh.userData.gun.visible = true;
+            peds.push(cop9);
+          }
+          if (dist(p.x, p.y, player.x, player.y) < 900) msg('Backup answers the officer-down call.', 5);
+        }
+      }
     } else if (npcCarryTick <= 0 && !p.dead && !p.cop && !p.combine && !p.ally && p.mesh && p.mesh.userData.gun && p.mesh.userData.gun.visible) {
       // open carry is illegal for EVERYONE: a cop who sees the iron starts
       // the same 5-second clock the player gets
@@ -16635,7 +16793,16 @@ if (location.hash === '#trafficlaw') {
     attachPedMesh(tc); peds.push(tc);
     for (let i = 0; i < 90; i++) updPed(gm, 1 / 60);
     ck('gunmanShoots', bullets.length > shotsBefore);
-  } else ck('gunmanShoots', false);
+    // COP-KILLER ESCALATION (Tank: gunman wiped the responders, nobody
+    // came): kill every officer on the scene — a fresh wave MUST answer
+    for (const q2 of peds) if (q2.cop && !q2.dead && dist(q2.x, q2.y, gm.x, gm.y) < 700) q2.dead = true;
+    for (const cc2 of cars) if (cc2.driver === 'cop' && !cc2.dead && dist(cc2.x, cc2.y, gm.x, gm.y) < 700) cc2.dead = true;
+    gm.backupCool = 0;
+    gm.outlawT = 40;
+    for (let i = 0; i < 90; i++) update(1 / 60);
+    const fresh2 = peds.filter(q2 => q2.cop && !q2.dead && dist(q2.x, q2.y, gm.x, gm.y) < 700).length;
+    ck('copKillerDrawsBackup', fresh2 >= 2 && gm.outlawT > 20);
+  } else { ck('gunmanShoots', false); ck('copKillerDrawsBackup', false); }
   // ---- LIVE LOOP: the real update() chain writes the ticket (Tank's field
   // test failed because his save had the PARDON on — prove both directions)
   pardonMode = false; godMode = true;
@@ -17618,6 +17785,18 @@ if (location.hash === '#perf') {
     }
     console.log('PERFCPU updateMs=' + (tU9 / N9).toFixed(2) + ' renderMs=' + (tR9 / N9).toFixed(2) +
       ' hudMs=' + (tH9 / N9).toFixed(2) + ' cores=' + navigator.hardwareConcurrency);
+    // WEATHER worst cases: a full storm frame and a full blizzard frame
+    // (with a loaded mark pool) — the numbers Tank's 60-FPS floor rides on
+    for (let i9 = 0; i9 < 900; i9++)
+      stampMark(player.x + rndf(-400, 400), player.y + rndf(-400, 400), rndf(0, 6.28), 0.32, 4, 'snow', 600, 0.18);
+    WEATHER.mode = 'rain'; WEATHER.inten = 1; WEATHER.wet = 1; WEATHER.snow = 0; WEATHER.deep = 0; WEATHER.t = 900;
+    let tWr9 = 0;
+    for (let i9 = 0; i9 < 120; i9++) { const t09 = performance.now(); updWeather(1 / 60); tWr9 += performance.now() - t09; }
+    WEATHER.mode = 'blizzard'; WEATHER.inten = 1; WEATHER.snow = 1; WEATHER.deep = 1; WEATHER.t = 900;
+    let tWb9 = 0;
+    for (let i9 = 0; i9 < 120; i9++) { const t09 = performance.now(); updWeather(1 / 60); tWb9 += performance.now() - t09; }
+    console.log('PERFWX stormMs=' + (tWr9 / 120).toFixed(2) + ' blizzardMs=' + (tWb9 / 120).toFixed(2) + ' (per frame, worst case)');
+    WEATHER.mode = 'clear'; WEATHER.inten = 0; WEATHER.wet = 0; WEATHER.snow = 0; WEATHER.deep = 0; WEATHER.t = 60;
     // can this file:// page spin real workers off a blob?
     try {
       const w9 = new Worker(URL.createObjectURL(new Blob(['onmessage=e=>postMessage(e.data*2)'], { type: 'text/javascript' })));
@@ -17781,6 +17960,42 @@ if (location.hash === '#touch') {
     console.log('TOUCHDBG ' + RU.join(' ') + ' fails=' + uFails);
   }, 400);
 }
+if (location.hash === '#peds') {
+  // BYSTANDER WARDROBE receipt (Tank order): the street rolls real variety
+  // — sexes, skins, hair, hats, glasses, beards, skirts — uniforms stay
+  // uniform, and a dressed ped still ragdolls.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let pFails = 0;
+    const RP = [], ckP = (n9, v9) => { RP.push(n9 + '=' + v9); if (!v9) pFails++; };
+    const batch9 = [];
+    for (let i9 = 0; i9 < 80; i9++) {
+      const tp9 = mkPed(player.x + rndf(-200, 200), player.y + rndf(-200, 200), {});
+      attachPedMesh(tp9);
+      peds.push(tp9);
+      batch9.push(tp9);
+    }
+    const f9 = batch9.filter(q9 => q9.look && q9.look.female).length / batch9.length;
+    ckP('bothSexesWalk', f9 > 0.2 && f9 < 0.7);
+    ckP('hairVariety', new Set(batch9.map(q9 => q9.look.hair)).size >= 3);
+    ckP('hatsHappen', batch9.some(q9 => q9.look.hat));
+    ckP('glassesHappen', batch9.some(q9 => q9.look.glasses));
+    ckP('skirtsHappen', batch9.some(q9 => q9.look.skirt));
+    ckP('beardsHappen', batch9.some(q9 => q9.look.beard));
+    ckP('skinVariety', new Set(batch9.map(q9 => q9._skin9)).size >= 3);
+    const cop9 = mkPed(player.x + 10, player.y, { cop: true, hp: 50, spd: 75, shirt: 0x20306a });
+    attachPedMesh(cop9);
+    peds.push(cop9);
+    ckP('copsStayUniform', !cop9.look);
+    const rp9 = batch9[0];
+    launchRagFrom(rp9, rp9.x + 5, rp9.y, 100);
+    ckP('wardrobeRagdolls', !!rp9.rag);
+    for (const q9 of batch9) q9.dead = true;
+    cop9.dead = true;
+    console.log('PEDDBG ' + RP.join(' ') + ' fails=' + pFails);
+  }, 500);
+}
 if (location.hash === '#weather') {
   // WEATHER receipt (Tank order): rain wets the ground and wakes the
   // puddles, snow falls AND lays, clear skies dry and melt it all back,
@@ -17806,6 +18021,7 @@ if (location.hash === '#weather') {
     const hp09 = zp9.hp;
     lightningStrike(zp9.x, zp9.y, zp9);
     ckW('boltHurtsPeds', zp9.hp <= hp09 - 260 && WEATHER.boltT > 0 && boltGrp.visible === true);
+    ckW('strikeIsAnnounced', msgs.some(m9 => /lightning/i.test(m9.t)));
     ckW('skyBlowsWhite', WEATHER.flashT > 0);
     // the player is NOT exempt
     const php9 = player.hp;
@@ -17893,6 +18109,7 @@ if (location.hash === '#weather') {
     WEATHER.inten = 1;
     for (let i9 = 0; i9 < 60; i9++) updWeather(0.1);
     ckW('powderRises', WEATHER.deep > 0.1 && deepMesh.visible === true);
+    ckW('placeboDressesTheDistance', farMesh9.visible === true && farBakes9 > 0);
     // the dig: walking presses a trail into the field (sampled at the far
     // SE corner — near spawn the receipt's own peds already trampled it)
     WEATHER.deep = 1;

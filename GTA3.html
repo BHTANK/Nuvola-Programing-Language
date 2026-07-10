@@ -1266,17 +1266,199 @@ function updEngine() {
     }
   }
 }
-function updRadio() {
-  if (!AC || muted || !radioOn || !player.car || state !== 'play' || paused || musicList.length) { radioT = AC ? AC.currentTime : 0; return; }
-  const BASS = [55, 55, 65.4, 49, 55, 73.4, 65.4, 49];
-  while (radioT < AC.currentTime + 0.3) {
-    const s = radioStep % 8;
-    if (s % 4 === 0) tone(130, 40, 0.12, 'sawtooth', 0.1, radioT);          // kick
-    if (s % 4 === 2) tone(3200, 2400, 0.03, 'square', 0.025, radioT);       // hat
-    tone(BASS[s], BASS[s], 0.18, 'sawtooth', 0.045, radioT);                // bassline
-    if (s === 0) tone(220, 220, 0.4, 'triangle', 0.02, radioT);
-    radioT += 0.21;
-    radioStep++;
+// ---- 140.0 NUVOLA BASS FM (Tank order: FULL dubstep, Knife Party school).
+// The radio WRITES the track live: wobble bass through a switching LFO into
+// a tanh shaper, half-time drums, densifying snare-roll builds, THE GAP,
+// then the drop. No files. No loading. E minor, 140 BPM, all night.
+let radioBus = null, radioDirt = null, radioAnn = false, _rnb = null;
+const RADIO = { step: 0, bar: 0, sec: 0, riff: 0, ev: 0 };
+const RSECTIONS = ['intro', 'build', 'drop', 'drop', 'break', 'build', 'drop', 'drop'];
+const RSTEP = 60 / 140 / 4;                        // one 16th note
+const RNOTES = [41.2, 49, 55, 61.7, 65.4, 73.4];   // E1 G1 A1 B1 C2 D2
+// drop riffs: 8 slots of 8ths — [note, lfoRateMult] or null (let it ring)
+const RRIFFS = [
+  [[0, 2], null, [0, 8], null, [3, 4], [3, 4], [0, 16], [2, 4]],
+  [[0, 4], [0, 4], null, [2, 2], [0, 12], null, [5, 3], [1, 6]],
+  [[0, 1], null, null, [0, 12], [4, 2], [0, 3], [0, 8], null]
+];
+function radioOut() {
+  if (!radioBus) {
+    radioBus = AC.createGain();
+    radioBus.gain.value = 0.5;
+    radioBus.connect(master || AC.destination);
+    radioDirt = AC.createWaveShaper();
+    const cur9 = new Float32Array(512);
+    for (let i = 0; i < 512; i++) { const x9 = i / 511 * 2 - 1; cur9[i] = Math.tanh(x9 * 2.7); }
+    radioDirt.curve = cur9;
+    radioDirt.connect(radioBus);
+  }
+  return radioBus;
+}
+function rNoiseBuf() {
+  if (_rnb) return _rnb;
+  const n9 = (AC.sampleRate * 0.5) | 0;
+  _rnb = AC.createBuffer(1, n9, AC.sampleRate);
+  const d9 = _rnb.getChannelData(0);
+  for (let i = 0; i < n9; i++) d9[i] = Math.random() * 2 - 1;
+  return _rnb;
+}
+function rKick(t) {
+  RADIO.ev++;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(150, t);
+  o.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+  g.gain.setValueAtTime(0.9, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.26);
+  o.connect(g).connect(radioOut());
+  o.start(t); o.stop(t + 0.3);
+}
+function rSnare(t, vol) {
+  RADIO.ev++;
+  const b = AC.createBufferSource(); b.buffer = rNoiseBuf();
+  const f = AC.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 1900; f.Q.value = 0.7;
+  const g = AC.createGain();
+  g.gain.setValueAtTime(vol || 0.5, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+  b.connect(f).connect(g).connect(radioOut());
+  b.start(t); b.stop(t + 0.24);
+  const o = AC.createOscillator(); o.type = 'triangle'; o.frequency.setValueAtTime(196, t);
+  const g2 = AC.createGain();
+  g2.gain.setValueAtTime((vol || 0.5) * 0.5, t);
+  g2.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+  o.connect(g2).connect(radioOut());
+  o.start(t); o.stop(t + 0.1);
+}
+function rHat(t, open) {
+  RADIO.ev++;
+  const b = AC.createBufferSource(); b.buffer = rNoiseBuf();
+  const f = AC.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 8200;
+  const g = AC.createGain();
+  const d9 = open ? 0.15 : 0.035;
+  g.gain.setValueAtTime(open ? 0.12 : 0.08, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + d9);
+  b.connect(f).connect(g).connect(radioOut());
+  b.start(t); b.stop(t + d9 + 0.02);
+}
+function rWobble(t, freq, dur, lfoRate, vol) {
+  RADIO.ev++;
+  radioOut();
+  const lp = AC.createBiquadFilter();
+  lp.type = 'lowpass'; lp.Q.value = 11;
+  lp.frequency.setValueAtTime(1000, t);
+  const lfo = AC.createOscillator();
+  lfo.type = 'sine';
+  lfo.frequency.setValueAtTime(lfoRate, t);
+  const lg = AC.createGain(); lg.gain.value = 850;
+  lfo.connect(lg).connect(lp.frequency);
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+  g.gain.setValueAtTime(vol, Math.max(t + 0.02, t + dur - 0.06));
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  lp.connect(g).connect(radioDirt);              // the growl goes through the dirt
+  const mk9 = (type9, f9, det9) => {
+    const o = AC.createOscillator();
+    o.type = type9; o.frequency.value = f9; o.detune.value = det9 || 0;
+    o.connect(lp); o.start(t); o.stop(t + dur + 0.03);
+  };
+  mk9('sawtooth', freq, -9); mk9('sawtooth', freq, 9); mk9('square', freq / 2, 0);
+  // the clean SUB rides under the filter — weight the growl can't carry
+  const sub = AC.createOscillator(); sub.type = 'sine'; sub.frequency.value = freq / 2;
+  const sg = AC.createGain();
+  sg.gain.setValueAtTime(0.0001, t);
+  sg.gain.exponentialRampToValueAtTime(vol * 0.6, t + 0.02);
+  sg.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  sub.connect(sg).connect(radioOut());
+  sub.start(t); sub.stop(t + dur + 0.03);
+  lfo.start(t); lfo.stop(t + dur + 0.03);
+}
+function rRiser(t, barDur) {
+  RADIO.ev++;
+  const b = AC.createBufferSource(); b.buffer = rNoiseBuf(); b.loop = true;
+  const f = AC.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.2;
+  f.frequency.setValueAtTime(400, t);
+  f.frequency.exponentialRampToValueAtTime(6500, t + barDur);
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0.02, t);
+  g.gain.exponentialRampToValueAtTime(0.22, t + barDur);
+  g.gain.setValueAtTime(0.0001, t + barDur + 0.01);
+  b.connect(f).connect(g).connect(radioOut());
+  b.start(t); b.stop(t + barDur + 0.05);
+  const o = AC.createOscillator(); o.type = 'sawtooth';
+  o.frequency.setValueAtTime(110, t);
+  o.frequency.exponentialRampToValueAtTime(440, t + barDur);
+  const g2 = AC.createGain();
+  g2.gain.setValueAtTime(0.03, t);
+  g2.gain.exponentialRampToValueAtTime(0.09, t + barDur);
+  g2.gain.setValueAtTime(0.0001, t + barDur + 0.01);
+  o.connect(g2).connect(radioOut());
+  o.start(t); o.stop(t + barDur + 0.05);
+}
+function rPad(t, barDur) {
+  RADIO.ev++;
+  radioOut();
+  const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 750; lp.Q.value = 0.6;
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.05, t + 0.3);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + barDur);
+  lp.connect(g).connect(radioBus);
+  for (const [f9, det9] of [[164.8, -6], [164.8, 6], [196, 0], [246.9, 4]]) {   // Em triad, close voiced
+    const o = AC.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f9; o.detune.value = det9;
+    o.connect(lp); o.start(t); o.stop(t + barDur + 0.05);
+  }
+}
+function updRadio(hz9) {
+  if (!AC || muted || !radioOn || !player.car || state !== 'play' || paused || musicList.length) {
+    radioT = AC ? AC.currentTime : 0;
+    return;
+  }
+  if (!radioAnn) { radioAnn = true; msg('♪ 140.0 NUVOLA BASS FM — full dubstep, all night.', 6); }
+  const barDur = RSTEP * 16;
+  const until9 = hz9 || AC.currentTime + 0.35;   // receipts inject a far horizon
+  while (radioT < until9) {
+    const t = radioT;
+    const s16 = RADIO.step % 16;
+    const barIn = RADIO.bar % 4;
+    const sec = RSECTIONS[RADIO.sec % RSECTIONS.length];
+    // THE GAP: the last beat before every drop is dead air — the signature
+    const nextSec = RSECTIONS[(RADIO.sec + 1) % RSECTIONS.length];
+    const gap = sec === 'build' && barIn === 3 && s16 >= 12 && nextSec === 'drop';
+    if (!gap) {
+      if (sec === 'drop') {
+        if (s16 === 0) rKick(t);
+        if (s16 === 10) rKick(t);                            // the syncopated stomp
+        if (s16 === 8) rSnare(t);
+        if (s16 % 2 === 0 && s16 !== 0 && s16 !== 8) rHat(t, false);
+        if (s16 === 14) rHat(t, true);
+        if (s16 % 2 === 0) {
+          const slot9 = RRIFFS[RADIO.riff % RRIFFS.length][(s16 / 2) | 0];
+          if (slot9) rWobble(t, RNOTES[slot9[0]], RSTEP * 2 * 0.95, 2.333 * slot9[1], 0.24);
+        }
+      } else if (sec === 'build') {
+        if (s16 % 4 === 0) rKick(t);
+        const roll9 = barIn >= 3 ? 1 : barIn >= 2 ? 2 : 4;   // the roll densifies
+        if (s16 % roll9 === 0) rSnare(t, 0.3 + barIn * 0.07);
+        if (barIn === 3 && s16 === 0) rRiser(t, barDur * 0.75);
+        if (s16 === 0) rWobble(t, RNOTES[0], RSTEP * 4, 2 + barIn * 2, 0.14);
+      } else {                                               // intro / break
+        if (s16 === 0) { rKick(t); rPad(t, barDur); }
+        if (s16 === 8) rSnare(t, 0.28);
+        if (s16 === 0 || s16 === 12) rWobble(t, RNOTES[0], RSTEP * 3, 1.2, 0.1);
+      }
+    }
+    RADIO.step++;
+    if (RADIO.step % 16 === 0) {
+      RADIO.bar++;
+      if (RADIO.bar % 4 === 0) {
+        RADIO.sec++;
+        if (RSECTIONS[RADIO.sec % RSECTIONS.length] === 'drop' && RSECTIONS[(RADIO.sec - 1) % RSECTIONS.length] !== 'drop') {
+          RADIO.riff = (RADIO.riff + 1 + (Math.random() * 2 | 0)) % RRIFFS.length;
+        }
+      }
+    }
+    radioT += RSTEP;
   }
 }
 
@@ -1417,6 +1599,9 @@ const crosswalks = [];   // corner crossing points: { x, y, to: [far corners], k
 // (4-way = even; T junction = long through / short single-lane stem).
 const TL_PERIOD = 16, TL_YELLOW = 1.5;           // one loop for the whole city
 const trafficLights = [];                        // { x, y, key } pole spots (logic px)
+const tlGrid = new Map();                        // tile key -> pole indices (feet + car hits)
+let tlMeshes = null;                             // instanced pole/housing meshes
+const brokenTLs = [];                            // poles down, waiting on the city truck
 const signalized = new Map();                    // 'cx,cy' -> { off, ewG, nsG }
 const props = { cranes: [], tanks: [], stacks: [], conts: [], bills: [], masts: [], ponds: [], gas: [], steeples: [], signs: [], tcranes: [], ships: [], churches: [] };
 // SOLIDS BY DEFAULT (Tank standing order 2026-07-09): everything placed in
@@ -1462,6 +1647,7 @@ const armoryPicks = [];
 const boatSpots = [];
 let tankRespawnT = 0;                            // counts up while the army pad sits empty
 let restaffT = 25;                               // slow clock: replaces dead shopkeeps/vendors/priests
+let capitolFlagM = null;                         // the banner on the capitol lawn — flies the wind
 // 0 north harbor, 1 south harbor (A<->B), 2 west causeway (A->3), 3 east causeway (B->3)
 const bridgesOpen = [false, false, false, false];
 const BRIDGE_GATES = [3, 17, 40, 30];      // N harbor, S harbor, WEST causeway (40), EAST causeway (30)
@@ -2402,17 +2588,17 @@ function dirAng(d) { return [0, Math.PI / 2, Math.PI, -Math.PI / 2][d]; }
 // fuelCap = tank size in gallons (Tank's spec: commuter 10, sport 13, taxi
 // 15, truck 17, cop 20); kinds without fuelCap (tank/helo/boat) never stall
 const CAR_KINDS = {
-  sedan: { hp: 100, max: 260, color: null, len: 40, w: 21, grip: 750, skid: 200, fuelCap: 10 },
-  taxi: { hp: 100, max: 270, color: 0xe8b800, len: 40, w: 21, grip: 760, skid: 205, fuelCap: 15 },
-  truck: { hp: 160, max: 190, color: 0x7a7f85, len: 52, w: 24, grip: 430, skid: 140, fuelCap: 17 },
-  cop: { hp: 120, max: 300, color: 0xf0f0f4, len: 42, w: 21, grip: 820, skid: 230, fuelCap: 20 },
-  sport: { hp: 80, max: 340, color: 0xc81e1e, len: 38, w: 19, grip: 950, skid: 260, fuelCap: 13 },
+  sedan: { hp: 100, max: 260, color: null, len: 40, w: 21, grip: 750, skid: 200, fuelCap: 10, mass: 1.0 },
+  taxi: { hp: 100, max: 270, color: 0xe8b800, len: 40, w: 21, grip: 760, skid: 205, fuelCap: 15, mass: 1.0 },
+  truck: { hp: 160, max: 190, color: 0x7a7f85, len: 52, w: 24, grip: 430, skid: 140, fuelCap: 17, mass: 1.9 },
+  cop: { hp: 120, max: 300, color: 0xf0f0f4, len: 42, w: 21, grip: 820, skid: 230, fuelCap: 20, mass: 1.15 },
+  sport: { hp: 80, max: 340, color: 0xc81e1e, len: 38, w: 19, grip: 950, skid: 260, fuelCap: 13, mass: 0.85 },
   // the VELOCE — F40-class exotic (original design, no badge): fastest iron
   // in the city, fragile, found ONLY on Capitol Shores (island 3)
-  veloce: { hp: 75, max: 420, color: 0xd21818, len: 39, w: 20, grip: 1020, skid: 275, fuelCap: 13 },
-  tank: { hp: 1000, max: 150, color: 0x4a5a3a, len: 64, w: 30, grip: 4000, skid: 9999 },
-  helo: { hp: 500, max: 250, color: 0x3c452e, len: 54, w: 14, grip: 900, skid: 9999 },
-  boat: { hp: 140, max: 230, color: 0xe8e4da, len: 52, w: 20, grip: 300, skid: 90 }
+  veloce: { hp: 75, max: 420, color: 0xd21818, len: 39, w: 20, grip: 1020, skid: 275, fuelCap: 13, mass: 0.8 },
+  tank: { hp: 1000, max: 150, color: 0x4a5a3a, len: 64, w: 30, grip: 4000, skid: 9999, mass: 8.0 },
+  helo: { hp: 500, max: 250, color: 0x3c452e, len: 54, w: 14, grip: 900, skid: 9999, mass: 2.0 },
+  boat: { hp: 140, max: 230, color: 0xe8e4da, len: 52, w: 20, grip: 300, skid: 90, mass: 1.4 }
 };
 const CAR_COLORS = [0x3a5f9e, 0x8a2f2f, 0x3f7d4a, 0x7a4f8a, 0xb8b8be, 0x2f2f36, 0xa05c28, 0x4f7d8a];
 
@@ -2426,7 +2612,8 @@ function mkCar(x, y, dir, kind, driver) {
     turret: dirAng(dir), fireT: 0, onFireT: 0, fireBy: null, mesh: null, stolen: false,
     latV: 0, skidding: false, skidT: 0, mods: { eng: 0, grip: 0, arm: 0 }, rental: false,
     // fuel: street cars come part-filled — a jacked ride is a gamble
-    fuelCap: k.fuelCap || 0, fuel: k.fuelCap ? k.fuelCap * (0.4 + Math.random() * 0.55) : 0, noFuel: false
+    fuelCap: k.fuelCap || 0, fuel: k.fuelCap ? k.fuelCap * (0.4 + Math.random() * 0.55) : 0, noFuel: false,
+    frame: { fl: 0, fr: 0, rl: 0, rr: 0 }      // per-corner FRAME bend
   };
 }
 function mkPed(x, y, opts) {
@@ -2539,6 +2726,13 @@ function msg(t, life) { msgs.push({ t, life: life || 4 }); if (msgs.length > 6) 
 const glCanvas = document.getElementById('gl');
 const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+// GPU PIPELINE (Tank order: use the card — zero assets, zero load time):
+// real shadow maps + filmic tone mapping; the glow pass lives below
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.shadowMap.autoUpdate = false;         // refreshed on a cadence in renderGPU
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x101a2a);
 scene.fog = new THREE.Fog(0x101a2a, 40, 200);   // horizon-matched indigo haze
@@ -2546,11 +2740,69 @@ const camera = new THREE.PerspectiveCamera(62, 1, 0.5, 340);
 let VW = 0, VH = 0;
 const hud = document.getElementById('hud');
 const hctx = hud.getContext('2d');
+// ---- GPU GLOW (zero-asset, zero-load): the scene renders to a target,
+// bright pixels are knocked out, blurred at quarter res, and added back —
+// neon, lamps, muzzle flashes and brake lights BLOOM like a night city
+const GLOW = { on: true };
+{
+  const pars9 = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat };
+  GLOW.rtScene = new THREE.WebGLRenderTarget(2, 2, pars9);
+  GLOW.rtA = new THREE.WebGLRenderTarget(2, 2, pars9);
+  GLOW.rtB = new THREE.WebGLRenderTarget(2, 2, pars9);
+  GLOW.cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const quadG9 = new THREE.PlaneGeometry(2, 2);
+  const vsh9 = 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
+  const mkPass9 = (frag, uniforms) => {
+    const m = new THREE.ShaderMaterial({ uniforms, vertexShader: vsh9, fragmentShader: frag, depthTest: false, depthWrite: false });
+    const sc = new THREE.Scene();
+    sc.add(new THREE.Mesh(quadG9, m));
+    return { m, sc };
+  };
+  GLOW.thresh = mkPass9(
+    'uniform sampler2D tex; varying vec2 vUv; void main(){ vec3 c = texture2D(tex, vUv).rgb; float l = dot(c, vec3(0.299, 0.587, 0.114)); gl_FragColor = vec4(c * smoothstep(0.74, 1.0, l), 1.0); }',
+    { tex: { value: null } });
+  GLOW.blur = mkPass9(
+    'uniform sampler2D tex; uniform vec2 dir; varying vec2 vUv; void main(){ vec3 s = texture2D(tex, vUv).rgb * 0.294; s += (texture2D(tex, vUv + dir * 1.407).rgb + texture2D(tex, vUv - dir * 1.407).rgb) * 0.253; s += (texture2D(tex, vUv + dir * 3.294).rgb + texture2D(tex, vUv - dir * 3.294).rgb) * 0.10; gl_FragColor = vec4(s, 1.0); }',
+    { tex: { value: null }, dir: { value: new THREE.Vector2() } });
+  GLOW.comp = mkPass9(
+    'uniform sampler2D tex; uniform sampler2D glow; uniform float k; varying vec2 vUv; void main(){ gl_FragColor = vec4(texture2D(tex, vUv).rgb + texture2D(glow, vUv).rgb * k, 1.0); }',
+    { tex: { value: null }, glow: { value: null }, k: { value: 0.85 } });
+}
+function renderGPU() {
+  // the shadow map redraws the whole city — every OTHER frame is invisible
+  // to the eye and halves the heaviest pass
+  GLOW.frame = (GLOW.frame || 0) + 1;
+  renderer.shadowMap.needsUpdate = (GLOW.frame & 1) === 0;
+  if (!GLOW.on) { renderer.render(scene, camera); return; }
+  renderer.setRenderTarget(GLOW.rtScene);
+  renderer.render(scene, camera);
+  GLOW.thresh.m.uniforms.tex.value = GLOW.rtScene.texture;
+  renderer.setRenderTarget(GLOW.rtA);
+  renderer.render(GLOW.thresh.sc, GLOW.cam);
+  for (let i9 = 0; i9 < 2; i9++) {
+    GLOW.blur.m.uniforms.tex.value = GLOW.rtA.texture;
+    GLOW.blur.m.uniforms.dir.value.set(1 / GLOW.rtA.width, 0);
+    renderer.setRenderTarget(GLOW.rtB);
+    renderer.render(GLOW.blur.sc, GLOW.cam);
+    GLOW.blur.m.uniforms.tex.value = GLOW.rtB.texture;
+    GLOW.blur.m.uniforms.dir.value.set(0, 1 / GLOW.rtA.height);
+    renderer.setRenderTarget(GLOW.rtA);
+    renderer.render(GLOW.blur.sc, GLOW.cam);
+  }
+  GLOW.comp.m.uniforms.tex.value = GLOW.rtScene.texture;
+  GLOW.comp.m.uniforms.glow.value = GLOW.rtA.texture;
+  renderer.setRenderTarget(null);
+  renderer.render(GLOW.comp.sc, GLOW.cam);
+}
 function resize() {
   VW = window.innerWidth; VH = window.innerHeight;
   renderer.setSize(VW, VH);
   camera.aspect = VW / VH; camera.updateProjectionMatrix();
   hud.width = VW; hud.height = VH;
+  const db9 = renderer.getDrawingBufferSize(new THREE.Vector2());
+  GLOW.rtScene.setSize(db9.x, db9.y);
+  GLOW.rtA.setSize(Math.max(2, db9.x >> 2), Math.max(2, db9.y >> 2));
+  GLOW.rtB.setSize(Math.max(2, db9.x >> 2), Math.max(2, db9.y >> 2));
 }
 window.addEventListener('resize', resize);
 resize();
@@ -2559,6 +2811,15 @@ scene.add(new THREE.HemisphereLight(0x46527e, 0x1b1b24, 1.75));   // brighter sk
 const moonLight = new THREE.DirectionalLight(0x9aa6d0, 1.05);
 moonLight.position.set(120, 200, 60);
 scene.add(moonLight);
+// the moon CASTS: a follow-box of real shadow around the player
+moonLight.castShadow = true;
+moonLight.shadow.mapSize.set(2048, 2048);
+moonLight.shadow.camera.near = 20;
+moonLight.shadow.camera.far = 520;
+moonLight.shadow.camera.left = -160; moonLight.shadow.camera.right = 160;
+moonLight.shadow.camera.top = 160; moonLight.shadow.camera.bottom = -160;
+moonLight.shadow.bias = -0.0006;
+scene.add(moonLight.target);
 { // moon + stars
   const moon = new THREE.Mesh(new THREE.SphereGeometry(9, 12, 12), new THREE.MeshBasicMaterial({ color: 0xd8dcf0, fog: false }));
   moon.position.set(600, 260, 150);
@@ -2943,14 +3204,43 @@ let oceanWater = null;
 // geometry is displaced by it, and the boats float on the exact same numbers.
 const WATER_BASE_Y = -0.14;
 let waterT = 0, waterPosArr = null, waterPosAttr = null, waterVX = null, waterVZ = null;
+// ---- THE WIND (Tank order): ONE global air state the whole world
+// receives — trees, grass, flags, water, drifting smoke all read it. The
+// direction wanders, the force breathes in gusts; the world MOLDS it:
+// a building upwind shelters everything in its lee.
+const WIND = { dir: Math.random() * Math.PI * 2, force: 0.45, gust: 0.2, x: 0, y: 0, ux: 1, uy: 0, _tDir: 0, _dirV: 0, _tGust: 0, _gustT: 0.2 };
+function updWind(dt) {
+  WIND._tDir -= dt;
+  if (WIND._tDir <= 0) { WIND._tDir = 4 + Math.random() * 7; WIND._dirV = (Math.random() - 0.5) * 0.3; }
+  WIND.dir += WIND._dirV * dt;
+  WIND._tGust -= dt;
+  if (WIND._tGust <= 0) { WIND._tGust = 2 + Math.random() * 5; WIND._gustT = Math.random() < 0.3 ? 0.45 + Math.random() * 0.5 : 0.05 + Math.random() * 0.3; }
+  WIND.gust += (WIND._gustT - WIND.gust) * Math.min(1, dt * 0.7);
+  WIND.force = clamp(0.2 + WIND.gust + Math.sin(gtime * 0.37) * 0.07, 0, 1);
+  WIND.ux = Math.cos(WIND.dir); WIND.uy = Math.sin(WIND.dir);
+  WIND.x = WIND.ux * WIND.force; WIND.y = WIND.uy * WIND.force;
+}
+// local air at a point: the global wind sheltered by whatever stands
+// upwind (marched 3 tiles INTO the wind — the environment molds the flow)
+function windAt(x, y) {
+  let sh9 = 1;
+  for (let s = 1; s <= 3; s++) {
+    const ix = Math.floor((x - WIND.ux * s * TILE) / TILE);
+    const iy = Math.floor((y - WIND.uy * s * TILE) / TILE);
+    if (inGrid(ix, iy) && tiles[idx(ix, iy)] === T_BLD) { sh9 = 0.2 + 0.15 * (s - 1); break; }
+  }
+  return { x: WIND.x * sh9, y: WIND.y * sh9, f: WIND.force * sh9 };
+}
 function waveH(wx, wz, t) {
   // render units; ~1 unit crest-to-trough. CROSSING swells — the x/z travel
   // directions are balanced (+/-) so there is NO net drift: the sea heaves in
-  // place instead of flowing one way like a river.
+  // place instead of flowing one way like a river. On top of that base heave
+  // the WIND drives a directional swell: the wake receives the air.
   return Math.sin(wx * 0.055 + wz * 0.02 + t * 0.9) * 0.18   // toward -x,-z
        + Math.sin(-wx * 0.05 + wz * 0.03 + t * 0.8) * 0.18   // toward +x,-z
        + Math.sin(wx * 0.03 - wz * 0.07 + t * 1.1) * 0.12    // toward -x,+z
-       + Math.sin(-wx * 0.09 - wz * 0.06 + t * 1.4) * 0.10;  // toward +x,+z
+       + Math.sin(-wx * 0.09 - wz * 0.06 + t * 1.4) * 0.10   // toward +x,+z
+       + Math.sin((wx * WIND.ux + wz * WIND.uy) * 0.045 - t * 1.3) * 0.22 * WIND.force;  // wind swell, downwind
 }
 // water: the VISIBLE water is exactly the T_WATER tiles — greedy-merged
 // rects skinned with the library's mirror-water shader (reflections + waves)
@@ -3018,6 +3308,23 @@ const waterRects = [];
   oceanWater.rotation.x = -Math.PI / 2;
   oceanWater.position.y = -0.14;
   scene.add(oceanWater);
+  // the MIRROR is a full second scene render every frame — refresh it every
+  // OTHER frame near the shore and every 8th inland (a stale reflection at
+  // 300+ units reads identical). Single biggest driving-FPS recovery.
+  const obr9 = oceanWater.onBeforeRender;
+  let mtick9 = 0;
+  oceanWater.onBeforeRender = function () {
+    mtick9++;
+    const ctx9 = camera.position.x / (TILE * RS), ctz9 = camera.position.z / (TILE * RS);
+    let near9 = false;
+    for (const r9 of waterRects) {
+      const dx9 = Math.max(r9.x0 - ctx9, 0, ctx9 - r9.x1);
+      const dz9 = Math.max(r9.y0 - ctz9, 0, ctz9 - r9.y1);
+      if (dx9 * dx9 + dz9 * dz9 < 26 * 26) { near9 = true; break; }
+    }
+    if (mtick9 % (near9 ? 2 : 8) !== 0) return;
+    obr9.apply(this, arguments);
+  };
 }
 // seafloor: one merged mesh, vertex depth = average of the 4 surrounding
 // tiles (land counts as 0) — a smooth ramp off every shore, drop-offs where
@@ -4664,23 +4971,237 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
     console.log('MOTEL DOORS: ' + doorPlacements.length + ' real doors hung on their stoops');
   }
 }
-// trees (instanced)
+// trees (instanced) — REAL trees (Tank order): tapered trunk with a lean,
+// angled limbs, clustered two-tone foliage. Every tree draws its shape from
+// a seeded hash so the stand looks grown, not stamped — and the canopies
+// RIDE THE WIND (staggered matrix pass in updWindWorld).
+const treeAnim = [];
+let treeLeafA = null, treeLeafB = null;
 {
   const n = trees.length;
   if (n) {
-    const trunk = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.22, 0.3, 2.2, 5), new THREE.MeshLambertMaterial({ color: 0x3a2c1c }), n);
-    const canopy = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 7, 6), new THREE.MeshLambertMaterial({ color: 0x1d4526 }), n);
-    const m = new THREE.Matrix4();
+    const h9 = (i, k) => { const v = Math.sin(i * 127.1 + k * 311.7) * 43758.5453; return v - Math.floor(v); };
+    const LIMBS = 4;
+    const trunkIM = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.17, 0.36, 2.9, 6), new THREE.MeshLambertMaterial({ color: 0x4a3620 }), n);
+    const limbIM = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.07, 0.16, 2.3, 5), new THREE.MeshLambertMaterial({ color: 0x453322 }), n * LIMBS);
+    // TWO clusters per limb (mid + tip) so the foliage visibly HANGS OFF
+    // the branches (Tank: clusters must connect to the limbs)
+    treeLeafA = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 7, 6), new THREE.MeshLambertMaterial({ color: 0x1d4526 }), n * LIMBS * 2);
+    treeLeafB = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 7, 6), new THREE.MeshLambertMaterial({ color: 0x2c6034 }), n * 2);
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), qY = new THREE.Quaternion(), qT = new THREE.Quaternion();
+    const e = new THREE.Euler(), v = new THREE.Vector3(), sV = new THREE.Vector3(), d9 = new THREE.Vector3();
+    const Y9 = new THREE.Vector3(0, 1, 0), Z9 = new THREE.Vector3(0, 0, 1);
     for (let i = 0; i < n; i++) {
       const t = trees[i], x = t.x * RS, z = t.y * RS, r = t.r * RS;
       addBlocker(t.x, t.y, 3.5);                 // the trunk is wood, not fog
-      m.makeTranslation(x, 1.1, z);
-      trunk.setMatrixAt(i, m);
-      m.makeScale(r, r * 0.9, r);
-      m.setPosition(x, 2.2 + r * 0.7, z);
-      canopy.setMatrixAt(i, m);
+      const trunkS = 0.9 + h9(i, 3) * 0.4;
+      const lean = (h9(i, 1) - 0.5) * 0.16, leanY = h9(i, 2) * 6.28;
+      e.set(Math.cos(leanY) * lean, 0, Math.sin(leanY) * lean); q.setFromEuler(e);
+      m.compose(v.set(x, 1.45 * trunkS, z), q, sV.set(1, trunkS, 1));
+      trunkIM.setMatrixAt(i, m);
+      const topY = 2.55 * trunkS;
+      const anim = { phase: h9(i, 4) * 6.28, rate: 1.0 + h9(i, 12) * 0.7, items: [] };
+      for (let L = 0; L < LIMBS; L++) {
+        const yaw = leanY + L * 1.65 + h9(i, 5 + L) * 0.9;
+        const tilt = 0.7 + h9(i, 9 + L) * 0.5;
+        qY.setFromAxisAngle(Y9, -yaw); qT.setFromAxisAngle(Z9, tilt);
+        q.copy(qY).multiply(qT);
+        d9.set(0, 1, 0).applyQuaternion(q);
+        m.compose(v.set(x + d9.x * 0.95, topY - 0.4 + d9.y * 0.95, z + d9.z * 0.95), q, sV.set(1, 1, 1));
+        limbIM.setMatrixAt(i * LIMBS + L, m);
+        // MID cluster halfway out + TIP cluster at the end of every limb —
+        // the leaves read as growing FROM the branch
+        const ms2 = r * (0.24 + h9(i, 21 + L) * 0.1);
+        const mx2 = x + d9.x * 1.35, my2 = topY - 0.4 + d9.y * 1.35 + ms2 * 0.2, mz2 = z + d9.z * 1.35;
+        m.compose(v.set(mx2, my2, mz2), qY.identity(), sV.set(ms2, ms2 * 0.85, ms2));
+        treeLeafA.setMatrixAt((i * LIMBS + L) * 2, m);
+        anim.items.push({ im: treeLeafA, idx: (i * LIMBS + L) * 2, bx: mx2, by: my2, bz: mz2, s: ms2 });
+        const ls = r * (0.34 + h9(i, 13 + L) * 0.16);
+        const lx = x + d9.x * 2.25, ly = topY - 0.4 + d9.y * 2.25 + ls * 0.3, lz = z + d9.z * 2.25;
+        m.compose(v.set(lx, ly, lz), qY.identity(), sV.set(ls, ls * 0.85, ls));
+        treeLeafA.setMatrixAt((i * LIMBS + L) * 2 + 1, m);
+        anim.items.push({ im: treeLeafA, idx: (i * LIMBS + L) * 2 + 1, bx: lx, by: ly, bz: lz, s: ls });
+      }
+      // a modest crown + mid cluster fill the core WITHOUT swallowing the
+      // limb tips (the old fat blobs hid every branch)
+      const cs = r * (0.58 + h9(i, 17) * 0.14);
+      m.compose(v.set(x, topY + cs * 0.6, z), qY.identity(), sV.set(cs, cs * 0.9, cs));
+      treeLeafB.setMatrixAt(i * 2, m);
+      anim.items.push({ im: treeLeafB, idx: i * 2, bx: x, by: topY + cs * 0.6, bz: z, s: cs });
+      const ms = r * 0.45;
+      m.compose(v.set(x + (h9(i, 18) - 0.5) * r * 0.8, topY + ms * 0.2, z + (h9(i, 19) - 0.5) * r * 0.8), qY.identity(), sV.set(ms, ms * 0.8, ms));
+      treeLeafB.setMatrixAt(i * 2 + 1, m);
+      anim.items.push({ im: treeLeafB, idx: i * 2 + 1, bx: x + (h9(i, 18) - 0.5) * r * 0.8, by: topY + ms * 0.2, bz: z + (h9(i, 19) - 0.5) * r * 0.8, s: ms });
+      treeAnim.push(anim);
     }
-    scene.add(trunk); scene.add(canopy);
+    scene.add(trunkIM); scene.add(limbIM); scene.add(treeLeafA); scene.add(treeLeafB);
+  }
+}
+// grass blades — they answer whatever touches them: feet, tires, the air
+// (Tank order). Root-pivoted instanced blades; touched blades bend away and
+// spring back, the rest sway on the wind in a staggered pass.
+let bladeIM = null;
+const blades = [], bladeGrid = new Map(), bladeActive = new Set();
+{
+  // PATCHES at FIELD density (Tank: quantity ×20): every tree is PLANTED ON
+  // a thick patch and the lawns carry ~1500 clumps of their own. The far
+  // mass stands with a baked lean; only blades near the camera animate.
+  const cap9 = 148000;
+  const sow9 = (cx9, cy9, rad9, count9) => {
+    for (let b9 = 0; b9 < count9 && blades.length < cap9; b9++) {
+      const a9 = Math.random() * 6.28, rr9 = Math.sqrt(Math.random()) * rad9;
+      const px = cx9 + Math.cos(a9) * rr9, py = cy9 + Math.sin(a9) * rr9;
+      const ix = Math.floor(px / TILE), iy = Math.floor(py / TILE);
+      if (!inGrid(ix, iy) || tiles[idx(ix, iy)] !== T_GRASS) continue;
+      blades.push({ x: px, y: py, phase: Math.random() * 6.28, yaw: Math.random() * 6.28, bx: 0, bz: 0, relaxT: 0, s: 0.7 + Math.random() * 0.6 });
+      const k9 = ix + ',' + iy;
+      if (!bladeGrid.has(k9)) bladeGrid.set(k9, []);
+      bladeGrid.get(k9).push(blades.length - 1);
+    }
+  };
+  for (const t9 of trees) sow9(t9.x, t9.y, TILE * 1.1, 320);   // the tree's patch
+  const cand9 = [];
+  for (let iy = 0; iy < GRID_H; iy++)
+    for (let ix = 0; ix < GRID_W; ix++)
+      if (tiles[idx(ix, iy)] === T_GRASS) cand9.push(ix + iy * GRID_W);
+  const step9 = Math.max(1, Math.floor(cand9.length / 1500));
+  for (let ci = 0; ci < cand9.length && blades.length < cap9; ci += step9) {
+    const ix = cand9[ci] % GRID_W, iy = Math.floor(cand9[ci] / GRID_W);
+    sow9((ix + 0.5) * TILE, (iy + 0.5) * TILE, TILE * 0.75, 74);   // a lawn clump
+  }
+  if (blades.length) {
+    const g9 = new THREE.BoxGeometry(0.07, 0.95, 0.024);
+    g9.translate(0, 0.475, 0);                   // pivot at the ROOT: rotation = bend
+    const bladeMat9 = new THREE.MeshLambertMaterial({ color: 0x3a7a40 });
+    // GPU WIND: the sway lives in the vertex shader — a per-instance phase
+    // hashed from the blade's own position, amplitude scaled by blade height
+    bladeMat9.onBeforeCompile = (sh9) => {
+      sh9.uniforms.uWind = GPUWIND.wind;
+      sh9.uniforms.uTime = GPUWIND.time;
+      sh9.vertexShader = sh9.vertexShader
+        .replace('void main() {', 'uniform vec2 uWind; uniform float uTime;\nvoid main() {')
+        .replace('#include <project_vertex>', [
+          'vec4 mvPosition = vec4( transformed, 1.0 );',
+          '#ifdef USE_INSTANCING',
+          '  mvPosition = instanceMatrix * mvPosition;',
+          '#endif',
+          'float ph9 = fract(sin(dot(instanceMatrix[3].xz, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831;',
+          'float sw9 = (sin(uTime * 2.2 + ph9) * 0.5 + 0.5) * 0.55 + 0.25;',
+          'mvPosition.xz += uWind * sw9 * max(transformed.y, 0.0);',
+          'mvPosition = modelViewMatrix * mvPosition;',
+          'gl_Position = projectionMatrix * mvPosition;'
+        ].join('\n'));
+      window.__gpuWindOK = true;
+      console.log('GPUWIND blade shader compiled');
+    };
+    bladeIM = new THREE.InstancedMesh(g9, bladeMat9, blades.length);
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), v = new THREE.Vector3(), sV = new THREE.Vector3();
+    const c9 = new THREE.Color();
+    for (let i = 0; i < blades.length; i++) {
+      const bl = blades[i];
+      // baked natural lean — the far field never animates, it just GROWS
+      e.set((Math.random() - 0.5) * 0.3, bl.yaw, (Math.random() - 0.5) * 0.3);
+      q.setFromEuler(e);
+      m.compose(v.set(bl.x * RS, 0, bl.y * RS), q, sV.set(1, bl.s, 1));
+      bladeIM.setMatrixAt(i, m);
+      c9.setHSL(0.32 + Math.random() * 0.04, 0.5 + Math.random() * 0.25, 0.3 + Math.random() * 0.18);
+      bladeIM.setColorAt(i, c9);                 // no two blades quite alike
+    }
+    if (bladeIM.instanceColor) bladeIM.instanceColor.needsUpdate = true;
+    scene.add(bladeIM);
+  }
+  console.log('WINDWORLD trees=' + trees.length + ' blades=' + blades.length);
+}
+// per-frame breath of the world: canopies sway, grass answers wind + touch,
+// the capitol flag flies downwind — everything reads the ONE WIND state
+const _wwM = new THREE.Matrix4(), _wwQ = new THREE.Quaternion(), _wwE = new THREE.Euler(), _wwV = new THREE.Vector3(), _wwS = new THREE.Vector3();
+let _wwSliceT = 0;
+// shared GPU wind uniforms — the grass sways in the VERTEX SHADER now:
+// all 142k blades, every frame, zero CPU (Tank: use the card)
+const GPUWIND = { wind: { value: new THREE.Vector2() }, time: { value: 0 } };
+function _bladeMatrix(i) {
+  // TOUCH bend only — the wind sway rides the vertex shader on top
+  const bl = blades[i];
+  _wwE.set(bl.bz, bl.yaw, -bl.bx);
+  _wwQ.setFromEuler(_wwE);
+  _wwM.compose(_wwV.set(bl.x * RS, 0, bl.y * RS), _wwQ, _wwS.set(1, bl.s, 1));
+  bladeIM.setMatrixAt(i, _wwM);
+}
+function updWindWorld(dt, t) {
+  // the moon's shadow box rides the player across the city
+  const fm9 = focus();
+  moonLight.position.set(fm9.x * RS + 120, 200, fm9.y * RS + 60);
+  moonLight.target.position.set(fm9.x * RS, 0, fm9.y * RS);
+  // the GPU wind uniforms: every blade in the city sways in the shader
+  GPUWIND.wind.value.set(WIND.x * 0.85, WIND.y * 0.85);
+  GPUWIND.time.value = gtime;
+  // trees: a rolling quarter of the stand refreshes each frame
+  if (treeAnim.length) {
+    const q4 = Math.ceil(treeAnim.length / 4), f0 = (_wwSliceT++ % 4) * q4;
+    for (let i = f0; i < Math.min(treeAnim.length, f0 + q4); i++) {
+      const a9 = treeAnim[i];
+      const off = (Math.sin(gtime * a9.rate + a9.phase) * 0.25 + 0.4) * WIND.force;
+      const dx = WIND.ux * off, dz = WIND.uy * off;
+      for (const it of a9.items) {
+        _wwM.compose(_wwV.set(it.bx + dx * it.by * 0.16, it.by, it.bz + dz * it.by * 0.16), _wwQ.identity(), _wwS.set(it.s, it.s * 0.87, it.s));
+        it.im.setMatrixAt(it.idx, _wwM);
+      }
+    }
+    treeLeafA.instanceMatrix.needsUpdate = true;
+    treeLeafB.instanceMatrix.needsUpdate = true;
+  }
+  if (bladeIM) {
+    // TOUCH: feet and tires shove nearby blades aside; they spring back
+    const movers9 = [];
+    if (!player.car && !player.dead) movers9.push({ x: player.x, y: player.y, r: 16, k: 1.0 });
+    for (const c of cars) if (!c.dead && Math.abs(c.speed) > 8) movers9.push({ x: c.x, y: c.y, r: c.w + 14, k: 1.3 });
+    for (const mv of movers9) {
+      const ix0 = Math.floor(mv.x / TILE), iy0 = Math.floor(mv.y / TILE);
+      for (let iy = iy0 - 1; iy <= iy0 + 1; iy++)
+        for (let ix = ix0 - 1; ix <= ix0 + 1; ix++) {
+          const bkt = bladeGrid.get(ix + ',' + iy);
+          if (!bkt) continue;
+          for (const bi of bkt) {
+            const bl = blades[bi];
+            const d = dist(bl.x, bl.y, mv.x, mv.y);
+            if (d > mv.r) continue;
+            const away = Math.max(0.2, d) ;
+            const push = (1 - d / mv.r) * 1.25 * mv.k;
+            bl.bx = (bl.x - mv.x) / away * push;
+            bl.bz = (bl.y - mv.y) / away * push;
+            bl.relaxT = 1.4;
+            bladeActive.add(bi);
+          }
+        }
+    }
+    // touch bends resolve on the CPU (only ever a handful of blades);
+    // the whole field's wind sway is the vertex shader's job now
+    for (const bi of bladeActive) {
+      const bl = blades[bi];
+      bl.relaxT -= dt;
+      bl.bx *= Math.pow(0.06, dt); bl.bz *= Math.pow(0.06, dt);
+      _bladeMatrix(bi);
+      if (bl.relaxT <= 0) { bl.bx = 0; bl.bz = 0; bladeActive.delete(bi); }
+    }
+    if (bladeActive.size) bladeIM.instanceMatrix.needsUpdate = true;
+  }
+  // the capitol flag is CLOTH: the sheet yaws downwind while its vertices
+  // ride a traveling wave — bigger toward the free edge, faster in a gust —
+  // and the fabric droops off the pole when the air goes still
+  if (capitolFlagM) {
+    const f9 = WIND.force;
+    capitolFlagM.rotation.y = -Math.atan2(WIND.uy, WIND.ux);
+    const pa9 = capitolFlagM.geometry.attributes.position;
+    const oy9 = capitolFlagM.geometry.userData.oy;
+    for (let vi = 0; vi < pa9.count; vi++) {
+      const u9 = pa9.getX(vi) / 2.6;             // 0 at the pole, 1 at the free edge
+      const wave9 = Math.sin(u9 * 5.5 - gtime * (4.5 + 6 * f9)) * 0.26 * u9 * Math.max(f9, 0.05)
+        + Math.sin(u9 * 9.5 - gtime * (7 + 5 * f9) + oy9[vi] * 2.2) * 0.07 * u9 * f9;
+      pa9.setZ(vi, wave9);
+      pa9.setY(vi, oy9[vi] - u9 * u9 * (1 - f9) * 0.85);   // calm = the cloth hangs
+    }
+    pa9.needsUpdate = true;
+    capitolFlagM.geometry.computeVertexNormals();
   }
 }
 // street lamps (instanced) + glow heads — DESTRUCTIBLE: a car at speed
@@ -4768,8 +5289,13 @@ function laneDirAt(x, y) {
         tlLampsNS[L9].setMatrixAt(i, m);
         tlLampsNS[L9].setColorAt(i, dim0[L9]);
       }
-      addBlocker(s.x, s.y, 3);                   // the pole is steel (solids by default)
+      // no static blocker: the pole blocks FEET via lampBlockAt and cars
+      // negotiate it in checkTLHits (bend/snap) — same law as street lamps
+      const tk9 = Math.floor(s.x / TILE) + ',' + Math.floor(s.y / TILE);
+      if (!tlGrid.has(tk9)) tlGrid.set(tk9, []);
+      tlGrid.get(tk9).push(i);
     }
+    tlMeshes = { poles: tlPoles, boxEW: tlBoxEW, boxNS: tlBoxNS };
     scene.add(tlPoles); scene.add(tlBoxEW); scene.add(tlBoxNS);
     for (const im of tlLampsEW) scene.add(im);
     for (const im of tlLampsNS) scene.add(im);
@@ -4825,6 +5351,7 @@ let laneArrowCount = 0;
 // lamp order [red, yellow, green]: lit color vs housed-dark color
 const TL_LIT = [new THREE.Color(0xff3838), new THREE.Color(0xffd23f), new THREE.Color(0x30d858)];
 const TL_DIM = [new THREE.Color(0x3a1010), new THREE.Color(0x3a2f0e), new THREE.Color(0x0e3018)];
+const TL_DEAD = new THREE.Color(0x101014);       // a snapped pole shows no colors at all
 const TL_ORDER = 'ryg';
 let tlStamp = '', TL_CFGS = null;
 function updTrafficLights() {
@@ -4841,6 +5368,7 @@ function updTrafficLights() {
   if (stamp === tlStamp) return;
   tlStamp = stamp;
   for (let i = 0; i < trafficLights.length; i++) {
+    if (trafficLights[i].broken) continue;       // a downed head stays dark
     const sig = signalized.get(trafficLights[i].key);
     const se = tlState(sig, true), sn = tlState(sig, false);
     for (let L9 = 0; L9 < 3; L9++) {
@@ -4948,7 +5476,127 @@ function lampBlockAt(x, y, fx, fy) {
     if (fdx * fdx + fdy * fdy < nd) continue;  // moving outward: let them out
     return true;
   }
+  // TRAFFIC LIGHT poles stop feet under the exact same rule (Tank order)
+  const tarr = tlGrid.get(Math.floor(x / TILE) + ',' + Math.floor(y / TILE));
+  if (tarr) for (const i of tarr) {
+    const s = trafficLights[i];
+    if (s.broken) continue;
+    const dx = x - s.x, dy = y - s.y;
+    const nd = dx * dx + dy * dy;
+    if (nd >= 16) continue;
+    const fdx = fx - s.x, fdy = fy - s.y;
+    if (fdx * fdx + fdy * fdy < nd) continue;
+    return true;
+  }
   return false;
+}
+// TRAFFIC LIGHT POLES live under the SAME law as street lamps (Tank order):
+// slow hits bend, fast hits snap the pole flat and kill the lights, the
+// city replaces it in 60 seconds — and an upright pole stops feet.
+function setTLPose(i, ang) {
+  const s = trafficLights[i], x = s.x * RS, z = s.y * RS;
+  _lampAxis.set(-Math.sin(s.fallDir || 0), 0, Math.cos(s.fallDir || 0));
+  _lampR.makeRotationAxis(_lampAxis, ang);
+  const put9 = (im9, ox9, oy9, oz9) => {
+    _lampT.makeTranslation(ox9, oy9, oz9);
+    _lampM.makeTranslation(x, 0, z);
+    _lampM.multiply(_lampR).multiply(_lampT);
+    im9.setMatrixAt(i, _lampM);
+    im9.instanceMatrix.needsUpdate = true;
+  };
+  put9(tlMeshes.poles, 0, 2.2, 0);
+  put9(tlMeshes.boxEW, 0, 4.95, 0);
+  put9(tlMeshes.boxNS, 0, 3.6, 0);
+  for (let L9 = 0; L9 < 3; L9++) {
+    const dy9 = (1 - L9) * 0.4;
+    put9(tlLampsEW[L9], s.fx * 0.21, 4.95 + dy9, 0);
+    put9(tlLampsNS[L9], 0, 3.6 + dy9, s.fy * 0.21);
+  }
+}
+function breakTL(i, dirAngRender, byCar) {
+  const s = trafficLights[i];
+  const sp = byCar ? Math.abs(byCar.speed) : 200;
+  const full = sp >= 110;
+  const target = full ? 1.45 : 0.2 + clamp((sp - 40) / 70, 0, 1) * 0.5;
+  if (s.broken) {
+    if (target <= s.maxAng + 0.05) return;
+    s.maxAng = target;
+    s.respawnT = 60;
+  } else {
+    s.broken = true;
+    s.fallT = 0;
+    s.maxAng = target;
+    s.fallDir = dirAngRender;
+    s.respawnT = 60;
+    brokenTLs.push(i);
+  }
+  sfx('crash', s.x, s.y);
+  sparks(s.x, s.y);
+  if (byCar) {
+    carDamage(byCar, Math.min(30, sp * 0.06), null);
+    dentCar(byCar, s.x, s.y, sp + 70);
+    byCar.speed *= full ? 0.86 : 0.93;
+    if (byCar === player.car) rumble(full ? 0.5 : 0.3, 0.35, 200);
+  }
+  if (full) {
+    // the signal head goes DARK — and stays dark until the truck comes
+    for (let L9 = 0; L9 < 3; L9++) {
+      tlLampsEW[L9].setColorAt(i, TL_DEAD);
+      tlLampsNS[L9].setColorAt(i, TL_DEAD);
+      tlLampsEW[L9].instanceColor.needsUpdate = true;
+      tlLampsNS[L9].instanceColor.needsUpdate = true;
+    }
+  }
+}
+function updTLBroken(dt) {
+  for (let bi = brokenTLs.length - 1; bi >= 0; bi--) {
+    const i = brokenTLs[bi];
+    const s = trafficLights[i];
+    if (s.fallT < 1) {
+      s.fallT = Math.min(1, s.fallT + dt * 1.7);
+      setTLPose(i, s.fallT * s.maxAng);
+    } else if (s.poseDirty) {
+      s.poseDirty = false;
+      setTLPose(i, s.maxAng);
+    }
+    s.respawnT -= dt;
+    if (s.respawnT <= 0) {
+      s.broken = false;
+      setTLPose(i, 0);
+      tlStamp = '';                              // force a repaint: lights come back on
+      brokenTLs.splice(bi, 1);
+    }
+  }
+}
+function checkTLHits(c) {
+  if ((c.alt || 0) > 4 || !tlMeshes) return;
+  const sp = Math.abs(c.speed);
+  if (sp < 2) return;
+  const cx2 = Math.floor(c.x / TILE), cy2 = Math.floor(c.y / TILE);
+  const reach = c.len / 2 + 5;
+  for (let oy = -1; oy <= 1; oy++)
+    for (let ox = -1; ox <= 1; ox++) {
+      const arr = tlGrid.get((cx2 + ox) + ',' + (cy2 + oy));
+      if (!arr) continue;
+      for (const i of arr) {
+        const s = trafficLights[i];
+        const d2 = dist(c.x, c.y, s.x, s.y);
+        if (d2 >= reach) continue;
+        if (s.broken) {
+          if (s.maxAng < 1.4 && sp >= 110) { s.poseDirty = true; breakTL(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c); }
+          continue;
+        }
+        if (sp >= 110) { breakTL(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c); continue; }
+        if (sp >= 40) breakTL(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c);
+        else if (sp > 18) { sfx('crash', s.x, s.y); dentCar(c, s.x, s.y, sp + 90); if (c === player.car) rumble(0.3, 0.18, 120); }
+        // the pole HOLDS below snap speed: push the car out
+        const px2 = c.x - s.x, py2 = c.y - s.y;
+        const pd = Math.max(1, Math.hypot(px2, py2));
+        c.x = s.x + px2 / pd * reach;
+        c.y = s.y + py2 / pd * reach;
+        c.speed *= 0.4;
+      }
+    }
 }
 function checkLampHits(c) {
   if ((c.alt || 0) > 4) return;                      // the flying bird clips no lampposts
@@ -5390,9 +6038,16 @@ function checkLampHits(c) {
     pole2.position.set(cx3 - 9, 6, face + 4);
     scene.add(pole2);
     addBlocker((cx3 - 9) / RS, (face + 4) / RS, 2.5);   // the flag pole
-    const flag = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.5, 0.08), new THREE.MeshLambertMaterial({ color: 0x8a1a24 }));
-    flag.position.set(cx3 - 9 + 1.4, 10.8, face + 4);
+    // CLOTH banner (Tank order): a segmented plane whose vertices carry a
+    // traveling wave — amplitude grows toward the free edge, the whole
+    // sheet yaws downwind, and it sags off the pole in a calm (updWindWorld)
+    const flagG = new THREE.PlaneGeometry(2.6, 1.5, 10, 4);
+    flagG.translate(1.3, 0, 0);                 // pivot at the pole edge
+    const flag = new THREE.Mesh(flagG, new THREE.MeshLambertMaterial({ color: 0x8a1a24, side: THREE.DoubleSide }));
+    flag.position.set(cx3 - 9, 10.8, face + 4);
+    flag.geometry.userData.oy = Float32Array.from(flagG.attributes.position.array.filter((v9, k9) => k9 % 3 === 1));
     scene.add(flag);
+    capitolFlagM = flag;
   }
   // hot dog stands: the real cart — body, wheels, grill, striped umbrella,
   // condiments, and the price sign. The vendor works behind it.
@@ -5676,6 +6331,50 @@ function placeBeam(px, py, colorHex, radius, height) {
   return b;
 }
 for (const ph of phones) placeBeam(ph.x, ph.y, 0x3fdc5f, 1.6, 7);
+// ACTUAL PAYPHONES (Tank order): every phone spot is a real kiosk — steel
+// post, half-booth hood, phone unit, a handset on the hook — faced toward
+// the street. The green beam stays: that is the job marker.
+{
+  const nP9 = phones.length;
+  if (nP9) {
+    const steel9 = new THREE.MeshLambertMaterial({ color: 0x2a2e36 });
+    const shell9 = new THREE.MeshLambertMaterial({ color: 0x1b5045 });
+    const unitM9 = new THREE.MeshLambertMaterial({ color: 0x14161c });
+    const mkIM9 = (w9, h9, d9, mat9) => { const im9 = new THREE.InstancedMesh(new THREE.BoxGeometry(w9, h9, d9), mat9, nP9); scene.add(im9); return im9; };
+    const postIM = mkIM9(0.16, 2.7, 0.16, steel9);
+    const backIM = mkIM9(0.07, 1.25, 0.9, shell9);
+    const sideLIM = mkIM9(0.5, 1.25, 0.06, shell9);
+    const sideRIM = mkIM9(0.5, 1.25, 0.06, shell9);
+    const topIM = mkIM9(0.62, 0.09, 0.95, shell9);
+    const unitIM = mkIM9(0.14, 0.55, 0.4, unitM9);
+    const setIM = mkIM9(0.1, 0.4, 0.12, steel9);
+    const M9 = new THREE.Matrix4(), Q9 = new THREE.Quaternion(), P9 = new THREE.Vector3(), S19 = new THREE.Vector3(1, 1, 1);
+    const UPy9 = new THREE.Vector3(0, 1, 0);
+    phones.forEach((ph, i) => {
+      const tx9 = Math.floor(ph.x / TILE), ty9 = Math.floor(ph.y / TILE);
+      let yaw9 = Math.PI / 2;
+      for (const [dx9, dy9, a9] of [[1, 0, 0], [0, 1, Math.PI / 2], [-1, 0, Math.PI], [0, -1, -Math.PI / 2]])
+        if (tileAt(tx9 + dx9, ty9 + dy9) === T_ROAD) { yaw9 = a9; break; }
+      Q9.setFromAxisAngle(UPy9, -yaw9);
+      const x9 = ph.x * RS, z9 = ph.y * RS;
+      const loc9 = (lx9, ly9, lz9, im9) => {
+        const wx9 = x9 + Math.cos(yaw9) * lx9 - Math.sin(yaw9) * lz9;
+        const wz9 = z9 + Math.sin(yaw9) * lx9 + Math.cos(yaw9) * lz9;
+        M9.compose(P9.set(wx9, ly9, wz9), Q9, S19);
+        im9.setMatrixAt(i, M9);
+      };
+      loc9(-0.28, 1.35, 0, postIM);              // post carries the booth
+      loc9(-0.28, 2.1, 0, backIM);               // open side faces the street
+      loc9(0, 2.1, -0.45, sideLIM);
+      loc9(0, 2.1, 0.45, sideRIM);
+      loc9(-0.02, 2.78, 0, topIM);
+      loc9(-0.19, 2.0, 0, unitIM);
+      loc9(-0.16, 1.72, 0.17, setIM);            // the handset on its hook
+      addBlocker(ph.x, ph.y, 4);                 // solids by default
+    });
+    console.log('PAYPHONES ' + nP9 + ' kiosks planted');
+  }
+}
 for (const gs of gunShops) placeBeam(gs.x, gs.y, 0xff9030, 1.6, 7);
 for (const pd of pads) placeBeam(pd.x, pd.y, 0x40e0d0, 2.4, 6);
 for (const mp of modPads) placeBeam(mp.x, mp.y, 0xc890ff, 2.4, 6);
@@ -6239,6 +6938,11 @@ function buildCarMesh(c) {
     pw.position.set(bayMidX - 0.42, 1.32, wz);
     g.add(pw);
   }
+  // the engine CRADLE roster: everything that rides the front frame rails.
+  // When the FRAME bends (applyFrame), these shift together with it —
+  // frame moves the cradle, the cradle moves the engine (Tank order)
+  g.userData.cradle = [engine, oilPan, headCv, intake, loom].map(cm9 => (
+    { m: cm9, bx: cm9.position.x, by: cm9.position.y, bz: cm9.position.z, brx: cm9.rotation.x }));
   // exhaust manifolds on both banks, downpipes into the underbody run
   g.userData.exhaust = [];
   for (const ms of [-1, 1]) {
@@ -6435,17 +7139,23 @@ function buildCarMesh(c) {
     g.userData.trim.push(hlT, tlT);
     g.userData[dz > 0 ? 'lampR' : 'lampL'] = hlT;
   }
-  // grille + chrome bumpers, front and rear — they crumple with the metal
+  // grille + chrome bumpers, front and rear — segmented so they CREASE in
+  // the crumple field like everything else, and tracked as real bars that
+  // skew off their mounts and tear away at wreck violence (Tank order)
   const chrome = new THREE.MeshLambertMaterial({ color: 0x9aa0a8 });
-  const grille = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.3, W * 0.4), new THREE.MeshLambertMaterial({ color: 0x1c2026 }));
+  const grille = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.3, W * 0.4, 1, 2, 5), new THREE.MeshLambertMaterial({ color: 0x1c2026 }));
   grille.position.set(L / 2 + 0.03, 1.02, 0);
   g.add(grille);
-  g.userData.trim.push({ m: grille, bx: L / 2 + 0.03, by: 1.02, bz: 0, ox: 0, oy: 0, oz: 0 });
+  g.userData.trim.push({ m: grille, bx: L / 2 + 0.03, by: 1.02, bz: 0, ox: 0, oy: 0, oz: 0, capX: 0.45, capZ: 0.4 });
+  g.userData.crush.push(grille);
+  g.userData.bumpers = [];
   for (const bs of [1, -1]) {
-    const bmp = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.26, W * 0.95), chrome);
+    const bmp = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.26, W * 0.95, 2, 1, 9), chrome);
     bmp.position.set(bs * (L / 2 + 0.12), 0.55, 0);
     g.add(bmp);
-    g.userData.trim.push({ m: bmp, bx: bs * (L / 2 + 0.12), by: 0.55, bz: 0, ox: 0, oy: 0, oz: 0 });
+    g.userData.trim.push({ m: bmp, bx: bs * (L / 2 + 0.12), by: 0.55, bz: 0, ox: 0, oy: 0, oz: 0, capX: 0.5, capZ: 0.45 });
+    g.userData.crush.push(bmp);
+    g.userData.bumpers.push({ m: bmp, end: bs, sag: 0, gone: false });
   }
   // HINGED PANELS — doors, hood, trunk lid / tailgate — all on the same
   // hardware: a latch, two hinges. Latch breaks: it swings free. Both
@@ -6453,7 +7163,8 @@ function buildCarMesh(c) {
   g.userData.panels = [];
   const mkPanel = (kind, side, grp, max) => {
     const p = { kind, side, grp, max, ang: 0, vel: 0, anim: 0, latch: true, hingeA: true, hingeB: true, gone: false,
-      latchHp: 60, hingeAHp: 50, hingeBHp: 50 };   // real hardware takes real damage
+      latchHp: 60, hingeAHp: 50, hingeBHp: 50,     // real hardware takes real damage
+      dent: 0, winGone: false, bz0: grp.position.z };   // visible cave-in + burst glass
     g.userData.panels.push(p);
     return p;
   };
@@ -6621,12 +7332,127 @@ function dentCar(c, wx, wy, v) {
     dentGeo(m9, lx - m9.position.x, lz - m9.position.z, nx, nz, mag, L * 0.20, W * 0.26, seed);
   }
   dentTrim(c, lx, lz, nx, nz, mag, L * 0.20, W * 0.26);
+  bendFrame(c, lx, lz, v);                                 // heavy hits reach the FRAME
+  // BUMPER MOUNTS: an end-on blow skews the bar off its brackets toward
+  // the struck side; enough violence and it TEARS OFF into the street
+  const bl9 = c.mesh.userData.bumpers;
+  if (bl9 && nx !== 0 && mag > 0.4) {
+    const b9 = bl9.find(bb9 => bb9.end === (nx < 0 ? 1 : -1) && !bb9.gone);
+    if (b9) {
+      b9.sag = Math.min(1, b9.sag + (mag - 0.4) * 0.9);
+      b9.m.rotation.y = Math.sign(lz || 1) * b9.sag * 0.18 * b9.end;
+      b9.m.rotation.z = -b9.sag * 0.10 * b9.end;
+      if (b9.sag >= 1 || mag > 1.15) {
+        b9.gone = true;
+        const wp9 = new THREE.Vector3();
+        b9.m.getWorldPosition(wp9);
+        c.mesh.remove(b9.m);
+        scene.add(b9.m);
+        const spd9b = Math.abs(c.speed);
+        if (spd9b > 60) {
+          b9.m.position.set(wp9.x, Math.max(wp9.y, 0.5), wp9.z);
+          b9.m.rotation.set(Math.random() * 6.28, -c.angle, Math.random() * 6.28);
+          droppedParts.push({
+            mesh: b9.m, t: 30,
+            vx: Math.cos(c.angle) * c.speed * RS * 0.7, vz: Math.sin(c.angle) * c.speed * RS * 0.7,
+            vy: 2 + Math.random() * 2, spin: (Math.random() - 0.5) * 8, tumble: (Math.random() - 0.5) * 8
+          });
+        } else {
+          b9.m.position.set(wp9.x, 0.14, wp9.z);
+          b9.m.rotation.set(0, -c.angle + (Math.random() - 0.5) * 0.8, 0.1);
+          droppedParts.push({ mesh: b9.m, t: 30 });
+        }
+        sfx('crash', c.x, c.y, 110);
+      }
+    }
+  }
   const ud9 = c.mesh.userData;
-  if (nz !== 0 && lx > -L * 0.35 && lx < L * 0.35) damageDoor(c, lz > 0 ? 1 : -1, mag);
-  if (nx < 0 && lx > L * 0.15) damagePanel(c, ud9.hoodP, mag);            // nose hit works the hood
-  if (nx > 0 && lx < -L * 0.15) damagePanel(c, ud9.trunkP || ud9.gateP, mag);   // tail hit works the lid/gate
+  if (nz !== 0 && lx > -L * 0.35 && lx < L * 0.35) {
+    damageDoor(c, lz > 0 ? 1 : -1, mag);
+    dentDoorVisual(c, lz > 0 ? 1 : -1, mag, lx, lz);   // the door CAVES, the glass goes
+  }
+  // the HOOD and LID are sheet metal too: nose/tail hits CRUMPLE the plate
+  // itself, not just the latch (Tank rammed a wall — the latch popped but
+  // the hood sat there showroom-flat)
+  if (nx < 0 && lx > L * 0.15) {
+    damagePanel(c, ud9.hoodP, mag);                                       // nose hit works the hood hardware
+    if (ud9.hoodP && !ud9.hoodP.gone) {
+      const hm9 = ud9.hoodP.grp.children[0];
+      dentGeo(hm9, lx - ud9.hoodP.grp.position.x - hm9.position.x, lz, nx, nz, mag * 0.9, L * 0.16, W * 0.3, seed);
+    }
+  }
+  if (nx > 0 && lx < -L * 0.15) {
+    const lid9 = ud9.trunkP || ud9.gateP;
+    damagePanel(c, lid9, mag);                                            // tail hit works the lid/gate hardware
+    if (lid9 && !lid9.gone) {
+      const lm9 = lid9.grp.children[0];
+      dentGeo(lm9, lx - lid9.grp.position.x - lm9.position.x, lz, nx, nz, mag * 0.9, L * 0.16, W * 0.3, seed);
+    }
+  }
+  // a T-BONE reaches the GLASSHOUSE: side hits dent the cab hard and wide
+  // (a frontal only shivers it) — Tank caved a frame and the cab sat pristine
   const cab = c.mesh.userData.cabMesh;
-  if (cab && mag > 0.3) dentGeo(cab, lx - cab.position.x, lz - cab.position.z, nx, nz, mag * 0.5, L * 0.10, W * 0.16, seed);
+  if (cab && mag > 0.25) {
+    const side9 = nz !== 0;
+    dentGeo(cab, lx - cab.position.x, lz - cab.position.z, nx, nz,
+      mag * (side9 ? 0.85 : 0.5), L * (side9 ? 0.18 : 0.10), W * (side9 ? 0.24 : 0.16), seed);
+  }
+}
+// a struck DOOR shows it: the panel caves inward and creases, and past a
+// real blow the door glass BURSTS out of it (Tank order: T-bones must
+// read on the doors and windows, not just the hull)
+function dentDoorVisual(c, side, mag, lx, lz) {
+  const ds = c.mesh && c.mesh.userData.doors;
+  if (!ds) return;
+  const d = ds[side < 0 ? 0 : 1];
+  if (!d || d.gone || mag <= 0.22) return;
+  d.dent = Math.min(0.9, (d.dent || 0) + (mag - 0.22) * 1.1);
+  if (mag > 0.5 && !d.winGone && d.grp.children[1]) {
+    d.winGone = true;
+    d.grp.children[1].visible = false;
+    for (let i = 0; i < 8; i++) {
+      addPart(c.x + Math.cos(c.angle) * lx + Math.cos(c.angle + Math.PI / 2) * lz,
+        c.y + Math.sin(c.angle) * lx + Math.sin(c.angle + Math.PI / 2) * lz,
+        1.6 + Math.random(), (Math.random() - 0.5) * 90, (Math.random() - 0.5) * 90, 1 + Math.random() * 2,
+        0.5 + Math.random() * 0.4, 0xbfe6ff, 0.7, true);
+    }
+  }
+}
+// ---- THE FRAME (Tank order): every impact carries mass, speed and ANGLE.
+// A heavy enough blow bends the frame at the struck corner, and the
+// CONNECTION WAVE spreads it: corner → neighbors (cos² falloff) → the
+// engine cradle rides the front rails, so a bent frame SHIFTS THE ENGINE —
+// and each bent corner toes and cambers its own wheel.
+function bendFrame(c, lx, lz, v) {
+  if (v < 190) return;                        // fender-bender speeds never reach steel
+  if (!c.frame) c.frame = { fl: 0, fr: 0, rl: 0, rr: 0 };
+  const th9 = Math.atan2(lz, lx);
+  const add9 = Math.min(0.4, (v - 190) / 620);
+  const CO9 = [['fl', Math.atan2(-c.w / 2, c.len / 2)], ['fr', Math.atan2(c.w / 2, c.len / 2)],
+    ['rl', Math.atan2(-c.w / 2, -c.len / 2)], ['rr', Math.atan2(c.w / 2, -c.len / 2)]];
+  for (const [k9, ca9] of CO9) {
+    const w9 = Math.max(0, Math.cos(angDiff(th9, ca9)));
+    if (w9 > 0) c.frame[k9] = Math.min(1, c.frame[k9] + add9 * w9 * w9);
+  }
+  applyFrame(c);
+}
+function applyFrame(c) {
+  const f9 = c.frame, ud = c.mesh && c.mesh.userData;
+  if (!f9 || !ud) return;
+  // the cradle rides the front frame: bend shoves the whole engine back,
+  // toward the softer rail, and tips it off its mounts
+  const front9 = (f9.fl + f9.fr) / 2, side9 = f9.fr - f9.fl;
+  if (ud.cradle) for (const cp of ud.cradle) {
+    cp.m.position.set(cp.bx - front9 * 0.6, cp.by - front9 * 0.12, cp.bz - side9 * 0.35);
+    cp.m.rotation.y = -side9 * 0.28;
+    cp.m.rotation.x = cp.brx + front9 * 0.1;
+  }
+  // wheel ALIGNMENT: a bent corner toes and cambers its tire
+  // (wheelsF order: [0] = +z right = fr side, [1] = -z left = fl side)
+  if (ud.wheelsF && ud.wheelsF.length === 2) {
+    ud.wheelsF[0].userData.toe = f9.fr * 0.4; ud.wheelsF[0].userData.camber = f9.fr * 0.3;
+    ud.wheelsF[1].userData.toe = -f9.fl * 0.4; ud.wheelsF[1].userData.camber = -f9.fl * 0.3;
+  }
 }
 // the spent push bar tears off and clatters into the street
 const droppedParts = [];
@@ -6641,6 +7467,32 @@ function dropRamBar(c) {
   scene.add(bar);
   droppedParts.push({ mesh: bar, t: 30 });
   sfx('crash', c.x, c.y, 130);
+}
+// EXHAUST (Tank order): light fumes off the tail pipe — MORE GAS = MORE
+// EXHAUST. The player's plume follows the throttle; running AI engines
+// puff by speed; a dead or dry engine makes nothing at all.
+function updExhaust(dt) {
+  for (const c of cars) {
+    if (c.dead || !c.fuelCap || c.noFuel || c.fuel <= 0 || c.drowned) continue;
+    const isP9 = c === player.car;
+    if (!isP9) {
+      if (!c.driver) continue;                   // parked iron doesn't idle
+      if (dist(c.x, c.y, player.x, player.y) > 520) continue;
+    }
+    const thr9 = isP9 ? (c._thr || 0) : clamp(Math.abs(c.speed) / CAR_KINDS[c.kind].max, 0, 1);
+    const rate9 = 1.6 + thr9 * 9 + Math.abs(c.speed) * 0.004;
+    c._exT = (c._exT || 0) - dt;
+    if (c._exT > 0) continue;
+    c._exT = 1 / rate9;
+    const ca9 = Math.cos(c.angle), sa9 = Math.sin(c.angle);
+    const px9 = c.x - ca9 * (c.len / 2 + 3) - sa9 * c.w * 0.22;
+    const py9 = c.y - sa9 * (c.len / 2 + 3) + ca9 * c.w * 0.22;
+    addPart(px9, py9, 0.5,
+      -ca9 * 14 + (Math.random() - 0.5) * 8, -sa9 * 14 + (Math.random() - 0.5) * 8,
+      1.1 + Math.random() * 0.8,
+      0.6 + thr9 * 0.45, 0x8a929c,
+      (c.kind === 'truck' ? 0.8 : 0.5) + thr9 * 0.4, false);
+  }
 }
 function updDropped(dt) {
   for (let i = droppedParts.length - 1; i >= 0; i--) {
@@ -6675,9 +7527,13 @@ function dentTrim(c, lx, lz, nx, nz, mag, capX, capZ) {
     const d = Math.hypot(t.bx - lx, t.bz - lz);
     if (d >= R) continue;
     const push = mag * (1 - d / R) * (1 - d / R);
-    t.ox = clamp(t.ox + nx * push, -capX, capX);
+    // a per-entry cap: bumpers crush an inch or two into the FRAME and stop
+    // — the shared body cap let a bar dive clean through the engine bay
+    const cx9 = t.capX !== undefined ? t.capX : capX;
+    const cz9 = t.capZ !== undefined ? t.capZ : capZ;
+    t.ox = clamp(t.ox + nx * push, -cx9, cx9);
     t.oy = clamp(t.oy - 0.12 * push, -0.45, 0.05);
-    t.oz = clamp(t.oz + nz * push, -capZ, capZ);
+    t.oz = clamp(t.oz + nz * push, -cz9, cz9);
     t.m.position.set(t.bx + t.ox, t.by + t.oy, t.bz + t.oz);
   }
 }
@@ -6724,7 +7580,15 @@ function updDoors(c, dt) {
       }
       if (d.gone) continue;
     } else d.ang += (0 - d.ang) * Math.min(1, dt * 12);
-    if (d.kind === 'door') d.grp.rotation.y = d.ang * d.side;
+    if (d.kind === 'door') {
+      d.grp.rotation.y = d.ang * d.side;
+      if (d.dent) {
+        // a caved door sits INSIDE its opening, creased off its hinge line
+        d.grp.position.z = d.bz0 - d.side * d.dent * 0.5;
+        d.grp.rotation.y += d.dent * 0.14 * d.side;
+        if (d.grp.children[0]) d.grp.children[0].rotation.x = d.dent * 0.22;
+      }
+    }
     else if (d.kind === 'hood') d.grp.rotation.z = d.ang;
     else if (d.kind === 'trunk') d.grp.rotation.z = -d.ang;
     else d.grp.rotation.z = d.ang;
@@ -6803,14 +7667,29 @@ function undentCar(c) {
     if (c.ramGone) { removeCarMesh(c); attachCarMesh(c); c.ramGone = false; }   // fresh bar bolted on
     else if (c.mesh.userData.ramBar) { c.mesh.userData.ramBar.position.x = 0; c.mesh.userData.ramBar.rotation.z = 0; }
   }
+  // the frame goes back on the jig: corners straight, cradle re-seated,
+  // wheels re-aligned
+  c.frame = { fl: 0, fr: 0, rl: 0, rr: 0 };
+  applyFrame(c);
   const ps9 = c.mesh.userData.panels;
+  const bmp9 = c.mesh.userData.bumpers;
+  if (bmp9) for (const b9 of bmp9) if (!b9.gone) { b9.sag = 0; b9.m.rotation.set(0, 0, 0); }
   if (ps9) {
-    if (ps9.some(d => d.gone)) { removeCarMesh(c); attachCarMesh(c); }   // fresh panels hung on the frame
-    else for (const d of ps9) { d.latch = true; d.hingeA = true; d.hingeB = true; d.latchHp = 60; d.hingeAHp = 50; d.hingeBHp = 50; d.ang = 0; d.vel = 0; d.anim = 0; d.grp.rotation.set(0, 0, 0); }
+    if (ps9.some(d => d.gone) || (bmp9 && bmp9.some(b9 => b9.gone))) { removeCarMesh(c); attachCarMesh(c); }   // fresh panels + bars hung on the frame
+    else for (const d of ps9) {
+      d.latch = true; d.hingeA = true; d.hingeB = true; d.latchHp = 60; d.hingeAHp = 50; d.hingeBHp = 50;
+      d.ang = 0; d.vel = 0; d.anim = 0; d.grp.rotation.set(0, 0, 0);
+      d.dent = 0; d.winGone = false;
+      d.grp.position.z = d.bz0;
+      if (d.grp.children[0]) d.grp.children[0].rotation.x = 0;
+      if (d.grp.children[1]) d.grp.children[1].visible = true;
+    }
   }
   const tr9 = c.mesh.userData.trim;
   if (tr9) for (const t of tr9) { t.ox = 0; t.oy = 0; t.oz = 0; t.m.position.set(t.bx, t.by, t.bz); }
-  for (const m of [c.mesh.userData.cabMesh].concat(c.mesh.userData.crush || [c.mesh.userData.bodyMesh])) {
+  for (const m of [c.mesh.userData.cabMesh]
+    .concat(c.mesh.userData.crush || [c.mesh.userData.bodyMesh])
+    .concat(ps9 ? ps9.map(d9 => d9.grp.children[0]) : [])) {   // hood/lid plates flatten on the jig too
     if (!m || !m.geometry.userData.orig) continue;
     m.geometry.attributes.position.array.set(m.geometry.userData.orig);
     m.geometry.userData.disp.fill(0);
@@ -6820,7 +7699,18 @@ function undentCar(c) {
 }
 function attachCarMesh(c) {
   c.mesh = buildCarMesh(c);
+  markShadows(c.mesh);
   scene.add(c.mesh);
+}
+// every solid mesh casts and receives the moon (glass casts nothing —
+// a transparent box would throw a solid black slab)
+function markShadows(root) {
+  root.traverse(o9 => {
+    if (!o9.isMesh) return;
+    o9.receiveShadow = true;
+    const m9 = o9.material;
+    if (m9 && !m9.transparent) o9.castShadow = true;
+  });
 }
 function removeCarMesh(c) {
   if (!c.mesh) return;
@@ -7224,6 +8114,7 @@ function ragPose(m, rag, t) {
 function attachPedMesh(p) {
   const headCol = p.cop ? (UNITS[p.unit] || UNITS.cop).head : 0xe0b090;
   p.mesh = buildPedMesh(p.shirt, headCol);
+  markShadows(p.mesh);
   if (p.shopkeep) {
     // the house minigun, out of sight under the counter until provoked
     const ud2 = p.mesh.userData;
@@ -7956,6 +8847,7 @@ function stepPlayerCar(c, dt) {
   }
   c.speed = clamp(c.speed, -95, kmax);
   if (c.noFuel && c.speed < 0) c.speed = 0;        // no engine, no reverse gear
+  c._thr = thrN;                                 // the exhaust reads the throttle
   // FUEL (Tank order): running time sips it, speed drinks it. The race car
   // drinks fast; the truck's burn rides its engine LOAD (throttle demand).
   // A beaten car runs RICH: ≤75% hp drinks faster, ≤50% faster still — and
@@ -8005,6 +8897,9 @@ function stepPlayerCar(c, dt) {
   const steer = (right ? 1 : 0) - (left ? 1 : 0) || clamp(padLX * 1.25, -1, 1);
   const dA = steer * 2.6 * (hand ? 1.5 : 1) * (c.kind === 'tank' ? 0.55 : 1) * clamp(c.speed / 140, -1, 1) * dt;
   if (dA) steerCar(c, dA);
+  // a bent frame PULLS: crooked alignment drags the car toward the soft side
+  const pull9 = c.frame ? (c.frame.fr - c.frame.fl) * 0.22 : 0;
+  if (pull9 && Math.abs(c.speed) > 30) steerCar(c, pull9 * clamp(c.speed / 200, -1, 1) * dt);
   c.steerVis = steer * 0.42;                     // wheels track the wheel, even at a standstill
   tireGrip(c, dt, hand ? 0.35 : 1);              // handbrake cuts grip: controlled slides
   moveCar(c, dt);
@@ -9211,11 +10106,27 @@ function carCollisions() {
       const b = cars[j];
       if (b.dead) continue;
       if ((a.gDeck || 0) !== (b.gDeck || 0) || Math.abs((a.alt || 0) - (b.alt || 0)) > 6) continue;   // different decks / altitudes never touch
-      const d = dist(a.x, a.y, b.x, b.y);
-      const rr2 = (a.len + b.len) / 4 + 4;
-      if (d > rr2 || d === 0) continue;
-      const nx = (b.x - a.x) / d, ny = (b.y - a.y) / d;
-      const push = (rr2 - d) / 2;
+      // TWO-DISC hulls (Tank: sedans buried their noses in the truck BED):
+      // a front and a rear disc ride each body, so a long bed is solid to
+      // its true tail — the old single center-circle let noses sink ~20px in
+      let d = dist(a.x, a.y, b.x, b.y);
+      if (d > (a.len + b.len) * 0.5 + 10 || d === 0) continue;
+      const oa9 = a.len * 0.27, ob9 = b.len * 0.27;
+      const ra9 = Math.max(a.w * 0.6, 11), rb9 = Math.max(b.w * 0.6, 11);
+      const caA = Math.cos(a.angle), saA = Math.sin(a.angle);
+      const caB = Math.cos(b.angle), saB = Math.sin(b.angle);
+      let hit9 = null;
+      for (let pa9 = -1; pa9 <= 1; pa9 += 2)
+        for (let pb9 = -1; pb9 <= 1; pb9 += 2) {
+          const ax9 = a.x + caA * oa9 * pa9, ay9 = a.y + saA * oa9 * pa9;
+          const bx9 = b.x + caB * ob9 * pb9, by9 = b.y + saB * ob9 * pb9;
+          const dd9 = dist(ax9, ay9, bx9, by9);
+          const ov9 = ra9 + rb9 - dd9;
+          if (ov9 > 0 && (!hit9 || ov9 > hit9.ov)) hit9 = { ov: ov9, dx: bx9 - ax9, dy: by9 - ay9, d: Math.max(dd9, 0.001) };
+        }
+      if (!hit9) continue;
+      const nx = hit9.dx / hit9.d, ny = hit9.dy / hit9.d;
+      const push = hit9.ov / 2;
       if (!solidAtPx(a.x - nx * push, a.y - ny * push)) { a.x -= nx * push; a.y -= ny * push; }
       if (!solidAtPx(b.x + nx * push, b.y + ny * push)) { b.x += nx * push; b.y += ny * push; }
       const at = a.kind === 'tank', bt = b.kind === 'tank';
@@ -9223,7 +10134,15 @@ function carCollisions() {
         const tank = at ? a : b, vict = at ? b : a;
         if (Math.abs(tank.speed) > 40) carDamage(vict, 400, tank.driver === 'player' ? 'p' : null);
       }
-      const impact = Math.abs(a.speed) + Math.abs(b.speed);
+      // impact carries MASS and closing speed along the contact normal:
+      // the heavy party delivers, the light party receives (Tank order)
+      const mA9 = CAR_KINDS[a.kind].mass || 1, mB9 = CAR_KINDS[b.kind].mass || 1;
+      const cvx9 = a.speed * Math.cos(a.angle) - b.speed * Math.cos(b.angle);
+      const cvy9 = a.speed * Math.sin(a.angle) - b.speed * Math.sin(b.angle);
+      const closing9 = Math.abs(cvx9 * nx + cvy9 * ny);
+      const recvA9 = closing9 * 2 * mB9 / (mA9 + mB9);
+      const recvB9 = closing9 * 2 * mA9 / (mA9 + mB9);
+      const impact = closing9;
       // RAM BARS: a pursuing cruiser that lands its nose on your car deals
       // push-bar damage and shoves you along its facing — and shrugs it off
       if (!at && !bt && stars() >= 1 && player.car && impact > 90) {
@@ -9247,10 +10166,10 @@ function carCollisions() {
       }
       if (impact > 150 && !at && !bt) {
         const by = a.driver === 'player' || b.driver === 'player' ? 'p' : null;
-        carDamage(a, impact * 0.045, by);
-        carDamage(b, impact * 0.045, by);
-        dentCar(a, (a.x + b.x) / 2, (a.y + b.y) / 2, impact);
-        dentCar(b, (a.x + b.x) / 2, (a.y + b.y) / 2, impact);
+        carDamage(a, recvA9 * 0.045, by);
+        carDamage(b, recvB9 * 0.045, by);
+        dentCar(a, (a.x + b.x) / 2, (a.y + b.y) / 2, recvA9);
+        dentCar(b, (a.x + b.x) / 2, (a.y + b.y) / 2, recvB9);
         if (a === player.car || b === player.car) rumble(clamp(impact / 350, 0.3, 1), 0.5, 260);
         sfx('crash', (a.x + b.x) / 2, (a.y + b.y) / 2, impact);
         sparks((a.x + b.x) / 2, (a.y + b.y) / 2);
@@ -11595,6 +12514,7 @@ function onClick() {
 function update(dt) {
   pollPad(dt);
   updMusic();
+  updWind(dt);                                   // the one air state the world receives
   // FORBIDDEN TERRITORY: an island with no freed bridge is a military zone.
   // Level 6 the whole time you stand on it — pinned, no fading, no mercy.
   // Stars act normal again the moment you make it back out (or die trying).
@@ -12000,9 +12920,11 @@ function update(dt) {
       }
     }
   }
-  for (const c of cars) if (!c.dead && (c.driver || Math.abs(c.speed) > 40)) checkLampHits(c);
+  for (const c of cars) if (!c.dead && (c.driver || Math.abs(c.speed) > 40)) { checkLampHits(c); checkTLHits(c); }
+  updTLBroken(dt);
   updLamps(dt);
   updDropped(dt);
+  updExhaust(dt);
   updGibs(dt);
   carCollisions();
   if (chopper) updChopper(dt);
@@ -12161,6 +13083,8 @@ function update(dt) {
   for (const p of parts) {
     p.life -= dt;
     if (p.life <= 0) { p.s.visible = false; continue; }
+    // free-flowing elements: smoke, sparks and dust drift on the wind
+    p.vx += WIND.x * 26 * dt; p.vy += WIND.y * 26 * dt;
     p.x += p.vx * dt; p.y += p.vy * dt; p.h += p.vh * dt;
     p.s.position.set(p.x * RS, p.h, p.y * RS);
     p.s.material.opacity = clamp(p.life / p.max, 0, 1);
@@ -12395,6 +13319,7 @@ let camYaw = 0;
 const camPos = new THREE.Vector3(playerStart.x * RS, 10, playerStart.y * RS + 20);
 const camLook = new THREE.Vector3(playerStart.x * RS, 3, playerStart.y * RS);
 function syncScene(dt, t) {
+  updWindWorld(dt, t);                     // trees, grass, cloth, all on the one wind
   if (oceanWater) {
     oceanWater.material.uniforms['time'].value += dt * 0.6;   // normal-map shimmer
     waterT += dt;
@@ -12454,7 +13379,11 @@ function syncScene(dt, t) {
         c.steerVis = (c.steerVis || 0) * Math.pow(0.05, dt);   // parked cars relax straight
       }
       c._pa = c.angle;
-      for (const wf of c.mesh.userData.wheelsF) wf.rotation.y = -(c.steerVis || 0);
+      for (const wf of c.mesh.userData.wheelsF) {
+        // steering input + whatever the bent frame did to the alignment
+        wf.rotation.y = -(c.steerVis || 0) + (wf.userData.toe || 0);
+        wf.rotation.x = wf.userData.camber || 0;
+      }
       c.wheelRoll = (c.wheelRoll || 0) + c.speed * RS * dt / 0.62;
       for (const wr of c.mesh.userData.wheelRolls) wr.rotation.z = -c.wheelRoll;
     }
@@ -13062,6 +13991,10 @@ function drawHUD(t) {
     hctx.fillStyle = ((t * 3) | 0) % 2 === 0 ? '#ff5050' : '#ffd23f';
     hctx.fillText('DISARM: ' + Math.ceil(disarmT) + 's', VW - 14, 58);
   }
+  // live FPS under the star row (Tank order: see what each change costs)
+  hctx.font = 'bold 13px monospace';
+  hctx.fillStyle = fpsSmooth >= 50 ? '#8fa8c8' : fpsSmooth >= 30 ? '#ffd23f' : '#ff5050';
+  hctx.fillText(Math.round(fpsSmooth) + ' FPS', VW - 14, s > 0 || disarmT > 0 ? 76 : 58);
   // messages — when the dialog banner is up, the stack starts below it
   // instead of overprinting the same top-center line
   hctx.textAlign = 'center';
@@ -13606,15 +14539,19 @@ function drawHUD(t) {
 
 // ---------------------------------------------------------------- main loop
 let lastT = performance.now();
+let fpsSmooth = 60;                     // live FPS, smoothed — HUD top-right
 let gtime = 0;
 function frame(now) {
-  const dt = Math.min(0.035, (now - lastT) / 1000);
+  const rawDt = (now - lastT) / 1000;
+  const dt = Math.min(0.035, rawDt);
   lastT = now;
   gtime += dt;
+  // live FPS (Tank order): smoothed over real frame time, HUD top-right
+  if (rawDt > 0 && rawDt < 1) fpsSmooth += (1 / rawDt - fpsSmooth) * 0.06;
   update(dt);
   updRadio();
   syncScene(dt, gtime);
-  if (!window._noRender) renderer.render(scene, camera);   // audio receipts starve without this skip (headless swiftshader)
+  if (!window._noRender) renderGPU();   // audio receipts starve without this skip (headless swiftshader)
   drawHUD(gtime);
   requestAnimationFrame(frame);
 }
@@ -15052,6 +15989,289 @@ if (location.hash === '#chapel') {
     priestOpen = false;
   }
   console.log('CHPDBG ' + RC.join(' ') + ' fails=' + cFails);
+}
+if (location.hash === '#phonebooth') {
+  // eyes-check: the payphone kiosk at spot 0
+  startGame();
+  scene.fog = null;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+  player.x = phones[0].x - 40; player.y = phones[0].y + 30;
+  player.angle = Math.atan2(phones[0].y - player.y, phones[0].x - player.x);
+  mouseYaw = camYaw = player.angle; mousePitch = 0.15; camZoom = 0.8;
+  for (let i = 0; i < 40; i++) syncScene(1 / 60, i / 60);
+}
+if (location.hash === '#tlpole') {
+  // TRAFFIC POLE + PAYPHONE receipt (Tank orders): poles live under the
+  // lamp law — upright stops feet, slow car hits bend, fast hits snap the
+  // pole flat and kill the head, the city rebuilds in 60s. Payphones are
+  // real kiosks with a solid footprint.
+  window._noRender = true;
+  startGame();
+  let tFails = 0;
+  const RTl = [], ckL = (n, v) => { RTl.push(n + '=' + v); if (!v) tFails++; };
+  const s0 = trafficLights[0];
+  ckL('uprightStopsFeet', lampBlockAt(s0.x, s0.y, s0.x + 10, s0.y) === true);
+  const ram9 = mkCar(s0.x - 40, s0.y, 0, 'sedan', 'player');
+  ram9.keep = true; attachCarMesh(ram9); cars.push(ram9);
+  ram9.x = s0.x - 12; ram9.speed = 200;
+  checkTLHits(ram9);
+  ckL('fastHitSnaps', s0.broken === true && s0.maxAng > 1.4);
+  ckL('postScrubsSpeed', Math.abs(ram9.speed) < 200);
+  ckL('fallenWalksPast', lampBlockAt(s0.x, s0.y, s0.x + 10, s0.y) === false);
+  updTrafficLights();
+  const cDead9 = new THREE.Color();
+  tlLampsEW[2].getColorAt(0, cDead9);
+  ckL('headStaysDark', cDead9.g < 0.2);
+  s0.respawnT = 0.02;
+  updTLBroken(0.05);
+  ckL('cityRebuilds', s0.broken === false && lampBlockAt(s0.x, s0.y, s0.x + 10, s0.y) === true);
+  const s1 = trafficLights[1];
+  const bend9 = mkCar(s1.x - 12, s1.y, 0, 'sedan', 'player');
+  bend9.keep = true; attachCarMesh(bend9); cars.push(bend9);
+  bend9.speed = 60;
+  checkTLHits(bend9);
+  ckL('slowHitBends', s1.broken === true && s1.maxAng < 1.4);
+  ckL('payphonesPlanted', phones.length >= 20 && solidAtPx(phones[0].x, phones[0].y) === true);
+  console.log('TLPDBG ' + RTl.join(' ') + ' fails=' + tFails);
+}
+if (location.hash === '#exhaust') {
+  // EXHAUST receipt: idle sips out a thin trail, full throttle POURS it,
+  // a dry/dead engine makes nothing.
+  window._noRender = true;
+  startGame();
+  let eFails = 0;
+  const RE = [], ckE = (n, v) => { RE.push(n + '=' + v); if (!v) eFails++; };
+  const ex9 = mkCar(player.x + 40, player.y, 0, 'sedan', 'player');
+  ex9.keep = true; attachCarMesh(ex9); cars.push(ex9);
+  player.car = ex9; ex9.fuel = 8;
+  const count9 = (thr9, sec9) => {
+    ex9._thr = thr9; ex9._exT = 0;
+    const p0 = parts.length;
+    let n9 = 0;
+    for (let i = 0; i < 60 * sec9; i++) { const b9 = parts.length; updExhaust(1 / 60); n9 += parts.length - b9; }
+    return n9;
+  };
+  const idle9 = count9(0, 2);
+  const full9 = count9(1, 2);
+  ckE('idlePuffs', idle9 >= 2);
+  ckE('moreGasMoreExhaust', full9 > idle9 * 2.5);
+  ex9.noFuel = true;
+  ckE('deadEngineMakesNone', count9(1, 2) === 0);
+  ex9.noFuel = false; ex9.fuel = 0;
+  ckE('dryTankMakesNone', count9(1, 2) === 0);
+  player.car = null;
+  console.log('EXHDBG ' + RE.join(' ') + ' fails=' + eFails);
+}
+if (location.hash === '#dubstep') {
+  // NUVOLA BASS FM receipt: the engine schedules a full arrangement —
+  // sections cycle intro→build→drop, the drop riffs rotate, hundreds of
+  // events land on the grid, and the whole thing runs without a stumble.
+  window._noRender = true;
+  startGame();
+  audioInit();
+  let dFails = 0;
+  const RD = [], ckD = (n, v) => { RD.push(n + '=' + v); if (!v) dFails++; };
+  const rc9 = mkCar(player.x + 30, player.y, 0, 'sedan', 'player');
+  rc9.keep = true; attachCarMesh(rc9); cars.push(rc9);
+  player.car = rc9;
+  ckD('acLive', !!AC);
+  if (AC) {
+    radioT = AC.currentTime;
+    const sec0 = RADIO.sec, ev0 = RADIO.ev;
+    updRadio(AC.currentTime + 70);                // one call writes ~40 bars ahead
+    ckD('busBuilt', !!radioBus && !!radioDirt);
+    ckD('sectionsCycle', RADIO.sec - sec0 >= 8);
+    ckD('gridFullOfEvents', RADIO.ev - ev0 > 400);
+    ckD('stationAnnounced', radioAnn === true);
+    ckD('dropsRotateRiffs', RADIO.riff >= 0 && RRIFFS.length === 3);
+  }
+  player.car = null;
+  console.log('DUBDBG ' + RD.join(' ') + ' fails=' + dFails);
+}
+if (location.hash === '#gpu') {
+  // GPU PIPELINE receipt (Tank order): shadows on and following the player,
+  // ACES tone mapping, glow targets live, and the grass wind compiled into
+  // the vertex shader (real frames must render for that one).
+  startGame();
+  setTimeout(() => {
+    let gFails = 0;
+    const RG = [], ckG = (n, v) => { RG.push(n + '=' + v); if (!v) gFails++; };
+    ckG('shadowsOn', renderer.shadowMap.enabled === true && moonLight.castShadow === true);
+    ckG('acesToneMapping', renderer.toneMapping === THREE.ACESFilmicToneMapping);
+    ckG('glowSized', GLOW.rtScene.width > 2 && GLOW.rtA.width > 2);
+    ckG('gpuWindCompiled', window.__gpuWindOK === true);
+    ckG('moonFollowsPlayer', Math.abs(moonLight.target.position.x - player.x * RS) < 2);
+    RG.push('drawCalls=' + renderer.info.render.calls + ' tris=' + Math.round(renderer.info.render.triangles / 1000) + 'k');
+    console.log('GPUDBG ' + RG.join(' ') + ' fails=' + gFails);
+  }, 900);
+}
+if (location.hash === '#tbone') {
+  // T-BONE receipt (Tank: "the windows and doors was not affected"): a hard
+  // side hit CAVES the struck door, BURSTS its glass, dents the cab, and
+  // the far-side door stays clean; the jig restores all of it.
+  window._noRender = true;
+  startGame();
+  let tbFails = 0;
+  const RT = [], ckT = (n, v) => { RT.push(n + '=' + v); if (!v) tbFails++; };
+  const tb9 = mkCar(29 * TILE, 60 * TILE, 0, 'sedan', null);
+  tb9.keep = true; attachCarMesh(tb9); cars.push(tb9);
+  const dR9 = tb9.mesh.userData.doors[1], dL9 = tb9.mesh.userData.doors[0];
+  dentCar(tb9, tb9.x, tb9.y + tb9.w / 2, 380);        // hard blow to the +z door
+  ckT('doorCaves', (dR9.dent || 0) > 0.2);
+  ckT('glassBursts', dR9.winGone === true && dR9.grp.children[1].visible === false);
+  ckT('farDoorClean', (dL9.dent || 0) === 0 && dL9.winGone !== true);
+  const cabD9 = tb9.mesh.userData.cabMesh.geometry.userData.disp;
+  let cabHit9 = 0;
+  for (let i = 0; i < cabD9.length; i++) cabHit9 += Math.abs(cabD9[i]);
+  ckT('cabTakesTheTbone', cabHit9 > 0.5);
+  updDoors(tb9, 1 / 60);
+  ckT('doorSitsInset', Math.abs(dR9.grp.position.z - dR9.bz0) > 0.2);
+  undentCar(tb9);
+  ckT('jigRestoresDoor', dR9.dent === 0 && dR9.grp.children[1].visible === true && dR9.grp.position.z === dR9.bz0);
+  // a nose ram CRUMPLES the hood plate itself; the jig flattens it
+  const tb2 = mkCar(29 * TILE, 62 * TILE, 0, 'sedan', null);
+  tb2.keep = true; attachCarMesh(tb2); cars.push(tb2);
+  dentCar(tb2, tb2.x + tb2.len / 2, tb2.y, 380);
+  const hdm9 = tb2.mesh.userData.hoodP.grp.children[0];
+  let hSum9 = 0;
+  if (hdm9.geometry.userData.disp) for (const dv9 of hdm9.geometry.userData.disp) hSum9 += Math.abs(dv9);
+  ckT('hoodCrumples', hSum9 > 0.3);
+  undentCar(tb2);
+  let hSum2 = 0;
+  if (hdm9.geometry.userData.disp) for (const dv9 of hdm9.geometry.userData.disp) hSum2 += Math.abs(dv9);
+  ckT('jigFlattensHood', hSum2 === 0);
+  // BUMPERS: crease + skew on the struck end, stop at the crush limit,
+  // tear off at wreck violence — and the jig hangs a fresh bar
+  const tb4 = mkCar(29 * TILE, 64 * TILE, 0, 'sedan', null);
+  tb4.keep = true; attachCarMesh(tb4); cars.push(tb4);
+  const bF9 = tb4.mesh.userData.bumpers.find(b9 => b9.end === 1);
+  dentCar(tb4, tb4.x + tb4.len / 2, tb4.y - 4, 320);
+  let bd9 = 0;
+  if (bF9.m.geometry.userData.disp) for (const dv9 of bF9.m.geometry.userData.disp) bd9 += Math.abs(dv9);
+  ckT('bumperCreases', bd9 > 0.2);
+  ckT('bumperSkews', bF9.sag > 0.1 && bF9.m.rotation.y !== 0);
+  const bTrim9 = tb4.mesh.userData.trim.find(t9 => t9.m === bF9.m);
+  ckT('bumperCrushStop', Math.abs(bTrim9.ox) <= 0.5001);
+  const dp9 = droppedParts.length;
+  dentCar(tb4, tb4.x + tb4.len / 2, tb4.y, 420);
+  ckT('bumperTearsOff', bF9.gone === true && droppedParts.length > dp9);
+  undentCar(tb4);
+  ckT('jigHangsFreshBar', tb4.mesh.userData.bumpers.every(b9 => !b9.gone && b9.sag === 0));
+  console.log('TBONEDBG ' + RT.join(' ') + ' fails=' + tbFails);
+}
+if (location.hash === '#frame') {
+  // FRAME + CONNECTION WAVE receipt (Tank order): a heavy 45° driver-front
+  // hit bends fl most, fr next (the wave), shifts the engine CRADLE with
+  // the frame, toes the struck wheel, makes the car PULL — mass decides
+  // how hard each party receives — and the jig straightens everything.
+  window._noRender = true;
+  startGame();
+  let frFails = 0;
+  const RR9 = [], ckR = (n, v) => { RR9.push(n + '=' + v); if (!v) frFails++; };
+  const rx9 = 29 * TILE, ry9 = 60 * TILE;
+  const mkF = (kind, x) => { const c = mkCar(x, ry9, 0, kind, 'player'); c.keep = true; attachCarMesh(c); cars.push(c); return c; };
+  const sf9 = mkF('sedan', rx9);
+  // heavy 45° blow to the DRIVER FRONT (left-front corner, world coords)
+  dentCar(sf9, sf9.x + sf9.len * 0.35, sf9.y - sf9.w * 0.35, 420);
+  ckR('flBendsMost', sf9.frame.fl > 0.15 && sf9.frame.fl > sf9.frame.fr);
+  ckR('waveReachesFr', sf9.frame.fr > 0.01 && sf9.frame.rr < sf9.frame.fr);
+  const cr9 = sf9.mesh.userData.cradle[0];
+  ckR('cradleShiftsEngine', cr9.m.position.x < cr9.bx - 0.05 && Math.abs(cr9.m.position.z - cr9.bz) > 0.02);
+  ckR('wheelToesOnBentCorner', Math.abs(sf9.mesh.userData.wheelsF[1].userData.toe || 0) > 0.05);
+  player.car = sf9;
+  const ang0 = sf9.angle;
+  for (let i = 0; i < 60; i++) { sf9.speed = 150; stepPlayerCar(sf9, 1 / 60); }
+  ckR('bentFramePulls', Math.abs(angDiff(sf9.angle, ang0)) > 0.02);
+  // MASS: the same closing speed hurts the light party more
+  const tr9 = mkF('truck', rx9 + 400);
+  const sd2 = mkF('sedan', rx9 + 400 - 36);
+  tr9.speed = 220; sd2.speed = 0; player.car = null; tr9.driver = null; sd2.driver = null;
+  const hp0 = sd2.hp, hpT0 = tr9.hp;
+  carCollisions();
+  ckR('massMatters', (hp0 - sd2.hp) > (hpT0 - tr9.hp) && (hp0 - sd2.hp) > 0);
+  // the jig: repair straightens frame, re-seats cradle, re-aligns wheels
+  undentCar(sf9);
+  ckR('jigStraightens', sf9.frame.fl === 0 && Math.abs(cr9.m.position.x - cr9.bx) < 0.001
+    && Math.abs(sf9.mesh.userData.wheelsF[1].userData.toe || 0) < 0.001);
+  console.log('FRAMEDBG ' + RR9.join(' ') + ' fails=' + frFails);
+}
+if (location.hash === '#beds') {
+  // TWO-DISC CAR HULLS receipt (Tank: truck bed clipped by other vehicles):
+  // a sedan nosed into a truck's bed zone gets pushed clear to the true
+  // tail; adjacent-lane traffic (48px spacing) is never touched.
+  window._noRender = true;
+  startGame();
+  let bFails = 0;
+  const RB = [], ckB = (n, v) => { RB.push(n + '=' + v); if (!v) bFails++; };
+  const rx9 = 29 * TILE, ry9 = 60 * TILE;          // the causeway: open road
+  const tr9 = mkCar(rx9, ry9, 0, 'truck', null); tr9.keep = true; attachCarMesh(tr9); cars.push(tr9);
+  const sd9 = mkCar(rx9 - 34, ry9, 0, 'sedan', null); sd9.keep = true; attachCarMesh(sd9); cars.push(sd9);
+  for (let i = 0; i < 30; i++) carCollisions();
+  ckB('noseStaysOutOfBed', dist(tr9.x, tr9.y, sd9.x, sd9.y) >= 50);
+  const l1 = mkCar(rx9, ry9 - 400, 0, 'sedan', null); l1.keep = true; attachCarMesh(l1); cars.push(l1);
+  const l2 = mkCar(rx9 + 48, ry9 - 400, 0, 'sedan', null); l2.keep = true; attachCarMesh(l2); cars.push(l2);
+  const x1 = l1.x, x2 = l2.x;
+  for (let i = 0; i < 30; i++) carCollisions();
+  ckB('laneTrafficUntouched', l1.x === x1 && l2.x === x2);
+  console.log('BEDDBG ' + RB.join(' ') + ' fails=' + bFails);
+}
+if (location.hash === '#wind') {
+  // WIND WORLD receipt (Tank order): one air state everything receives —
+  // the wind evolves, buildings shelter their lee, grass bends underfoot
+  // and springs back, canopies sway, the cloth flag waves and droops calm,
+  // the water wake carries a wind swell.
+  window._noRender = true;
+  startGame();
+  let wFails = 0;
+  const RW = [], ckW = (n, v) => { RW.push(n + '=' + v); if (!v) wFails++; };
+  const d0 = WIND.dir, f0min = { lo: 9, hi: -9 };
+  for (let i = 0; i < 60 * 25; i++) { updWind(1 / 60); gtime += 1 / 60; f0min.lo = Math.min(f0min.lo, WIND.force); f0min.hi = Math.max(f0min.hi, WIND.force); }
+  ckW('windEvolves', Math.abs(WIND.dir - d0) > 0.02 && (f0min.hi - f0min.lo) > 0.05);
+  WIND.dir = 0; WIND.ux = 1; WIND.uy = 0; WIND.force = 0.7; WIND.x = 0.7; WIND.y = 0;
+  const bW = buildings.find(b9 => b9.tw >= 3 && b9.th >= 3 && (b9.style === 'commercial' || b9.style === 'slab' || b9.style === 'tower'));
+  const leeF = windAt((bW.tx + bW.tw + 0.4) * TILE, (bW.ty + bW.th / 2) * TILE).f;
+  const openF = windAt((bW.tx - 2.5) * TILE, (bW.ty + bW.th / 2) * TILE).f;
+  ckW('buildingsShelterTheLee', leeF < openF * 0.6 && openF > 0.6);
+  const bl0 = blades[0];
+  player.x = bl0.x + 4; player.y = bl0.y;
+  updWindWorld(1 / 60, 0);
+  ckW('grassBendsUnderfoot', Math.hypot(bl0.bx, bl0.bz) > 0.25);
+  player.x = bl0.x + 900;
+  for (let i = 0; i < 60 * 3; i++) updWindWorld(1 / 60, 0);
+  ckW('grassSpringsBack', Math.hypot(bl0.bx, bl0.bz) < 0.05);
+  const it0 = treeAnim[0].items[0];
+  const mm9 = new THREE.Matrix4();
+  it0.im.getMatrixAt(it0.idx, mm9);
+  const tx0 = mm9.elements[12];
+  WIND.force = 1; WIND.x = 1;
+  for (let i = 0; i < 8; i++) { gtime += 0.35; updWindWorld(1 / 60, 0); }
+  it0.im.getMatrixAt(it0.idx, mm9);
+  ckW('canopiesRideTheWind', Math.abs(mm9.elements[12] - tx0) > 0.03);
+  const pa0 = capitolFlagM.geometry.attributes.position;
+  const z0 = pa0.getZ(pa0.count - 1);
+  gtime += 0.4; updWindWorld(1 / 60, 0);
+  ckW('flagIsCloth', Math.abs(pa0.getZ(pa0.count - 1) - z0) > 0.01);
+  WIND.force = 0;
+  updWindWorld(1 / 60, 0);
+  let tipY = 9, tipOy = 0;
+  for (let vi = 0; vi < pa0.count; vi++) if (pa0.getX(vi) > 2.5 && pa0.getY(vi) < tipY) { tipY = pa0.getY(vi); tipOy = capitolFlagM.geometry.userData.oy[vi]; }
+  ckW('clothSagsInACalm', tipY < tipOy - 0.4);
+  const wv0 = waveH(200, 200, 3);
+  WIND.force = 0.9;
+  ckW('wakeCarriesTheWind', Math.abs(waveH(200, 200, 3) - wv0) > 0.02);
+  console.log('WINDDBG ' + RW.join(' ') + ' fails=' + wFails);
+}
+if (location.hash === '#windview') {
+  // eyes-check: full trees (trunk/limbs/foliage), grass blades, park ground
+  startGame();
+  scene.fog = null;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+  WIND.force = 0.8; WIND.dir = 0.7; WIND.ux = Math.cos(0.7); WIND.uy = Math.sin(0.7);
+  const t0 = trees[0];
+  player.x = t0.x + 10; player.y = t0.y + 130;
+  player.angle = -Math.PI / 2;
+  mouseYaw = camYaw = -Math.PI / 2; mousePitch = 0.12; camZoom = 1.5;
+  for (let i = 0; i < 40; i++) syncScene(1 / 60, i / 60);
 }
 if (location.hash === '#fuel') {
   // FUEL SYSTEM receipt (Tank order): tank sizes per kind, speed drinks
@@ -16496,6 +17716,35 @@ if (location.hash === '#cheat') {
 (function () {
   const styles = {};
   for (const b of buildings) { const s = b.style || b.tex || '?'; styles[s] = (styles[s] || 0) + 1; }
+// the built world casts and receives the moon — one boot pass, milliseconds
+// (grass never casts: 142k blades in the shadow map buys speckle for cost)
+scene.traverse(o9 => {
+  if (!(o9.isMesh || o9.isInstancedMesh)) return;
+  o9.receiveShadow = true;
+  const m9 = o9.material;
+  if (m9 && !m9.transparent && o9 !== oceanWater) o9.castShadow = true;
+});
+if (bladeIM) bladeIM.castShadow = false;
+if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = false; }
+// STATIC WORLD FREEZE: three recomposes every auto-update matrix on EVERY
+// pass (main + mirror + shadow) — and the city is thousands of meshes that
+// never move. Compose them ONCE; dynamic subtrees (cars, peds, the player,
+// the flag, the save floppy, water) stay live.
+{
+  const dyn9 = new Set([player.mesh, ghostSeat, capitolFlagM, saveIcon, oceanWater].filter(Boolean));
+  for (const c9 of cars) if (c9.mesh) dyn9.add(c9.mesh);
+  for (const p9 of peds) if (p9.mesh) dyn9.add(p9.mesh);
+  let frozen9 = 0;
+  const freeze9 = (o9) => {
+    if (dyn9.has(o9)) return;
+    o9.updateMatrix();
+    o9.matrixAutoUpdate = false;
+    frozen9++;
+    for (const ch9 of o9.children) freeze9(ch9);
+  };
+  for (const ch9 of scene.children) freeze9(ch9);
+  console.log('GPUSTATIC ' + frozen9 + ' static matrices frozen (' + dyn9.size + ' dynamic roots live)');
+}
   console.log('GTA3 BOOT OK — buildings=' + buildings.length + ' lamps=' + lamps.length + ' peds=' + peds.length + ' cars=' + cars.length);
   console.log('CITYARCH styles=' + Object.keys(styles).map(k => k + ':' + styles[k]).join(' '));
 })();

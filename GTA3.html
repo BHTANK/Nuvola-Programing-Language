@@ -281,6 +281,8 @@ function touchButtons() {
   } else {
     b9.push({ n: 'fire', label: 'FIRE', x: VW - r9 - 24, y: VH - r9 - 46, r: r9 * 1.15 });
     b9.push({ n: 'use', label: 'USE', x: VW - r9 * 3.5 - 30, y: VH - r9 - 24, r: r9 });
+    // tap = next weapon; HOLD = the weapon wheel, thumb picks, release loads
+    b9.push({ n: 'weap', label: 'WPN', x: VW - r9 - 30, y: VH - r9 * 3.7 - 50, r: r9 * 0.9 });
   }
   return b9;
 }
@@ -289,6 +291,7 @@ TOUCH._start = (id9, x9, y9) => {
     if (Math.hypot(x9 - b9.x, y9 - b9.y) <= b9.r * 1.25) {
       TOUCH.held[b9.n] = id9;
       if (b9.n === 'use') TOUCH.useEdge = true;
+      if (b9.n === 'weap') { TOUCH.weapT = 0; TOUCH.weapCx = b9.x; TOUCH.weapCy = b9.y; }
       return;
     }
   }
@@ -296,6 +299,14 @@ TOUCH._start = (id9, x9, y9) => {
   TOUCH.look = { id: id9, lx: x9, ly: y9 };
 };
 TOUCH._move = (id9, x9, y9) => {
+  if (TOUCH.held.weap === id9) {
+    // the wheel is open under this thumb: the drag direction IS the pick
+    if (wheelOpen && wheelSrc === 'touch') {
+      const dx9 = x9 - TOUCH.weapCx, dy9 = y9 - TOUCH.weapCy;
+      if (Math.hypot(dx9, dy9) > 26) wheelSel = wheelSelFromAngle(Math.atan2(dy9, dx9));
+    }
+    return;
+  }
   if (TOUCH.stick && TOUCH.stick.id === id9) {
     TOUCH.stick.dx = clamp(x9 - TOUCH.stick.ax, -60, 60);
     TOUCH.stick.dy = clamp(y9 - TOUCH.stick.ay, -60, 60);
@@ -307,6 +318,14 @@ TOUCH._move = (id9, x9, y9) => {
   }
 };
 TOUCH._end = (id9) => {
+  if (TOUCH.held.weap === id9) {
+    if (wheelOpen && wheelSrc === 'touch') closeWheel(true);            // hold: load the pick
+    else if ((TOUCH.weapT || 0) < 0.28 && !player.car && state === 'play' && !paused) {
+      const i9 = WORDER.indexOf(player.weapon);                         // tap: next weapon
+      player.weapon = WORDER[(i9 + 1) % WORDER.length];
+      sfx('pickup');
+    }
+  }
   if (TOUCH.stick && TOUCH.stick.id === id9) TOUCH.stick = null;
   if (TOUCH.look && TOUCH.look.id === id9) TOUCH.look = null;
   for (const n9 in TOUCH.held) if (TOUCH.held[n9] === id9) delete TOUCH.held[n9];
@@ -327,8 +346,12 @@ if (TOUCH.on) {
       for (const t9 of e9.changedTouches) TOUCH._end(t9.identifier);
     }, { passive: false });
 }
-function applyTouch() {
+function applyTouch(dt9) {
   if (!TOUCH.on) return;
+  if (TOUCH.held.weap !== undefined) {
+    TOUCH.weapT = (TOUCH.weapT || 0) + (dt9 || 1 / 60);
+    if (TOUCH.weapT >= 0.28 && !wheelOpen && !player.car) openWheel('touch');
+  }
   if (TOUCH.stick) {
     const nx9 = clamp(TOUCH.stick.dx / 52, -1, 1), ny9 = clamp(TOUCH.stick.dy / 52, -1, 1);
     if (Math.hypot(nx9, ny9) > 0.14) { padLX = padLX || nx9; padLY = padLY || ny9; }
@@ -652,7 +675,8 @@ function runConsole(raw) {
   if (!cmd) return;
   // anything beyond save/load/stats is a cheat — and every save made from
   // that point on carries the mark
-  if (!/^(save (10|[1-9])|load (10|[1-9])|stats|saves)$/.test(cmd)) cheated = true;
+  // weather commands are a TEST TOOL (Tank order) — no advantage, no brand
+  if (!/^(save (10|[1-9])|load (10|[1-9])|stats|saves|weather (rain|snow|clear|lightning|blizzard))$/.test(cmd)) cheated = true;
   let out;
   if (cmd === 'fix car') {
     if (player.car) {
@@ -706,6 +730,21 @@ function runConsole(raw) {
         }
         out = 'JOB ' + n + ' is next. Save a slot to keep it.';
       }
+    }
+  } else if (/^weather (rain|snow|clear|lightning|blizzard)$/.test(cmd)) {
+    // TEST TOOL (Tank order): "weather rain|snow|blizzard|lightning|clear"
+    // — lightning drops ONE bolt near the player; the rest force a spell
+    const w9 = cmd.split(' ')[1];
+    if (w9 === 'lightning') {
+      const a9 = Math.random() * Math.PI * 2, d9 = rndf(40, 90);
+      lightningStrike(player.x + Math.cos(a9) * d9, player.y + Math.sin(a9) * d9, null);
+      out = 'Bolt delivered.';
+    } else {
+      WEATHER.mode = w9;
+      WEATHER.t = w9 === 'clear' ? rndf(100, 210) : 600;
+      out = w9 === 'clear' ? 'Skies clearing.'
+        : w9 === 'rain' ? 'Storm rolling in.'
+          : w9 === 'blizzard' ? 'WHITEOUT — waist-deep and rising.' : 'Snow rolling in.';
     }
   } else if (cmd === 'stats') {
     msg('CARS DESTROYED ' + STATS.carsDestroyed + ' · RUN OVER ' + STATS.pedsRunOver + ' · CIVILIANS ' + STATS.civiliansKilled + ' · COPS ' + STATS.copsKilled + ' · COMBINE ' + STATS.goonsKilled, 12);
@@ -1191,6 +1230,17 @@ function sfx(k, x, y, v9) {
     tone(120, 40, 0.3, 'sine', 0.1);
   } else if (k === 'flame') {
     noise(0.22, 0.12, 700, 'bandpass', 0.8);
+  } else if (k === 'thunder') {
+    noise(0.09, 0.5, 2600, 'highpass');            // the tear overhead
+    noise(2.6, 0.55, 300, 'lowpass', 0, 46, 'brown');   // rolling rumble bed
+    noise(1.2, 0.35, 700, 'lowpass', 0, 90);       // mid roll
+    tone(52, 20, 1.6, 'sine', 0.3);                // sub press
+    sendVerbFrom(sfxDest, 0.55, true);
+  } else if (k === 'zap') {
+    noise(0.06, 0.5, 3400, 'highpass');            // the snap
+    noise(0.3, 0.3, 1800, 'bandpass', 3);          // sizzle
+    tone(3200, 300, 0.18, 'sawtooth', 0.06);       // arc whine falling
+    tone(70, 24, 0.5, 'sine', 0.25);               // the crack's body
   } else if (k === 'pickup') {
     tone(880, 1320, 0.09, 'triangle', 0.07);
     tone(1320, 1760, 0.1, 'triangle', 0.05);
@@ -2966,10 +3016,633 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-scene.add(new THREE.HemisphereLight(0x46527e, 0x1b1b24, 1.75));   // brighter sky fill — the city reads
+const hemiLight = new THREE.HemisphereLight(0x46527e, 0x1b1b24, 1.75);   // brighter sky fill — the city reads
+scene.add(hemiLight);
+const HEMI_BASE = 1.75;                          // lightning flashes ride on top of this
 const moonLight = new THREE.DirectionalLight(0x9aa6d0, 1.05);
 moonLight.position.set(120, 200, 60);
 scene.add(moonLight);
+// ================= WEATHER (Tank order): snow that falls AND lays, storms
+// with lightning + thunder, wet streets with puddles that answer the rain —
+// and a 0.001% chance per moment that any character (player included)
+// catches a bolt with their name on it.
+const WEATHER = {
+  mode: 'clear', t: 20,       // current spell + time left in it
+  inten: 0,                   // 0..1 ramp of the current spell
+  wet: 0, snow: 0,            // ground memory: soak + accumulation
+  deep: 0,                    // BLIZZARD depth: 1 = waist-high powder
+  flashT: 0, flash2: 0,       // sky-flash envelope + queued second blink
+  thunderQ: [],               // rolling claps on a delay
+  boltT: 0,
+  STRIKE_P: 0.00001,          // 0.001% per character per moment
+  rainSrc: null, rainGain: null
+};
+const RAIN_N = 850, SNOW_N = 1300, RAIN_BOX = 130, RAIN_H = 70;
+const rainGrp = new THREE.Group();
+scene.add(rainGrp);
+const rainPos = new Float32Array(RAIN_N * 6);
+const rainPts = new Float32Array(RAIN_N * 3);      // logical drop anchors
+for (let i9 = 0; i9 < RAIN_N; i9++) {
+  rainPts[i9 * 3] = (Math.random() - 0.5) * RAIN_BOX;
+  rainPts[i9 * 3 + 1] = Math.random() * RAIN_H;
+  rainPts[i9 * 3 + 2] = (Math.random() - 0.5) * RAIN_BOX;
+}
+const rainGeo = new THREE.BufferGeometry();
+rainGeo.setAttribute('position', new THREE.BufferAttribute(rainPos, 3));
+const rainMat = new THREE.LineBasicMaterial({ color: 0x8fb0d8, transparent: true, opacity: 0, depthWrite: false });
+const rainLines = new THREE.LineSegments(rainGeo, rainMat);
+rainLines.frustumCulled = false;
+rainLines.visible = false;
+rainGrp.add(rainLines);
+const snowGeoP = new THREE.BufferGeometry();
+const snowPos = new Float32Array(SNOW_N * 3);
+for (let i9 = 0; i9 < SNOW_N; i9++) {
+  snowPos[i9 * 3] = (Math.random() - 0.5) * RAIN_BOX;
+  snowPos[i9 * 3 + 1] = Math.random() * RAIN_H;
+  snowPos[i9 * 3 + 2] = (Math.random() - 0.5) * RAIN_BOX;
+}
+snowGeoP.setAttribute('position', new THREE.BufferAttribute(snowPos, 3));
+const snowMat = new THREE.PointsMaterial({ color: 0xf2f5ff, size: 0.38, transparent: true, opacity: 0, depthWrite: false, sizeAttenuation: true });
+const snowPts9 = new THREE.Points(snowGeoP, snowMat);
+snowPts9.frustumCulled = false;
+snowPts9.visible = false;
+rainGrp.add(snowPts9);
+// ground overlays: one merged sheet of LAND-only quads (row-run merge —
+// snow must never lay on open water), used twice: white lay + wet darkening
+const landRuns9 = [];
+{
+  for (let iy9 = 0; iy9 < GRID_H; iy9++) {
+    let sx9 = -1;
+    for (let ix9 = 0; ix9 <= GRID_W; ix9++) {
+      const land9 = ix9 < GRID_W && tiles[iy9 * GRID_W + ix9] !== T_WATER;
+      if (land9 && sx9 < 0) sx9 = ix9;
+      if (!land9 && sx9 >= 0) { landRuns9.push([sx9, iy9, ix9 - sx9]); sx9 = -1; }
+    }
+  }
+}
+function landSheet9(y9, mat9) {
+  const pos9 = new Float32Array(landRuns9.length * 12);
+  const idx9 = new Uint32Array(landRuns9.length * 6);
+  landRuns9.forEach(([tx9, ty9, w9], i9) => {
+    const x09 = tx9 * TILE * RS, x19 = (tx9 + w9) * TILE * RS;
+    const z09 = ty9 * TILE * RS, z19 = (ty9 + 1) * TILE * RS;
+    pos9.set([x09, y9, z09, x19, y9, z09, x19, y9, z19, x09, y9, z19], i9 * 12);
+    idx9.set([i9 * 4, i9 * 4 + 2, i9 * 4 + 1, i9 * 4, i9 * 4 + 3, i9 * 4 + 2], i9 * 6);
+  });
+  const g9 = new THREE.BufferGeometry();
+  g9.setAttribute('position', new THREE.BufferAttribute(pos9, 3));
+  g9.setIndex(new THREE.BufferAttribute(idx9, 1));
+  g9.computeVertexNormals();
+  const m9 = new THREE.Mesh(g9, mat9);
+  m9.frustumCulled = false;
+  scene.add(m9);
+  return m9;
+}
+const wetMat9 = new THREE.MeshBasicMaterial({ color: 0x0a1424, transparent: true, opacity: 0, depthWrite: false });
+const wetSheet = landSheet9(0.13, wetMat9);
+const snowLayMat = new THREE.MeshLambertMaterial({ color: 0xe9edf6, transparent: true, opacity: 0, depthWrite: false });
+const snowSheet = landSheet9(0.16, snowLayMat);
+snowSheet.receiveShadow = true;                  // the moon draws on fresh snow
+// transparent SORTING is by bounding-sphere distance — the city-sized
+// sheets randomly paint OVER the small decals (prints vanished under the
+// snow). Explicit renderOrder pins the stack: wet < snow < puddles <
+// ripples < marks.
+wetSheet.renderOrder = 1;
+snowSheet.renderOrder = 2;
+// puddles: sky-tinted discs merged into ONE mesh, parked on road tiles
+const puddleSpots9 = [];
+{
+  let tries9 = 0;
+  while (puddleSpots9.length < 90 && tries9++ < 4000) {
+    const ix9 = (Math.random() * GRID_W) | 0, iy9 = (Math.random() * GRID_H) | 0;
+    if (tiles[iy9 * GRID_W + ix9] !== T_ROAD && tiles[iy9 * GRID_W + ix9] !== T_LOT) continue;
+    puddleSpots9.push({ x: (ix9 + 0.5) * TILE + rndf(-14, 14), y: (iy9 + 0.5) * TILE + rndf(-14, 14), r: rndf(2.2, 5.4) });
+  }
+}
+const pudMat9 = new THREE.MeshBasicMaterial({ color: 0x2a3c5e, transparent: true, opacity: 0, depthWrite: false });
+let pudMesh9 = null;
+{
+  const SEG9 = 10;
+  const pos9 = new Float32Array(puddleSpots9.length * (SEG9 + 1) * 3);
+  const idx9 = [];
+  puddleSpots9.forEach((p9, i9) => {
+    const b9 = i9 * (SEG9 + 1);
+    pos9.set([p9.x * RS, 0.15, p9.y * RS], b9 * 3);
+    for (let s9 = 0; s9 < SEG9; s9++) {
+      const a9 = s9 / SEG9 * Math.PI * 2;
+      pos9.set([p9.x * RS + Math.cos(a9) * p9.r * (0.7 + Math.sin(a9 * 3 + i9) * 0.3), 0.15, p9.y * RS + Math.sin(a9) * p9.r * (0.7 + Math.cos(a9 * 2 + i9) * 0.3)], (b9 + 1 + s9) * 3);
+      idx9.push(b9, b9 + 1 + s9, b9 + 1 + (s9 + 1) % SEG9);
+    }
+  });
+  const g9 = new THREE.BufferGeometry();
+  g9.setAttribute('position', new THREE.BufferAttribute(pos9, 3));
+  g9.setIndex(idx9);
+  pudMesh9 = new THREE.Mesh(g9, pudMat9);
+  pudMesh9.frustumCulled = false;
+  pudMesh9.renderOrder = 3;
+  scene.add(pudMesh9);
+}
+// ripple rings: the rain ANSWERS on the puddles — recycled instances
+const RIP_N = 44;
+const ripIM = new THREE.InstancedMesh(new THREE.RingGeometry(0.42, 0.55, 12), new THREE.MeshBasicMaterial({ color: 0x9fc4e8, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide }), RIP_N);
+ripIM.frustumCulled = false;
+ripIM.renderOrder = 4;
+const rips9 = [];
+{
+  const M9 = new THREE.Matrix4();
+  for (let i9 = 0; i9 < RIP_N; i9++) {
+    rips9.push({ x: 0, z: 0, age: Math.random() });
+    M9.makeScale(0.001, 0.001, 0.001);
+    ripIM.setMatrixAt(i9, M9);
+  }
+  scene.add(ripIM);
+}
+// ---- BLIZZARD (Tank: "push the boundaries"): waist-high MOVABLE snow.
+// A city-wide dig field remembers every wader and every wheel; a camera-
+// riding heightfield renders the powder with carved trails; the powder
+// itself drags feet and hulls back — plowed paths walk normal.
+const DEEP_C = 4;                                // dig cells per tile
+const DEEP_W = GRID_W * DEEP_C, DEEP_H = GRID_H * DEEP_C;
+const DEEP_CELL = TILE / DEEP_C;                 // logic px per cell
+const deepDig = new Float32Array(DEEP_W * DEEP_H).fill(1);
+let deepCur9 = 0;
+function deepAt(x9, y9) {                        // bilinear field sample, 1 = virgin drift
+  const fx9 = x9 / DEEP_CELL - 0.5, fy9 = y9 / DEEP_CELL - 0.5;
+  const x09 = Math.floor(fx9), y09 = Math.floor(fy9);
+  const tx9 = fx9 - x09, ty9 = fy9 - y09;
+  const g9 = (ix9, iy9) => deepDig[clamp(iy9, 0, DEEP_H - 1) * DEEP_W + clamp(ix9, 0, DEEP_W - 1)];
+  return (g9(x09, y09) * (1 - tx9) + g9(x09 + 1, y09) * tx9) * (1 - ty9)
+    + (g9(x09, y09 + 1) * (1 - tx9) + g9(x09 + 1, y09 + 1) * tx9) * ty9;
+}
+function digSnow(x9, y9, r9, press9) {           // press the powder down to (1-press9)
+  // a foot smaller than a dig cell must STILL press its own cell — clamp
+  // the working radius so the containing cell center is always in range
+  const rr9 = Math.max(r9, DEEP_CELL * 0.71);
+  const c09 = Math.floor((x9 - rr9) / DEEP_CELL), c19 = Math.floor((x9 + rr9) / DEEP_CELL);
+  const d09 = Math.floor((y9 - rr9) / DEEP_CELL), d19 = Math.floor((y9 + rr9) / DEEP_CELL);
+  for (let cy9 = Math.max(0, d09); cy9 <= Math.min(DEEP_H - 1, d19); cy9++)
+    for (let cx9 = Math.max(0, c09); cx9 <= Math.min(DEEP_W - 1, c19); cx9++) {
+      const dd9 = dist((cx9 + 0.5) * DEEP_CELL, (cy9 + 0.5) * DEEP_CELL, x9, y9);
+      if (dd9 > rr9) continue;
+      // a boot flattens across its WHOLE print — 75% press even at the
+      // edge (to-zero falloff left corner-straddling steps uncarved)
+      const t9 = 1 - press9 * (1 - 0.25 * Math.pow(dd9 / rr9, 2));
+      const i9 = cy9 * DEEP_W + cx9;
+      if (deepDig[i9] > t9) deepDig[i9] = t9;
+    }
+}
+const DEEP_SEG = 80, DEEP_SPAN = 110;
+const deepGeo = new THREE.PlaneGeometry(DEEP_SPAN, DEEP_SPAN, DEEP_SEG, DEEP_SEG);
+deepGeo.rotateX(-Math.PI / 2);
+const deepMesh = new THREE.Mesh(deepGeo, new THREE.MeshLambertMaterial({ color: 0xeef2fa }));
+deepMesh.receiveShadow = true;
+deepMesh.frustumCulled = false;
+deepMesh.visible = false;
+scene.add(deepMesh);
+function updDeepSnow(dt) {
+  const W9 = WEATHER;
+  if (W9.mode === 'blizzard' && W9.inten > 0.3) W9.deep = Math.min(1, W9.deep + dt / 35);
+  else W9.deep = Math.max(0, W9.deep - dt / (W9.mode === 'rain' ? 25 : 60));
+  if (W9.deep <= 0.02) {
+    if (deepMesh.visible) { deepMesh.visible = false; snowSheet.position.y = 0; snowSheet.updateMatrix(); }
+    return;
+  }
+  const dh9 = W9.deep * 1.7;                     // waist on the 3.54-unit frame
+  // every wader and wheel presses a trail — and the powder drags them:
+  // deep going is SLOW, a plowed path walks almost normal
+  const wade9 = (e9, r9, press9, isCar9) => {
+    if (e9.gDeck != null) return;
+    // you wade the snow that WAS there — then your step flattens it
+    const local9 = deepAt(e9.x, e9.y) * W9.deep;
+    digSnow(e9.x, e9.y, r9, press9);
+    if (e9._wdPX !== undefined && local9 > 0.05) {
+      const f9 = isCar9 ? 1 / (1 + local9 * 0.55) : 1 / (1 + local9 * 1.25);
+      e9.x = e9._wdPX + (e9.x - e9._wdPX) * f9;
+      e9.y = e9._wdPY + (e9.y - e9._wdPY) * f9;
+      if (isCar9 && e9.speed !== undefined) e9.speed *= Math.max(0, 1 - local9 * 0.85 * dt);
+    }
+    e9._wdPX = e9.x; e9._wdPY = e9.y;
+  };
+  if (!player.car && !player.dead && !player.rag) wade9(player, 6, 0.9, false);
+  for (const p9 of peds) if (!p9.dead && !p9.rag && !p9.riding) wade9(p9, 5, 0.85, false);
+  for (const c9 of cars) if (!c9.dead && (c9.alt || 0) < 1 && c9.kind !== 'boat' && c9.kind !== 'helo') wade9(c9, c9.w * 0.6 + 3, 0.95, true);
+  // fresh fall fills the trails back in, a slice of the field per frame
+  if (W9.mode === 'blizzard') {
+    const N9 = 32768;
+    for (let k9 = 0; k9 < N9; k9++) {
+      const i9 = (deepCur9 + k9) % deepDig.length;
+      if (deepDig[i9] < 1) deepDig[i9] = Math.min(1, deepDig[i9] + 0.0022);
+    }
+    deepCur9 = (deepCur9 + N9) % deepDig.length;
+  }
+  // the drift rides the camera, snapped to the dig grid so it never swims
+  deepMesh.visible = true;
+  const snap9 = DEEP_CELL * RS;
+  const ox9 = Math.round(camera.position.x / snap9) * snap9;
+  const oz9 = Math.round(camera.position.z / snap9) * snap9;
+  deepMesh.position.set(ox9, 0, oz9);
+  const pa9 = deepGeo.attributes.position;
+  for (let i9 = 0; i9 < pa9.count; i9++) {
+    const vx9 = pa9.getX(i9), vz9 = pa9.getZ(i9);
+    const wpx9 = (ox9 + vx9) / RS, wpy9 = (oz9 + vz9) / RS;
+    const tx9 = Math.floor(wpx9 / TILE), ty9 = Math.floor(wpy9 / TILE);
+    let y9;
+    if (tx9 < 0 || ty9 < 0 || tx9 >= GRID_W || ty9 >= GRID_H
+      || tiles[ty9 * GRID_W + tx9] === T_WATER || solid[ty9 * GRID_W + tx9] === 1) y9 = -0.6;
+    else y9 = dh9 * (0.12 + 0.88 * deepAt(wpx9, wpy9)) * (0.93 + 0.07 * Math.sin(wpx9 * 0.11) * Math.cos(wpy9 * 0.13));
+    pa9.setY(i9, y9);
+  }
+  pa9.needsUpdate = true;
+  deepGeo.computeVertexNormals();
+  snowSheet.position.y = W9.deep * 1.2;          // the distance keeps the illusion
+  snowSheet.updateMatrix();
+}
+// THE MOON (Tank order): Earth's near side, hung where the light comes
+// from — maria, Tycho's rays, storm clouds dim it
+const MOON_DIR = new THREE.Vector3(120, 200, 60).normalize();
+const moonDisc = (() => {
+  const c9 = document.createElement('canvas');
+  c9.width = c9.height = 256;
+  const g9 = c9.getContext('2d');
+  g9.beginPath(); g9.arc(128, 128, 124, 0, Math.PI * 2); g9.clip();
+  g9.fillStyle = '#e2e6ee';
+  g9.fillRect(0, 0, 256, 256);
+  // the near-side maria, roughly where Earth sees them
+  const mare9 = (x9, y9, rx9, ry9, a9) => {
+    g9.save(); g9.translate(x9, y9); g9.rotate(a9 || 0);
+    g9.beginPath(); g9.ellipse(0, 0, rx9, ry9, 0, 0, Math.PI * 2);
+    g9.fillStyle = 'rgba(120,130,150,0.55)'; g9.fill(); g9.restore();
+  };
+  mare9(70, 120, 36, 46, 0.2);        // Oceanus Procellarum
+  mare9(97, 84, 30, 25, -0.2);        // Mare Imbrium
+  mare9(142, 79, 21, 18, 0.1);        // Serenitatis
+  mare9(160, 106, 21, 17, 0.3);       // Tranquillitatis
+  mare9(177, 138, 15, 13, 0.2);       // Fecunditatis
+  mare9(198, 94, 12, 9, -0.4);        // Crisium
+  mare9(106, 160, 19, 14, 0);         // Nubium
+  mare9(78, 172, 12, 10, 0);          // Humorum
+  // Tycho and its rays
+  g9.strokeStyle = 'rgba(238,242,250,0.35)'; g9.lineWidth = 2;
+  for (let r9 = 0; r9 < 7; r9++) {
+    const a9 = -Math.PI / 2 + (r9 - 3) * 0.42;
+    g9.beginPath(); g9.moveTo(128, 202);
+    g9.lineTo(128 + Math.cos(a9) * 95, 202 + Math.sin(a9) * 95); g9.stroke();
+  }
+  const crater9 = (x9, y9, r9) => {
+    g9.beginPath(); g9.arc(x9, y9, r9, 0, Math.PI * 2);
+    g9.fillStyle = 'rgba(150,158,175,0.7)'; g9.fill();
+    g9.beginPath(); g9.arc(x9, y9, r9 * 0.55, 0, Math.PI * 2);
+    g9.fillStyle = 'rgba(226,230,238,0.9)'; g9.fill();
+  };
+  crater9(128, 202, 8);               // Tycho
+  crater9(94, 130, 6);                // Copernicus
+  crater9(64, 136, 4);                // Kepler
+  // limb shading
+  const rim9 = g9.createRadialGradient(128, 128, 88, 128, 128, 124);
+  rim9.addColorStop(0, 'rgba(0,0,0,0)'); rim9.addColorStop(1, 'rgba(30,36,52,0.55)');
+  g9.fillStyle = rim9; g9.fillRect(0, 0, 256, 256);
+  const tex9 = new THREE.CanvasTexture(c9);
+  const m9 = new THREE.Mesh(new THREE.CircleGeometry(13, 40),
+    new THREE.MeshBasicMaterial({ map: tex9, transparent: true, fog: false, depthWrite: false }));
+  scene.add(m9);
+  return m9;
+})();
+// the bolt: 8 jagged segments, repositioned per strike
+const boltGrp = new THREE.Group();
+const boltSegs9 = [];
+{
+  const bm9 = new THREE.MeshBasicMaterial({ color: 0xeaf2ff });
+  for (let i9 = 0; i9 < 8; i9++) {
+    const s9 = new THREE.Mesh(new THREE.BoxGeometry(0.26, 1, 0.26), bm9);
+    boltSegs9.push(s9);
+    boltGrp.add(s9);
+  }
+  boltGrp.visible = false;
+  scene.add(boltGrp);
+}
+function boltTo9(x9, y9) {
+  const up9 = new THREE.Vector3(0, 1, 0), dir9 = new THREE.Vector3();
+  let px9 = x9 * RS + rndf(-8, 8), pz9 = y9 * RS + rndf(-8, 8), py9 = 86;
+  for (let i9 = 0; i9 < boltSegs9.length; i9++) {
+    const last9 = i9 === boltSegs9.length - 1;
+    const nx9 = last9 ? x9 * RS : px9 + rndf(-6, 6);
+    const nz9 = last9 ? y9 * RS : pz9 + rndf(-6, 6);
+    const ny9 = last9 ? 1 : py9 - 86 / boltSegs9.length;
+    const s9 = boltSegs9[i9];
+    dir9.set(nx9 - px9, ny9 - py9, nz9 - pz9);
+    const len9 = Math.max(0.01, dir9.length());
+    s9.position.set((px9 + nx9) / 2, (py9 + ny9) / 2, (pz9 + nz9) / 2);
+    s9.scale.set(1, len9, 1);
+    s9.quaternion.setFromUnitVectors(up9, dir9.normalize());
+    px9 = nx9; py9 = ny9; pz9 = nz9;
+  }
+  boltGrp.visible = true;
+}
+function lightningStrike(x9, y9, victim9) {
+  boltTo9(x9, y9);
+  WEATHER.boltT = 0.22;
+  WEATHER.flashT = 0.2;
+  WEATHER.flash2 = 0.12;
+  sfx('zap', x9, y9);
+  sfx('thunder');
+  sparks(x9, y9);
+  if (victim9 === player) {
+    hurtPlayer(70);
+    if (player.car) carDamage(player.car, 25, null);
+  } else if (victim9 && victim9.hp !== undefined) {
+    victim9.hp -= 260;
+    launchRagFrom(victim9, x9 + rndf(-6, 6), y9 + rndf(-6, 6), 120);
+  }
+}
+// ---- MARKS (Tank order): footprints + tire tracks in the snow, wet
+// prints in the rain — and pools of blood (fallen peds) and oil (dead
+// cars) that feet and tires TRACK AWAY with them. One instanced quad
+// recycler, per-instance color, shrink-out at end of life.
+const MARK_N = 1024;
+const markIM = new THREE.InstancedMesh(
+  new THREE.PlaneGeometry(1, 1),
+  new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.85, depthWrite: false }),
+  MARK_N
+);
+markIM.frustumCulled = false;
+markIM.visible = false;
+markIM.renderOrder = 6;                          // decals ride ON TOP of the sheets
+scene.add(markIM);
+// REAL FEET (Tank order): a boot-sole alpha shape — ball, gap, heel —
+// toes to the travel direction, mirrored left/right via negative scale
+const footTex9 = (() => {
+  const c9 = document.createElement('canvas');
+  c9.width = 32; c9.height = 48;
+  const g9 = c9.getContext('2d');
+  g9.fillStyle = '#fff';
+  g9.beginPath(); g9.ellipse(16, 13, 9, 11, 0, 0, Math.PI * 2); g9.fill();    // ball + toes
+  g9.beginPath(); g9.ellipse(15, 39, 6.5, 6, 0, 0, Math.PI * 2); g9.fill();   // heel block
+  return new THREE.CanvasTexture(c9);
+})();
+const footIM = new THREE.InstancedMesh(
+  new THREE.PlaneGeometry(1, 1),
+  new THREE.MeshBasicMaterial({ map: footTex9, transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide }),
+  MARK_N
+);
+footIM.frustumCulled = false;
+footIM.visible = false;
+footIM.renderOrder = 6;
+scene.add(footIM);
+const marks9 = new Array(MARK_N).fill(null);
+let markHead9 = 0, marksLive9 = 0;
+const pools9 = [];                              // {x, y, r, kind, t} in logic px
+const _mkM = new THREE.Matrix4(), _mkQ = new THREE.Quaternion(), _mkQ2 = new THREE.Quaternion();
+const _mkP = new THREE.Vector3(), _mkS = new THREE.Vector3(), _mkC = new THREE.Color();
+const _mkUP = new THREE.Vector3(0, 1, 0);
+const _mkQX = new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0));   // flat-on-ground, once
+const MARK_COLS = { snow: 0x8e99b2, wet: 0x0b1220, blood: 0x7a1212, oil: 0x101216 };   // prints must READ on white
+function stampMark(x9, y9, ang9, sx9, sy9, kind9, life9, h9, foot9) {
+  const i9 = markHead9;
+  markHead9 = (markHead9 + 1) % MARK_N;
+  if (!marks9[i9]) marksLive9++;
+  marks9[i9] = { x: x9 * RS, z: y9 * RS, yaw: ang9, sx: sx9, sy: sy9, kind: kind9, t: 0, life: life9, h: h9, foot: !!foot9 };
+  const own9 = foot9 ? footIM : markIM, sib9 = foot9 ? markIM : footIM;
+  own9.setColorAt(i9, _mkC.setHex(MARK_COLS[kind9]));
+  if (own9.instanceColor) own9.instanceColor.needsUpdate = true;
+  _mkM.compose(_mkP.set(0, -10, 0), _mkQ.identity(), _mkS.set(0.0001, 0.0001, 0.0001));
+  sib9.setMatrixAt(i9, _mkM);                    // the slot lives in ONE mesh at a time
+  sib9.instanceMatrix.needsUpdate = true;
+}
+function trackKind9(ent9) {
+  if (ent9._mkBlood > 0) { ent9._mkBlood--; return 'blood'; }
+  if (ent9._mkOil > 0) { ent9._mkOil--; return 'oil'; }
+  if (WEATHER.snow > 0.25) return 'snow';
+  if (WEATHER.wet > 0.35) return 'wet';
+  return null;
+}
+function poolPickup9(ent9, x9, y9) {
+  for (const p9 of pools9) {
+    if (dist(x9, y9, p9.x, p9.y) < p9.r) {
+      if (p9.kind === 'blood') ent9._mkBlood = 10;
+      else ent9._mkOil = 12;
+    }
+  }
+}
+function updMarks(dt) {
+  // fresh pools under the fallen — scan, never touch the death code
+  for (const p9 of peds)
+    if (p9.dead && !p9._pooled) { p9._pooled = true; pools9.push({ x: p9.x, y: p9.y, r: 14, kind: 'blood', t: 0 }); stampMark(p9.x, p9.y, rndf(0, 6.28), 5.2, 4.2, 'blood', 70, 0.145); }
+  for (const c9 of cars)
+    if (c9.dead && !c9._pooled) { c9._pooled = true; pools9.push({ x: c9.x, y: c9.y, r: 18, kind: 'oil', t: 0 }); stampMark(c9.x, c9.y, c9.angle, 7, 4.6, 'oil', 80, 0.145); }
+  for (let i9 = pools9.length - 1; i9 >= 0; i9--) { pools9[i9].t += dt; if (pools9[i9].t > 70) pools9.splice(i9, 1); }
+  // feet: alternating prints every few steps of travel
+  const foot9 = (ent9) => {
+    if (ent9.gDeck != null) return;             // garage decks keep no snow
+    const px9 = ent9._mkPX === undefined ? ent9.x : ent9._mkPX;
+    const py9 = ent9._mkPY === undefined ? ent9.y : ent9._mkPY;
+    const d9 = dist(ent9.x, ent9.y, px9, py9);
+    ent9._mkD = (ent9._mkD || 0) + d9;
+    ent9._mkPX = ent9.x; ent9._mkPY = ent9.y;
+    if (d9 <= 0.01 || ent9._mkD < 9) return;
+    ent9._mkD = 0;
+    poolPickup9(ent9, ent9.x, ent9.y);
+    const k9 = trackKind9(ent9);
+    if (!k9) return;
+    ent9._mkSide = -(ent9._mkSide || 1);
+    const pa9 = ent9.angle + Math.PI / 2;
+    // a real boot print: toes to the travel direction, left/right mirrored
+    stampMark(ent9.x + Math.cos(pa9) * ent9._mkSide * 1.6, ent9.y + Math.sin(pa9) * ent9._mkSide * 1.6,
+      ent9.angle, 0.34 * ent9._mkSide, 0.62, k9, k9 === 'wet' ? 7 : k9 === 'snow' ? 45 : 25, 0.18, true);
+  };
+  if (!player.car && !player.dead && !player.rag) foot9(player);
+  for (const p9 of peds) if (!p9.dead && !p9.rag && !p9.riding) foot9(p9);
+  // wheels: paired dashes off the rear axle
+  for (const c9 of cars) {
+    if (c9.dead || Math.abs(c9.speed) < 10 || (c9.alt || 0) > 0.5 || c9.kind === 'boat' || c9.kind === 'helo') continue;
+    if (c9.gDeck != null) continue;
+    if (c9._mkPX === undefined) { c9._mkPX = c9.x; c9._mkPY = c9.y; c9._mkPA = c9.angle; continue; }
+    const px9 = c9._mkPX, py9 = c9._mkPY, pA9 = c9._mkPA;
+    const run9 = dist(c9.x, c9.y, px9, py9);
+    if (run9 < 16) continue;                     // the anchor is the LAST STAMP, not last frame
+    if (run9 > 70) { c9._mkPX = c9.x; c9._mkPY = c9.y; c9._mkPA = c9.angle; continue; }   // teleport: no cross-town ribbon
+    poolPickup9(c9, c9.x, c9.y);
+    const k9 = trackKind9(c9);
+    // SOLID LINES per tire (Tank order): each stamp is a ribbon segment
+    // spanning from the wheel's LAST stamped spot to its current one —
+    // consecutive segments touch, so the track reads as one drawn line
+    if (k9) {
+      const hw9 = c9.w * 0.42;
+      for (const s9 of [-1, 1]) {
+        const wx09 = px9 - Math.cos(pA9) * c9.len * 0.3 + Math.cos(pA9 + Math.PI / 2) * s9 * hw9;
+        const wy09 = py9 - Math.sin(pA9) * c9.len * 0.3 + Math.sin(pA9 + Math.PI / 2) * s9 * hw9;
+        const wx19 = c9.x - Math.cos(c9.angle) * c9.len * 0.3 + Math.cos(c9.angle + Math.PI / 2) * s9 * hw9;
+        const wy19 = c9.y - Math.sin(c9.angle) * c9.len * 0.3 + Math.sin(c9.angle + Math.PI / 2) * s9 * hw9;
+        const seg9 = dist(wx09, wy09, wx19, wy19);
+        if (seg9 < 1) continue;
+        stampMark((wx09 + wx19) / 2, (wy09 + wy19) / 2, Math.atan2(wy19 - wy09, wx19 - wx09),
+          0.32, seg9 * RS * 1.14, k9, k9 === 'wet' ? 6 : k9 === 'snow' ? 45 : 20, 0.18);
+      }
+    }
+    c9._mkPX = c9.x; c9._mkPY = c9.y; c9._mkPA = c9.angle;
+  }
+  // age + draw: hold, then shrink out; snow prints die with the melt
+  let any9 = false;
+  for (let i9 = 0; i9 < MARK_N; i9++) {
+    const m9 = marks9[i9];
+    if (!m9) continue;
+    const im9 = m9.foot ? footIM : markIM;
+    m9.t += dt;
+    const melt9 = m9.kind === 'snow' && WEATHER.snow < 0.05;
+    if (m9.t >= m9.life || melt9) {
+      marks9[i9] = null;
+      _mkS.set(0.0001, 0.0001, 0.0001);
+      _mkM.compose(_mkP.set(0, -10, 0), _mkQ.identity(), _mkS);
+      im9.setMatrixAt(i9, _mkM);
+      continue;
+    }
+    any9 = true;
+    const fade9 = m9.t > m9.life * 0.72 ? 1 - (m9.t - m9.life * 0.72) / (m9.life * 0.28) : 1;
+    _mkQ.setFromAxisAngle(_mkUP, -m9.yaw);
+    _mkQ.multiply(_mkQX);
+    _mkS.set(m9.sx * fade9, m9.sy * fade9, 1);
+    _mkM.compose(_mkP.set(m9.x, m9.h, m9.z), _mkQ, _mkS);
+    im9.setMatrixAt(i9, _mkM);
+  }
+  markIM.visible = any9;
+  footIM.visible = any9;
+  if (any9) { markIM.instanceMatrix.needsUpdate = true; footIM.instanceMatrix.needsUpdate = true; }
+}
+function ensureRainLoop9() {
+  if (!AC || WEATHER.rainSrc) return;
+  const len9 = AC.sampleRate * 2, buf9 = AC.createBuffer(1, len9, AC.sampleRate);
+  const d9 = buf9.getChannelData(0);
+  for (let i9 = 0; i9 < len9; i9++) d9[i9] = Math.random() * 2 - 1;
+  const src9 = AC.createBufferSource();
+  src9.buffer = buf9; src9.loop = true;
+  const f9 = AC.createBiquadFilter();
+  f9.type = 'lowpass'; f9.frequency.value = 1400;
+  const g9 = AC.createGain();
+  g9.gain.value = 0;
+  src9.connect(f9); f9.connect(g9); g9.connect(master || AC.destination);
+  src9.start();
+  WEATHER.rainSrc = src9; WEATHER.rainGain = g9;
+}
+const MENU_WX9 = ['rain', 'clear', 'snow', 'clear', 'snow', 'rain', 'clear'];   // Tank's showcase reel
+let menuWxI9 = 0;
+function updWeather(dt) {
+  const W9 = WEATHER;
+  // the spell clock — on the MENU the sky runs Tank's showcase reel at a
+  // brisk pace; in play, clear skies trade with rain or snow at random
+  W9.t -= dt;
+  if (W9.t <= 0) {
+    if (state === 'menu') {
+      W9.mode = MENU_WX9[menuWxI9++ % MENU_WX9.length];
+      W9.t = W9.mode === 'clear' ? 13 : 24;
+    } else if (W9.mode === 'clear') { W9.mode = Math.random() < 0.55 ? 'rain' : 'snow'; W9.t = rndf(55, 115); }
+    else { W9.mode = 'clear'; W9.t = rndf(100, 210); }
+  }
+  const want9 = W9.mode === 'clear' ? 0 : 1;
+  W9.inten += (want9 - W9.inten) * Math.min(1, dt * 0.4);
+  // ground memory: rain soaks then dries; snow lays, melts slow — fast in
+  // rain. The menu reel runs the ground 4× faster so the lay and the melt
+  // both SHOW inside the short showcase spells.
+  const gr9 = state === 'menu' ? 4 : 1;
+  if (W9.mode === 'rain' && W9.inten > 0.3) W9.wet = Math.min(1, W9.wet + dt * gr9 / 12);
+  else W9.wet = Math.max(0, W9.wet - dt * gr9 / 50);
+  const snowMode9 = W9.mode === 'snow' || W9.mode === 'blizzard';
+  if (snowMode9 && W9.inten > 0.3) W9.snow = Math.min(1, W9.snow + dt * gr9 / (W9.mode === 'blizzard' ? 18 : 45));
+  else W9.snow = Math.max(0, W9.snow - dt * gr9 / (W9.mode === 'rain' ? 30 : 110));
+  wetMat9.opacity = W9.wet * 0.34;
+  snowLayMat.opacity = W9.snow * 0.88;
+  pudMat9.opacity = W9.wet * 0.6;
+  // invisible sheets still rasterize the whole city — drop them from the
+  // frame entirely when dry/bare (a real fill-rate tax in clear weather)
+  wetSheet.visible = wetMat9.opacity > 0.01;
+  snowSheet.visible = snowLayMat.opacity > 0.01;
+  pudMesh9.visible = pudMat9.opacity > 0.01;
+  // the clouds ride the camera
+  rainGrp.position.set(camera.position.x, 0, camera.position.z);
+  const raining9 = W9.mode === 'rain' && W9.inten > 0.03;
+  const snowing9 = snowMode9 && W9.inten > 0.03;
+  rainLines.visible = raining9;
+  snowPts9.visible = snowing9;
+  rainMat.opacity = W9.inten * 0.5;
+  snowMat.opacity = W9.inten * (W9.mode === 'blizzard' ? 1.0 : 0.9);
+  snowMat.size = W9.mode === 'blizzard' ? 0.5 : 0.38;   // fat flakes in a whiteout
+  const wvx9 = (WIND.x || 0) * 9, wvz9 = (WIND.y || 0) * 9;
+  if (raining9) {
+    for (let i9 = 0; i9 < RAIN_N; i9++) {
+      let x9 = rainPts[i9 * 3], y9 = rainPts[i9 * 3 + 1], z9 = rainPts[i9 * 3 + 2];
+      y9 -= 150 * dt;
+      x9 += wvx9 * dt; z9 += wvz9 * dt;
+      if (y9 < 0) { y9 += RAIN_H; x9 = (Math.random() - 0.5) * RAIN_BOX; z9 = (Math.random() - 0.5) * RAIN_BOX; }
+      rainPts[i9 * 3] = x9; rainPts[i9 * 3 + 1] = y9; rainPts[i9 * 3 + 2] = z9;
+      rainPos.set([x9, y9, z9, x9 + wvx9 * 0.02, y9 + 3.4, z9 + wvz9 * 0.02], i9 * 6);
+    }
+    rainGeo.attributes.position.needsUpdate = true;
+  }
+  if (snowing9) {
+    for (let i9 = 0; i9 < SNOW_N; i9++) {
+      let x9 = snowPos[i9 * 3], y9 = snowPos[i9 * 3 + 1], z9 = snowPos[i9 * 3 + 2];
+      y9 -= (5.5 + (i9 % 5)) * dt;
+      x9 += (Math.sin(gtime * 1.4 + i9) * 1.6 + wvx9 * 0.45) * dt;
+      z9 += (Math.cos(gtime * 1.1 + i9 * 1.7) * 1.6 + wvz9 * 0.45) * dt;
+      if (y9 < 0) { y9 += RAIN_H; x9 = (Math.random() - 0.5) * RAIN_BOX; z9 = (Math.random() - 0.5) * RAIN_BOX; }
+      if (x9 > RAIN_BOX / 2) x9 -= RAIN_BOX; else if (x9 < -RAIN_BOX / 2) x9 += RAIN_BOX;
+      if (z9 > RAIN_BOX / 2) z9 -= RAIN_BOX; else if (z9 < -RAIN_BOX / 2) z9 += RAIN_BOX;
+      snowPos[i9 * 3] = x9; snowPos[i9 * 3 + 1] = y9; snowPos[i9 * 3 + 2] = z9;
+    }
+    snowGeoP.attributes.position.needsUpdate = true;
+  }
+  // puddle ripples answer the rain
+  ripIM.material.opacity = W9.wet * 0.5 * (raining9 ? 1 : 0.25);
+  ripIM.visible = W9.wet > 0.05;
+  if (ripIM.visible) {
+    const M9 = new THREE.Matrix4(), R9 = new THREE.Matrix4().makeRotationX(-Math.PI / 2);
+    for (const r9 of rips9) {
+      r9.age += dt * 1.4;
+      if (r9.age >= 1) {
+        if (!raining9) { r9.age = 1; continue; }
+        const p9 = puddleSpots9[(Math.random() * puddleSpots9.length) | 0];
+        if (!p9) continue;
+        r9.x = p9.x * RS + rndf(-p9.r, p9.r) * 0.5;
+        r9.z = p9.y * RS + rndf(-p9.r, p9.r) * 0.5;
+        r9.age = 0;
+      }
+      const s9 = 0.2 + r9.age * 2.6;
+      M9.makeScale(s9, s9, s9).multiply(R9);
+      M9.setPosition(r9.x, 0.17, r9.z);
+      ripIM.setMatrixAt(rips9.indexOf(r9), M9);
+    }
+    ripIM.instanceMatrix.needsUpdate = true;
+  }
+  // sky flashes + rolling thunder
+  if (W9.flash2 > 0) { W9.flash2 -= dt; if (W9.flash2 <= 0) W9.flashT = 0.12; }
+  if (W9.flashT > 0) W9.flashT -= dt;
+  hemiLight.intensity = HEMI_BASE + (W9.flashT > 0 ? clamp(W9.flashT / 0.2, 0, 1) * 5 : 0);
+  if (W9.mode === 'rain' && W9.inten > 0.5 && Math.random() < dt * 0.07) {
+    W9.flashT = 0.16;
+    W9.flash2 = rndf(0.15, 0.32);
+    W9.thunderQ.push({ d: rndf(0.5, 2.2) });
+  }
+  for (let i9 = W9.thunderQ.length - 1; i9 >= 0; i9--) {
+    W9.thunderQ[i9].d -= dt;
+    if (W9.thunderQ[i9].d <= 0) { sfx('thunder'); W9.thunderQ.splice(i9, 1); }
+  }
+  if (W9.boltT > 0) { W9.boltT -= dt; if (W9.boltT <= 0) boltGrp.visible = false; }
+  // the 0.001% bolt (per character, per moment, storms only)
+  if (W9.mode === 'rain' && W9.inten > 0.5 && state === 'play') {
+    if (!player.dead && Math.random() < W9.STRIKE_P) lightningStrike(player.x, player.y, player);
+    for (const p9 of peds) {
+      if (p9.dead) continue;
+      if (Math.random() < W9.STRIKE_P) { lightningStrike(p9.x, p9.y, p9); break; }
+    }
+  }
+  // the rain has a voice
+  ensureRainLoop9();
+  if (W9.rainGain) W9.rainGain.gain.value = muted ? 0 : (W9.mode === 'rain' ? W9.inten : 0) * 0.14;
+  // the moon hangs on the light's line; storm cover dims it
+  moonDisc.position.copy(camera.position).addScaledVector(MOON_DIR, 300);
+  moonDisc.lookAt(camera.position);
+  moonDisc.material.opacity = 1 - W9.inten * 0.75;
+  updDeepSnow(dt);                               // the blizzard drift, if any
+  updMarks(dt);                                  // the world remembers who moved through it
+}
 // the moon CASTS: a follow-box of real shadow around the player
 moonLight.castShadow = true;
 moonLight.shadow.mapSize.set(2048, 2048);
@@ -8984,10 +9657,18 @@ function steerCar(c, dA) {
 // tune-up garage upgrades scale the stock numbers
 function modF(c, key2) { return 1 + 0.12 * (c.mods ? c.mods[key2] : 0); }
 function carMaxHp(c) { return CAR_KINDS[c.kind].hp + 40 * (c.mods ? c.mods.arm : 0); }
+// WEATHER TRACTION (Tank's law): rain is slick, laying snow is WORSE —
+// and the bite loss ramps GRADUALLY with the ground coverage, hitting
+// full slip only on a solid cover. Deep powder adds its own drag.
+function weatherGrip(c) {
+  if (c && c.gDeck != null) return 1;            // garage decks stay dry
+  return clamp(1 - WEATHER.wet * 0.22 - WEATHER.snow * 0.5 - WEATHER.deep * 0.18, 0.3, 1);
+}
 function tireGrip(c, dt, gripScale) {
   const K = CAR_KINDS[c.kind];
-  let grip = K.grip * (gripScale || 1) * modF(c, 'grip');
-  c.skidding = Math.abs(c.latV) > K.skid * (gripScale || 1) * modF(c, 'grip');
+  const wg9 = weatherGrip(c);
+  let grip = K.grip * (gripScale || 1) * modF(c, 'grip') * wg9;
+  c.skidding = Math.abs(c.latV) > K.skid * (gripScale || 1) * modF(c, 'grip') * wg9;
   if (c.skidding) grip *= 0.55;                 // kinetic grip < static grip
   const dec = grip * dt;
   if (Math.abs(c.latV) <= dec) c.latV = 0;
@@ -13018,7 +13699,7 @@ function onClick() {
 // ---------------------------------------------------------------- update (sim)
 function update(dt) {
   pollPad(dt);
-  applyTouch();                     // the phone rig merges into the pad globals
+  applyTouch(dt);                   // the phone rig merges into the pad globals
   CORES.flush();                    // last frame's queued path plans hit the cores
   updMusic();
   updWind(dt);                                   // the one air state the world receives
@@ -13865,6 +14546,7 @@ const camPos = new THREE.Vector3(playerStart.x * RS, 10, playerStart.y * RS + 20
 const camLook = new THREE.Vector3(playerStart.x * RS, 3, playerStart.y * RS);
 function syncScene(dt, t) {
   updWindWorld(dt, t);                     // trees, grass, cloth, all on the one wind
+  updWeather(dt);                          // snow, rain, lightning — the sky's turn
   if (oceanWater) {
     oceanWater.material.uniforms['time'].value += dt * 0.6;   // normal-map shimmer
     waterT += dt;
@@ -15074,6 +15756,11 @@ function drawHUD(t) {
       hctx.fillText('[' + (i === 10 ? '0' : i) + '] ' + (sum || 'empty'), col, row);
     }
     hctx.textAlign = 'center';
+  }
+  // lightning: the sky blows white for a blink
+  if (state === 'play' && WEATHER.flashT > 0) {
+    hctx.fillStyle = 'rgba(224,238,255,' + (0.36 * clamp(WEATHER.flashT / 0.2, 0, 1)).toFixed(3) + ')';
+    hctx.fillRect(0, 0, VW, VH);
   }
   // ---- the phone thumb rig (Tank order): joystick ghost bottom-left
   // (live at wherever the thumb landed), buttons lit while held
@@ -17023,7 +17710,7 @@ if (location.hash === '#touch') {
     ckU('desktopClean', mobileFrom('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36', 0) === null);
     const wasOn9 = TOUCH.on;
     TOUCH.on = true;
-    ckU('mapShrinksOnPhone', touchMapW() === 132);
+    ckU('mapShrinksOnPhone', touchMapW() === 112);
     // the stick: anchor on the left, thumb pushed right+down
     TOUCH._start(7, VW * 0.2, VH * 0.6);
     TOUCH._move(7, VW * 0.2 + 40, VH * 0.6 + 22);
@@ -17060,8 +17747,174 @@ if (location.hash === '#touch') {
     ckU('dragLooks', Math.abs(mouseYaw - yaw09) > 0.2);
     TOUCH._end(21);
     ckU('desktopKeepsBigMap', (TOUCH.on = false, touchMapW() === 208));
+    TOUCH.on = true;
+    // WEAPON button (Tank order): tap cycles, hold opens the wheel and the
+    // thumb picks, release loads the pick
+    const wb9 = touchButtons().find(b2 => b2.n === 'weap');
+    const w09 = player.weapon;
+    TOUCH._start(31, wb9.x, wb9.y);
+    applyTouch(0.05);
+    TOUCH._end(31);
+    ckU('weapTapCycles', player.weapon === WORDER[(WORDER.indexOf(w09) + 1) % WORDER.length]);
+    TOUCH._start(32, wb9.x, wb9.y);
+    applyTouch(0.3);
+    ckU('weapHoldOpensWheel', wheelOpen === true && wheelSrc === 'touch');
+    TOUCH._move(32, wb9.x + 60, wb9.y);              // thumb drags RIGHT
+    const selPick9 = wheelSel;
+    TOUCH._end(32);
+    ckU('thumbPicksAndLoads', selPick9 === wheelSelFromAngle(0) && player.weapon === WORDER[selPick9] && !wheelOpen);
     TOUCH.on = wasOn9;
     console.log('TOUCHDBG ' + RU.join(' ') + ' fails=' + uFails);
+  }, 400);
+}
+if (location.hash === '#weather') {
+  // WEATHER receipt (Tank order): rain wets the ground and wakes the
+  // puddles, snow falls AND lays, clear skies dry and melt it all back,
+  // and the bolt hurts whoever it finds — at 0.001% per moment.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let wFails = 0;
+    const RW = [], ckW = (n9, v9) => { RW.push(n9 + '=' + v9); if (!v9) wFails++; };
+    ckW('strikeOddsAreTanks', WEATHER.STRIKE_P === 0.00001);
+    ckW('snowSheetSkipsWater', landRuns9.length > 50 && landRuns9.length < GRID_H * GRID_W / 4);
+    // RAIN: force the spell, run a wet minute
+    WEATHER.mode = 'rain'; WEATHER.t = 600; WEATHER.inten = 0; WEATHER.wet = 0;
+    for (let i9 = 0; i9 < 300; i9++) updWeather(0.1);
+    ckW('rainRampsIn', WEATHER.inten > 0.9);
+    ckW('groundSoaks', WEATHER.wet > 0.9 && wetMat9.opacity > 0.25);
+    ckW('rainFalls', rainLines.visible === true && rainMat.opacity > 0.3);
+    ckW('puddlesWake', pudMat9.opacity > 0.4 && ripIM.visible === true);
+    ckW('snowStaysAway', snowPts9.visible === false);
+    // the bolt: a ped takes 260 and flies
+    const zp9 = mkPed(player.x + 30, player.y, {});
+    attachPedMesh(zp9); peds.push(zp9);
+    const hp09 = zp9.hp;
+    lightningStrike(zp9.x, zp9.y, zp9);
+    ckW('boltHurtsPeds', zp9.hp <= hp09 - 260 && WEATHER.boltT > 0 && boltGrp.visible === true);
+    ckW('skyBlowsWhite', WEATHER.flashT > 0);
+    // the player is NOT exempt
+    const php9 = player.hp;
+    godMode = false;
+    lightningStrike(player.x, player.y, player);
+    ckW('boltHurtsTheGhost', player.hp < php9);
+    godMode = true;
+    // SNOW: switch spells, let it lay
+    WEATHER.mode = 'snow'; WEATHER.t = 600; WEATHER.snow = 0;
+    for (let i9 = 0; i9 < 400; i9++) updWeather(0.1);
+    ckW('snowFalls', snowPts9.visible === true && snowMat.opacity > 0.5);
+    ckW('snowLays', WEATHER.snow > 0.8 && snowLayMat.opacity > 0.6);
+    ckW('rainStops', rainLines.visible === false);
+    ckW('groundDries', WEATHER.wet < 0.2);
+    // CLEAR: the melt
+    WEATHER.mode = 'clear'; WEATHER.t = 600;
+    for (let i9 = 0; i9 < 1300; i9++) updWeather(0.1);
+    ckW('clearMeltsTheLay', WEATHER.snow < 0.05 && WEATHER.inten < 0.05);
+    // MARKS: the snow remembers feet and tires; pools track away
+    const nMk9 = () => marks9.filter(Boolean).length;
+    WEATHER.snow = 1; WEATHER.wet = 0;
+    let mk09 = nMk9();
+    for (let i9 = 0; i9 < 30; i9++) { player.x += 6; updMarks(0.05); }
+    ckW('feetPrintTheSnow', nMk9() > mk09 && marks9.some(m9 => m9 && m9.kind === 'snow' && m9.sx < 1));
+    const tcar9 = mkCar(player.x + 60, player.y + 40, 0, 'sedan', 'ai');
+    tcar9.keep = true; attachCarMesh(tcar9); cars.push(tcar9);
+    tcar9.speed = 80;
+    mk09 = nMk9();
+    for (let i9 = 0; i9 < 30; i9++) { tcar9.x += 7; updMarks(0.05); }
+    ckW('tiresTrackTheSnow', nMk9() > mk09 && marks9.some(m9 => m9 && m9.kind === 'snow' && m9.sy > 1));
+    // wet prints when the ground is soaked instead
+    WEATHER.snow = 0; WEATHER.wet = 1;
+    for (let i9 = 0; i9 < 20; i9++) { player.x += 6; updMarks(0.05); }
+    ckW('wetPrintsInRain', marks9.some(m9 => m9 && m9.kind === 'wet'));
+    // a fallen ped pools blood; walking through it tracks red away — even dry
+    WEATHER.wet = 0;
+    const bp9 = mkPed(player.x + 30, player.y, {});
+    attachPedMesh(bp9); peds.push(bp9);
+    bp9.dead = true;
+    updMarks(0.05);
+    ckW('bloodPools', pools9.some(p9 => p9.kind === 'blood') && marks9.some(m9 => m9 && m9.kind === 'blood' && m9.sx > 3));
+    player.x = bp9.x; player.y = bp9.y;
+    player._mkD = 99;
+    updMarks(0.05);
+    for (let i9 = 0; i9 < 10; i9++) { player.x += 6; updMarks(0.05); }
+    ckW('feetTrackBloodAway', marks9.some(m9 => m9 && m9.kind === 'blood' && m9.sx < 1));
+    // dead cars leak oil pools
+    tcar9.dead = true;
+    updMarks(0.05);
+    ckW('wrecksLeakOil', pools9.some(p9 => p9.kind === 'oil'));
+    // dry clean ground takes no prints
+    const mkDry9 = nMk9();
+    player._mkBlood = 0; player._mkOil = 0;
+    for (let i9 = 0; i9 < 20; i9++) { player.x += 6; updMarks(0.05); }
+    ckW('dryGroundKeepsNoPrints', nMk9() <= mkDry9);
+    // the console TEST TOOL: "weather rain|snow|lightning|clear"
+    runConsole('weather rain');
+    ckW('cmdRain', WEATHER.mode === 'rain' && WEATHER.t > 500);
+    runConsole('weather snow');
+    ckW('cmdSnow', WEATHER.mode === 'snow');
+    WEATHER.boltT = 0; WEATHER.flashT = 0;
+    runConsole('weather lightning');
+    ckW('cmdLightning', WEATHER.boltT > 0 && WEATHER.flashT > 0 && boltGrp.visible === true);
+    runConsole('weather clear');
+    ckW('cmdClear', WEATHER.mode === 'clear');
+    cheated = false;
+    runConsole('weather rain');
+    ckW('testToolLeavesNoBrand', cheated === false);
+    // TRACTION LAW: dry > wet > snow cover, ramping with coverage
+    WEATHER.wet = 0; WEATHER.snow = 0; WEATHER.deep = 0;
+    const gDry9 = weatherGrip();
+    WEATHER.wet = 1;
+    const gWet9 = weatherGrip();
+    WEATHER.wet = 0; WEATHER.snow = 0.5;
+    const gHalf9 = weatherGrip();
+    WEATHER.snow = 1;
+    const gSnow9 = weatherGrip();
+    WEATHER.snow = 0;
+    ckW('dryGripsFull', gDry9 === 1);
+    ckW('rainIsSlick', gWet9 < 1 && gWet9 > gSnow9);
+    ckW('snowRampsToFullSlip', gHalf9 > gSnow9 && gSnow9 <= 0.5);
+    // BLIZZARD: the console calls a whiteout, the powder RISES
+    runConsole('weather blizzard');
+    ckW('cmdBlizzard', WEATHER.mode === 'blizzard');
+    WEATHER.inten = 1;
+    for (let i9 = 0; i9 < 60; i9++) updWeather(0.1);
+    ckW('powderRises', WEATHER.deep > 0.1 && deepMesh.visible === true);
+    // the dig: walking presses a trail into the field (sampled at the far
+    // SE corner — near spawn the receipt's own peds already trampled it)
+    WEATHER.deep = 1;
+    const vx9 = (GRID_W - 6) * TILE, vy9 = (GRID_H - 6) * TILE;
+    const virgin9 = deepAt(vx9, vy9);
+    for (let i9 = 0; i9 < 12; i9++) digSnow(vx9, vy9, 6, 0.9);
+    ckW('feetCarveTrails', virgin9 > 0.9 && deepAt(vx9, vy9) < 0.45);
+    // the powder DRAGS: same push, deep drift vs plowed trail — measured
+    // on FRESH ground (the receipt loop already trampled the spawn spot)
+    player.x += 300;
+    player._wdPX = player.x; player._wdPY = player.y;
+    const px09 = player.x;
+    player.x += 10;
+    updDeepSnow(0.016);
+    const drift9 = player.x - px09;
+    for (let i9 = 0; i9 < 14; i9++) digSnow(player.x, player.y, 8, 0.95);
+    player._wdPX = player.x; player._wdPY = player.y;
+    const px19 = player.x;
+    player.x += 10;
+    updDeepSnow(0.016);
+    const plowed9 = player.x - px19;
+    ckW('deepSnowWades', drift9 < 7 && plowed9 > drift9);
+    // the MOON: hung on the light line, dimmed by storm cover
+    ckW('moonHangs', Math.abs(moonDisc.position.distanceTo(camera.position) - 300) < 2);
+    WEATHER.inten = 1;
+    updWeather(0.016);
+    const dim9 = moonDisc.material.opacity;
+    WEATHER.mode = 'clear'; WEATHER.t = 600; WEATHER.inten = 0;
+    updWeather(0.016);
+    ckW('stormDimsTheMoon', dim9 < 0.5 && moonDisc.material.opacity > 0.9);
+    // clear melts the drift back down
+    WEATHER.deep = 0.5;
+    for (let i9 = 0; i9 < 400; i9++) updWeather(0.1);
+    ckW('clearMeltsTheDrift', WEATHER.deep < 0.05);
+    runConsole('weather clear');
+    console.log('WTHDBG ' + RW.join(' ') + ' fails=' + wFails);
   }, 400);
 }
 if (location.hash === '#tbone') {
@@ -18690,7 +19543,7 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
 // never move. Compose them ONCE; dynamic subtrees (cars, peds, the player,
 // the flag, the save floppy, water) stay live.
 {
-  const dyn9 = new Set([player.mesh, ghostSeat, capitolFlagM, saveIcon, oceanWater].filter(Boolean));
+  const dyn9 = new Set([player.mesh, ghostSeat, capitolFlagM, saveIcon, oceanWater, moonDisc].filter(Boolean));   // the moon rides the camera
   for (const c9 of cars) if (c9.mesh) dyn9.add(c9.mesh);
   for (const p9 of peds) if (p9.mesh) dyn9.add(p9.mesh);
   let frozen9 = 0;

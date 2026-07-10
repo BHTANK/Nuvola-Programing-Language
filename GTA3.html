@@ -2319,7 +2319,11 @@ function setBarrier(which, on) {
     const cols = which === 2 ? [28, 29] : [108, 109];
     for (const bx of cols) for (const by of [100, 101]) solid[idx(bx, by)] = on ? 1 : 0;
   }
+  // the workers' grid mirror follows every bridge change (var flag: city
+  // gen runs at top-level eval, long before the CORES const exists)
+  if (_coresReady && CORES.on()) CORES.arm();
 }
+var _coresReady = false;
 genCity();
 // City-wide: NO two buildings may share a tile or a coplanar wall plane.
 // Applies to every style (tenement, commercial, civic, motel, towers, …).
@@ -10487,11 +10491,118 @@ function chaseWaypoint(o, tx, ty, dt, look) {
   if (o.pfT <= 0 || o.pfGi !== gi || o.pfGj !== gj) {
     o.pfT = 0.8 + Math.random() * 0.4;
     o.pfGi = gi; o.pfGj = gj;
-    o.pfWp = pathNext(o.x, o.y, tx, ty, look || 3);
+    if (CORES.on()) CORES.plan(o, o.x, o.y, tx, ty, look || 3);   // fresh leg lands async; walk the old one meanwhile
+    else o.pfWp = pathNext(o.x, o.y, tx, ty, look || 3);
   }
   if (o.pfWp && dist(o.x, o.y, o.pfWp.x, o.pfWp.y) < 30) o.pfT = 0;   // leg done: next
   return o.pfWp;
 }
+// ---- NUVOLA CORES (Tank order: use the machine's CPU cores) ----
+// Pursuit BFS is a pure function of the tile grid, and chaseWaypoint
+// already tolerates a sub-second-stale answer — so the sweep moves to a
+// worker pool holding its own mirror of the grid. A pursuer keeps walking
+// its old leg until the fresh waypoint lands (a frame or two later). The
+// worker BFS is the SAME algorithm, same tie-breaks — answers are exact.
+// No workers (or any debug hash) = the old synchronous path, unchanged.
+const CORES = (() => {
+  const pool9 = [], queue9 = [], wait9 = new Map();
+  let seq9 = 0, rr9 = 0, armed9 = false;
+  const stats9 = { workers: 0, jobs: 0, replies: 0 };
+  const src9 =
+    'let W=0,H=0,TILE=48,solid=null,prev=null,seen=null,q=null,stamp=0;\n' +
+    'function bfs(fx,fy,tx,ty,look){\n' +
+    ' const si=Math.floor(fx/TILE),sj=Math.floor(fy/TILE),gi=Math.floor(tx/TILE),gj=Math.floor(ty/TILE);\n' +
+    ' if(si<0||sj<0||si>=W||sj>=H||gi<0||gj<0||gi>=W||gj>=H)return null;\n' +
+    ' if(si===gi&&sj===gj)return{x:tx,y:ty};\n' +
+    ' if(++stamp===65535){seen.fill(0);stamp=1;}\n' +
+    ' let qh=0,qt=0;const start=sj*W+si,goal=gj*W+gi;\n' +
+    ' q[qt++]=start;seen[start]=stamp;prev[start]=-1;\n' +
+    ' let found=-1,guard=0;\n' +
+    ' while(qh<qt&&guard++<6000){\n' +
+    '  const cur=q[qh++];\n' +
+    '  if(cur===goal){found=cur;break;}\n' +
+    '  const ci=cur%W,cj=(cur/W)|0;\n' +
+    '  for(let k=0;k<4;k++){\n' +
+    '   const ni=ci+(k===0?1:k===1?-1:0),nj=cj+(k===2?1:k===3?-1:0);\n' +
+    '   if(ni<0||nj<0||ni>=W||nj>=H)continue;\n' +
+    '   const n=nj*W+ni;\n' +
+    '   if(seen[n]===stamp)continue;\n' +
+    '   if(solid[n]===1&&n!==goal)continue;\n' +
+    '   seen[n]=stamp;prev[n]=cur;q[qt++]=n;\n' +
+    '  }\n' +
+    ' }\n' +
+    ' if(found<0)return null;\n' +
+    ' const chain=[];\n' +
+    ' for(let n=found;n!==-1;n=prev[n])chain.push(n);\n' +
+    ' chain.reverse();\n' +
+    ' const k=Math.min(look||3,chain.length-1),n2=chain[k];\n' +
+    ' return{x:((n2%W)+0.5)*TILE,y:(((n2/W)|0)+0.5)*TILE};\n' +
+    '}\n' +
+    'onmessage=(e)=>{\n' +
+    ' const d=e.data;\n' +
+    ' if(d.grid){W=d.w;H=d.h;TILE=d.tile;solid=new Uint8Array(d.grid);prev=new Int32Array(W*H);seen=new Uint16Array(W*H);q=new Int32Array(W*H);stamp=0;return;}\n' +
+    ' const req=new Float64Array(d.req),n=req.length/6,out=new Float64Array(n*4);\n' +
+    ' for(let i=0;i<n;i++){\n' +
+    '  const r=bfs(req[i*6+1],req[i*6+2],req[i*6+3],req[i*6+4],req[i*6+5]);\n' +
+    '  out[i*4]=req[i*6];out[i*4+1]=r?1:0;out[i*4+2]=r?r.x:0;out[i*4+3]=r?r.y:0;\n' +
+    ' }\n' +
+    ' postMessage({res:out.buffer},[out.buffer]);\n' +
+    '};';
+  try {
+    const url9 = URL.createObjectURL(new Blob([src9], { type: 'text/javascript' }));
+    const n9 = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 2));
+    for (let i9 = 0; i9 < n9; i9++) {
+      const w9 = new Worker(url9);
+      w9.onmessage = (e9) => {
+        const out9 = new Float64Array(e9.data.res);
+        for (let j9 = 0; j9 < out9.length; j9 += 4) {
+          const o9 = wait9.get(out9[j9]);
+          if (!o9) continue;
+          wait9.delete(out9[j9]);
+          o9.pfWp = out9[j9 + 1] ? { x: out9[j9 + 2], y: out9[j9 + 3] } : null;
+          stats9.replies++;
+        }
+      };
+      w9.onerror = () => {};
+      pool9.push(w9);
+    }
+    stats9.workers = pool9.length;
+  } catch (e9) { /* no worker support: the synchronous path below covers it */ }
+  return {
+    stats: stats9,
+    _force: false,                     // receipts flip this to exercise the live path
+    on() { return armed9 && pool9.length > 0 && (!location.hash || this._force); },
+    arm() {
+      if (!pool9.length) return;
+      for (const w9 of pool9) w9.postMessage({ grid: solid.slice(0).buffer, w: GRID_W, h: GRID_H, tile: TILE });
+      armed9 = true;
+    },
+    plan(o9, fx9, fy9, tx9, ty9, look9) {
+      if (o9._pfId === undefined) o9._pfId = ++seq9;
+      if (wait9.has(o9._pfId)) return;             // one in flight per pursuer
+      wait9.set(o9._pfId, o9);
+      queue9.push(o9._pfId, fx9, fy9, tx9, ty9, look9 || 3);
+      stats9.jobs++;
+    },
+    flush() {
+      if (!queue9.length || !pool9.length) return;
+      const f9 = new Float64Array(queue9);
+      queue9.length = 0;
+      pool9[rr9++ % pool9.length].postMessage({ req: f9.buffer }, [f9.buffer]);
+    },
+    // receipt hooks: push one raw batch through worker wi and promise the reply
+    probeOn(wi9, reqs9) {
+      return new Promise((res9) => {
+        const w9 = pool9[wi9 % pool9.length];
+        const old9 = w9.onmessage;
+        w9.onmessage = (e9) => { w9.onmessage = old9; res9(new Float64Array(e9.data.res)); };
+        const f9 = new Float64Array(reqs9);
+        w9.postMessage({ req: f9.buffer }, [f9.buffer]);
+      });
+    }
+  };
+})();
+_coresReady = true;
 // feet: walk the path leg by leg (moveCircle soaks up props on the way)
 function chaseWalk(p, tx, ty, spd, dt) {
   const wp = chaseWaypoint(p, tx, ty, dt, 3);
@@ -12622,6 +12733,7 @@ function onClick() {
 // ---------------------------------------------------------------- update (sim)
 function update(dt) {
   pollPad(dt);
+  CORES.flush();                    // last frame's queued path plans hit the cores
   updMusic();
   updWind(dt);                                   // the one air state the world receives
   // FORBIDDEN TERRITORY: an island with no freed bridge is a military zone.
@@ -16387,7 +16499,91 @@ if (location.hash === '#perf') {
       ' flatCasters=' + flat + ' callsWithShadowPass=' + c1 + ' callsWithout=' + c2 +
       ' shadowPassCalls=' + (c1 - c2) + ' tris=' + Math.round(t1 / 1000) + 'k | ' +
       [...mats.entries()].sort((a, b) => b[1] - a[1]).map(e9 => e9[0] + 'x' + e9[1]).join(' '));
+    // CPU side: where the main-thread milliseconds actually go
+    let tU9 = 0, tR9 = 0, tH9 = 0;
+    const N9 = 180;
+    for (let i9 = 0; i9 < N9; i9++) {
+      let t09 = performance.now(); update(1 / 60); tU9 += performance.now() - t09;
+      t09 = performance.now(); renderGPU(); tR9 += performance.now() - t09;
+      t09 = performance.now(); drawHUD(gtime); tH9 += performance.now() - t09;
+    }
+    console.log('PERFCPU updateMs=' + (tU9 / N9).toFixed(2) + ' renderMs=' + (tR9 / N9).toFixed(2) +
+      ' hudMs=' + (tH9 / N9).toFixed(2) + ' cores=' + navigator.hardwareConcurrency);
+    // can this file:// page spin real workers off a blob?
+    try {
+      const w9 = new Worker(URL.createObjectURL(new Blob(['onmessage=e=>postMessage(e.data*2)'], { type: 'text/javascript' })));
+      w9.onmessage = e9 => console.log('PERFWRK roundtrip=' + e9.data + ' ok=' + (e9.data === 42));
+      w9.onerror = e9 => console.log('PERFWRK error: ' + e9.message);
+      w9.postMessage(21);
+    } catch (e9) { console.log('PERFWRK blocked: ' + e9.message); }
   }, 1500);
+}
+if (location.hash === '#cores') {
+  // NUVOLA CORES receipt (Tank order: use the CPU cores to extend
+  // potential): the worker pool mirrors the tile grid and runs pursuit
+  // BFS off the main thread. Prove — pool alive, worker answers EXACTLY
+  // match the main-thread pathNext (same algorithm, same tie-breaks), a
+  // live async waypoint lands on a pursuer, and a heavy batch spread over
+  // the pool beats the main thread doing the same work.
+  window._noRender = true;
+  startGame();
+  setTimeout(async () => {
+    let cFails = 0;
+    const RC = [], ckC = (n9, v9) => { RC.push(n9 + '=' + v9); if (!v9) cFails++; };
+    ckC('poolAlive', CORES.stats.workers >= 1);
+    CORES._force = true;
+    CORES.arm();
+    // open tiles to route between
+    const pts9 = [];
+    let tries9 = 0;
+    while (pts9.length < 120 && tries9++ < 6000) {
+      const ix9 = 2 + ((Math.random() * (GRID_W - 4)) | 0), iy9 = 2 + ((Math.random() * (GRID_H - 4)) | 0);
+      if (solid[iy9 * GRID_W + ix9] !== 1) pts9.push([(ix9 + 0.5) * TILE, (iy9 + 0.5) * TILE]);
+    }
+    const reqs9 = [];
+    for (let i9 = 0; i9 + 1 < pts9.length; i9 += 2)
+      reqs9.push(i9, pts9[i9][0], pts9[i9][1], pts9[i9 + 1][0], pts9[i9 + 1][1], 3);
+    const out9 = await CORES.probeOn(0, reqs9);
+    let match9 = 0, total9 = 0;
+    for (let i9 = 0; i9 + 1 < pts9.length; i9 += 2) {
+      const ref9 = pathNext(pts9[i9][0], pts9[i9][1], pts9[i9 + 1][0], pts9[i9 + 1][1], 3);
+      const j9 = (i9 / 2) * 4;
+      total9++;
+      const hitOk9 = (out9[j9 + 1] === 1) === !!ref9;
+      const xyOk9 = !ref9 || (Math.abs(out9[j9 + 2] - ref9.x) < 0.01 && Math.abs(out9[j9 + 3] - ref9.y) < 0.01);
+      if (hitOk9 && xyOk9) match9++;
+    }
+    ckC('exactParity', total9 >= 40 && match9 === total9);
+    // a live pursuer: plan queued, flushed, answer lands ASYNC off-thread
+    const fake9 = { x: pts9[0][0], y: pts9[0][1] };
+    chaseWaypoint(fake9, pts9[1][0], pts9[1][1], 1, 3);
+    CORES.flush();
+    await new Promise(r9 => setTimeout(r9, 150));
+    ckC('liveWaypointLands', fake9.pfWp !== undefined && CORES.stats.replies > 0);
+    // the ceiling: the same heavy batch, main thread vs the pool
+    const heavy9 = [];
+    for (let r9 = 0; r9 < 20; r9++)
+      for (let i9 = 0; i9 + 1 < pts9.length; i9 += 2)
+        heavy9.push(heavy9.length, pts9[i9][0], pts9[i9][1], pts9[i9 + 1][0], pts9[i9 + 1][1], 3);
+    const nJobs9 = heavy9.length / 6;
+    let t09 = performance.now();
+    for (let i9 = 0; i9 < heavy9.length; i9 += 6)
+      pathNext(heavy9[i9 + 1], heavy9[i9 + 2], heavy9[i9 + 3], heavy9[i9 + 4], heavy9[i9 + 5]);
+    const mainMs9 = performance.now() - t09;
+    const nW9 = Math.max(1, CORES.stats.workers);
+    const per9 = Math.ceil(nJobs9 / nW9) * 6;
+    t09 = performance.now();
+    await Promise.all(Array.from({ length: nW9 }, (_, w9) => {
+      const s9 = heavy9.slice(w9 * per9, (w9 + 1) * per9);
+      return s9.length ? CORES.probeOn(w9, s9) : Promise.resolve(null);
+    }));
+    const poolMs9 = performance.now() - t09;
+    ckC('poolCarriesTheLoad', poolMs9 > 0 && poolMs9 < Math.max(mainMs9 * 1.25, mainMs9 + 4));
+    CORES._force = false;
+    RC.push('jobs=' + nJobs9 + ' mainMs=' + mainMs9.toFixed(1) + ' poolMs=' + poolMs9.toFixed(1) +
+      ' workers=' + nW9 + ' speedup=' + (poolMs9 > 0 ? (mainMs9 / poolMs9).toFixed(2) : '-') + 'x');
+    console.log('CORDBG ' + RC.join(' ') + ' fails=' + cFails);
+  }, 800);
 }
 if (location.hash === '#tbone') {
   // T-BONE receipt (Tank: "the windows and doors was not affected"): a hard
@@ -18236,6 +18432,9 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
   for (const o9 of texM9) o9.parent.remove(o9);
   console.log('GPUMERGE2 texturedMeshes=' + texM9.length + ' buckets=' + buckets9.size);
 }
+// the city is final — mirror the tile grid into the worker cores
+CORES.arm();
+console.log('CORES ' + CORES.stats.workers + ' workers armed with the ' + GRID_W + 'x' + GRID_H + ' grid');
   console.log('GTA3 BOOT OK — buildings=' + buildings.length + ' lamps=' + lamps.length + ' peds=' + peds.length + ' cars=' + cars.length);
   console.log('CITYARCH styles=' + Object.keys(styles).map(k => k + ':' + styles[k]).join(' '));
 })();

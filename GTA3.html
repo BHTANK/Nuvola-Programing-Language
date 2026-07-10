@@ -1598,6 +1598,19 @@ const crosswalks = [];   // corner crossing points: { x, y, to: [far corners], k
 // crossings alternate — traffic flows in waves) and per-axis green splits
 // (4-way = even; T junction = long through / short single-lane stem).
 const TL_PERIOD = 16, TL_YELLOW = 1.5;           // one loop for the whole city
+// NUVOLA MOTORS (Tank order): the display floor derives from CAR_KINDS —
+// every ROAD model is on the lot today, and every future model joins
+// automatically. The cruiser (police property) and the Veloce (island-3
+// exclusive reward) stay off the floor.
+const dealerPads = [];
+let dealerLot = null;
+function dealerRoster() {
+  return Object.keys(CAR_KINDS).filter(k => CAR_KINDS[k].fuelCap && k !== 'cop' && k !== 'veloce');
+}
+function dealerPrice(kind) {
+  const k = CAR_KINDS[kind];
+  return Math.round((k.max * 5 + k.hp * 4) / 100) * 100;
+}
 const trafficLights = [];                        // { x, y, key } pole spots (logic px)
 const tlGrid = new Map();                        // tile key -> pole indices (feet + car hits)
 let tlMeshes = null;                             // instanced pole/housing meshes
@@ -1729,7 +1742,7 @@ function genCity() {
     '4,16': 'rowhouse', '16,16': 'tenement', '28,16': 'park', '40,16': 'docks',
     '4,28': 'tenement', '16,28': 'police', '28,28': 'tenement', '40,28': 'docks',
     '4,40': 'motel', '16,40': 'hospital', '28,40': 'bank', '40,40': 'docks',
-    '4,52': 'industry', '16,52': 'tenement', '28,52': 'rowhouse', '40,52': 'docks',
+    '4,52': 'industry', '16,52': 'tenement', '28,52': 'dealer', '40,52': 'docks',
     // multi-storey parkade on the industrial strip (island 0 — was missing)
     '4,64': 'garage', '16,64': 'construction', '28,64': 'tenement', '40,64': 'docks',
     '4,76': 'gas', '16,76': 'industry', '28,76': 'rowhouse', '40,76': 'docks',
@@ -1986,6 +1999,17 @@ function genCity() {
         buildings.push({ tx: x0 + 1, ty: y0 + 1, tw: 6, th: 2, floors: 1.65, tint: 0xd4c4a4, tex: 'motel', style: 'motel', sign: 'motel' });
         markSolidRect(x0 + 1, y0 + 3, 2, 4);
         buildings.push({ tx: x0 + 1, ty: y0 + 3, tw: 2, th: 4, floors: 1.65, tint: 0xd4c4a4, tex: 'motel', style: 'motel' });
+      } else if (kind === 'dealer') {
+        // NUVOLA MOTORS: a small glass-front showroom and the whole road
+        // roster angled on display pads out front, restocked as it sells
+        paveAll(x0, y0);
+        markSolidRect(x0 + 1, y0 + 1, 3, 2);
+        buildings.push({
+          tx: x0 + 1, ty: y0 + 1, tw: 3, th: 2, floors: 1.6,
+          tint: 0x3e5468, tex: 'conc', style: 'commercial',
+          store: false, wt: false, bill: false, crown: false, sign: 'dealer'
+        });
+        dealerLot = { x0, y0 };                  // pads spring from the roster
       } else if (kind === 'projects') {
         // identical housing slabs in a row
         paveAll(x0, y0);
@@ -2481,7 +2505,7 @@ function districtAt(x, y) {
 // human labels for district kinds + signed buildings (HUD + minimap)
 const DISTRICT_LABELS = {
   hospital: 'Hospital', police: 'Police precinct', bank: 'Bank', mall: 'Mall',
-  motel: 'Motel', gas: 'Gas station', church: 'Chapel', capitol: 'State capitol',
+  motel: 'Motel', gas: 'Gas station', church: 'Chapel', capitol: 'State capitol', dealer: 'Car dealership',
   stadium: 'Stadium', garage: 'Parking garage', commercial: 'Commercial',
   tenement: 'Tenements', rowhouse: 'Row houses', towers: 'Towers',
   projects: 'Housing projects', industry: 'Industry', docks: 'Docks',
@@ -2498,7 +2522,8 @@ const LANDMARK_META = {
   apts: { name: 'HARBOR ARMS', letter: 'A', color: '#8fffb0' },
   capitol: { name: 'STATE CAPITOL', letter: 'C', color: '#e8e0c0' },
   church: { name: 'CHAPEL', letter: '+', color: '#ffd98a' },
-  mod: { name: 'TUNE-UP SHOP', letter: 'U', color: '#c890ff' }
+  mod: { name: 'TUNE-UP SHOP', letter: 'U', color: '#c890ff' },
+  dealer: { name: 'NUVOLA MOTORS', letter: 'D', color: '#7dd4ff' }
 };
 const landmarks = [];
 function rebuildLandmarks() {
@@ -2596,11 +2621,27 @@ const CAR_KINDS = {
   // the VELOCE — F40-class exotic (original design, no badge): fastest iron
   // in the city, fragile, found ONLY on Capitol Shores (island 3)
   veloce: { hp: 75, max: 420, color: 0xd21818, len: 39, w: 20, grip: 1020, skid: 275, fuelCap: 13, mass: 0.8 },
+  // the HUMVEE: military iron with an M2 ring — 360°, all elevations,
+  // fifty-cal death on the fire button. Lives at the base AND the car lot.
+  humvee: { hp: 260, max: 230, color: 0x4a5240, len: 48, w: 26, grip: 900, skid: 220, fuelCap: 25, mass: 2.4 },
   tank: { hp: 1000, max: 150, color: 0x4a5a3a, len: 64, w: 30, grip: 4000, skid: 9999, mass: 8.0 },
   helo: { hp: 500, max: 250, color: 0x3c452e, len: 54, w: 14, grip: 900, skid: 9999, mass: 2.0 },
   boat: { hp: 140, max: 230, color: 0xe8e4da, len: 52, w: 20, grip: 300, skid: 90, mass: 1.4 }
 };
 const CAR_COLORS = [0x3a5f9e, 0x8a2f2f, 0x3f7d4a, 0x7a4f8a, 0xb8b8be, 0x2f2f36, 0xa05c28, 0x4f7d8a];
+// the dealership floor: one pad per road model, laid out now that the
+// model book exists (genCity runs before CAR_KINDS initializes)
+if (dealerLot) {
+  const ros9 = dealerRoster();
+  for (let i = 0; i < ros9.length; i++) {
+    dealerPads.push({
+      x: (dealerLot.x0 + 1.4 + (i % 4) * 1.8) * TILE,
+      y: (dealerLot.y0 + 4.5 + Math.floor(i / 4) * 1.8) * TILE,
+      ang: -Math.PI / 2 + 0.35,
+      kind: ros9[i], restockT: 0
+    });
+  }
+}
 
 function mkCar(x, y, dir, kind, driver) {
   const k = CAR_KINDS[kind];
@@ -2729,7 +2770,7 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
 // GPU PIPELINE (Tank order: use the card — zero assets, zero load time):
 // real shadow maps + filmic tone mapping; the glow pass lives below
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.shadowMap.autoUpdate = false;         // refreshed on a cadence in renderGPU
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
@@ -2769,10 +2810,12 @@ const GLOW = { on: true };
     { tex: { value: null }, glow: { value: null }, k: { value: 0.85 } });
 }
 function renderGPU() {
-  // the shadow map redraws the whole city — every OTHER frame is invisible
-  // to the eye and halves the heaviest pass
-  GLOW.frame = (GLOW.frame || 0) + 1;
-  renderer.shadowMap.needsUpdate = (GLOW.frame & 1) === 0;
+  // the shadow map redraws EVERY live frame — always in sync with the
+  // screen (Tank: quality is never taken away; speed comes from making
+  // the passes cheaper, not from shedding them). Paused frames skip the
+  // depth pass for free — nothing moves, nothing changes.
+  renderer.shadowMap.needsUpdate = _shadowDirty;
+  _shadowDirty = false;
   if (!GLOW.on) { renderer.render(scene, camera); return; }
   renderer.setRenderTarget(GLOW.rtScene);
   renderer.render(scene, camera);
@@ -2814,11 +2857,14 @@ scene.add(moonLight);
 // the moon CASTS: a follow-box of real shadow around the player
 moonLight.castShadow = true;
 moonLight.shadow.mapSize.set(2048, 2048);
-moonLight.shadow.camera.near = 20;
-moonLight.shadow.camera.far = 520;
+moonLight.shadow.camera.near = 40;
+moonLight.shadow.camera.far = 460;
 moonLight.shadow.camera.left = -160; moonLight.shadow.camera.right = 160;
 moonLight.shadow.camera.top = 160; moonLight.shadow.camera.bottom = -160;
-moonLight.shadow.bias = -0.0006;
+// normalBias beats depth bias for acne on big flat faces; the tiny depth
+// bias just cleans the leftovers
+moonLight.shadow.bias = -0.0002;
+moonLight.shadow.normalBias = 1.0;
 scene.add(moonLight.target);
 { // moon + stars
   const moon = new THREE.Mesh(new THREE.SphereGeometry(9, 12, 12), new THREE.MeshBasicMaterial({ color: 0xd8dcf0, fog: false }));
@@ -3313,6 +3359,7 @@ const waterRects = [];
   // 300+ units reads identical). Single biggest driving-FPS recovery.
   const obr9 = oceanWater.onBeforeRender;
   let mtick9 = 0;
+  const mirHid9 = [];
   oceanWater.onBeforeRender = function () {
     mtick9++;
     const ctx9 = camera.position.x / (TILE * RS), ctz9 = camera.position.z / (TILE * RS);
@@ -3323,7 +3370,20 @@ const waterRects = [];
       if (dx9 * dx9 + dz9 * dz9 < 26 * 26) { near9 = true; break; }
     }
     if (mtick9 % (near9 ? 2 : 8) !== 0) return;
+    // the reflection pass sees EVERY car and ped in the city — but past
+    // ~120 units a reflected car is sub-pixel in the ripples. Hide the far
+    // dynamics for this one internal render; the screen pass never changes.
+    const cx9 = camera.position.x, cz9 = camera.position.z;
+    mirHid9.length = 0;
+    const cull9 = (m9, r9c) => {
+      if (!m9 || !m9.visible) return;
+      const dx9 = m9.position.x - cx9, dz9 = m9.position.z - cz9;
+      if (dx9 * dx9 + dz9 * dz9 > r9c * r9c) { m9.visible = false; mirHid9.push(m9); }
+    };
+    for (const c9 of cars) cull9(c9.mesh, 120);
+    for (const p9 of peds) cull9(p9.mesh, 60);
     obr9.apply(this, arguments);
+    for (const m9 of mirHid9) m9.visible = true;
   };
 }
 // seafloor: one merged mesh, vertex depth = average of the 4 surrounding
@@ -3895,6 +3955,7 @@ const TEXS = {
     apts: signTexture('#2a2018', '#ffd9a0', 'HARBOR ARMS', false),
     capitol: signTexture('#3a3628', '#f0ead2', 'STATE CAPITOL', false),
     mod: signTexture('#170f2e', '#c890ff', 'TUNE-UP GARAGE', false),
+    dealer: signTexture('#0e2a3e', '#7dd4ff', 'NUVOLA MOTORS', false),
     church: signTexture('#241c14', '#ffe9b0', 'FIRST CHAPEL', false),
     hotdog: signTexture('#7a1f1f', '#ffe9b0', 'HOT DOGS $10', false)
   }
@@ -5127,11 +5188,21 @@ function _bladeMatrix(i) {
   _wwM.compose(_wwV.set(bl.x * RS, 0, bl.y * RS), _wwQ, _wwS.set(1, bl.s, 1));
   bladeIM.setMatrixAt(i, _wwM);
 }
+let _shadowDirty = true, _moonSX = 1e9, _moonSZ = 1e9;
 function updWindWorld(dt, t) {
-  // the moon's shadow box rides the player across the city
+  // SHADOW STABILITY (Tank: blotchy, blinking): the box SNAPS to an 8-unit
+  // grid — between snaps the shadow camera is rock still, so the texel
+  // grid never crawls. The map still redraws every 2nd frame so moving
+  // cars carry their shadows; a static camera makes that redraw invisible.
+  _shadowDirty = true;
   const fm9 = focus();
-  moonLight.position.set(fm9.x * RS + 120, 200, fm9.y * RS + 60);
-  moonLight.target.position.set(fm9.x * RS, 0, fm9.y * RS);
+  const sx9 = Math.round(fm9.x * RS / 8) * 8, sz9 = Math.round(fm9.y * RS / 8) * 8;
+  if (sx9 !== _moonSX || sz9 !== _moonSZ) {
+    _moonSX = sx9; _moonSZ = sz9;
+    moonLight.position.set(sx9 + 120, 200, sz9 + 60);
+    moonLight.target.position.set(sx9, 0, sz9);
+    _shadowDirty = true;
+  }
   // the GPU wind uniforms: every blade in the city sways in the shader
   GPUWIND.wind.value.set(WIND.x * 0.85, WIND.y * 0.85);
   GPUWIND.time.value = gtime;
@@ -7262,6 +7333,31 @@ function buildCarMesh(c) {
       scoop.position.set(cabRX - 0.4, 1.02, s * (W / 2 + 0.04));
       g.add(scoop);
     }
+  } else if (c.kind === 'humvee') {
+    // the M2 RING: turret base on the roof, a rotating mount with a gun
+    // shield, and the fifty on its own pitch pivot — 360° and all heights
+    const ringM = new THREE.MeshLambertMaterial({ color: 0x3a4034 });
+    const ring = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 1.5, 0.3, 10), ringM);
+    ring.position.set(0.4, 3.15, 0);
+    g.add(ring);
+    const tur = new THREE.Group();
+    tur.position.set(0.4, 3.3, 0);
+    const shield = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.9, 1.4), ringM);
+    shield.position.set(0.75, 0.45, 0);
+    tur.add(shield);
+    const gunG = new THREE.Group();
+    gunG.position.set(0.2, 0.55, 0);
+    const recv = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.3, 0.26), new THREE.MeshLambertMaterial({ color: 0x1c1e22 }));
+    recv.position.set(0.3, 0, 0);
+    gunG.add(recv);
+    const brl = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.09, 1.5, 6), new THREE.MeshLambertMaterial({ color: 0x26282e }));
+    brl.rotation.z = Math.PI / 2;
+    brl.position.set(1.55, 0.03, 0);
+    gunG.add(brl);
+    tur.add(gunG);
+    g.add(tur);
+    g.userData.hmvTurret = tur;
+    g.userData.hmvGun = gunG;
   }
   g.userData.bodyMat = bodyMat;
   g.userData.cabMat = cabMat;
@@ -11181,6 +11277,19 @@ function tryEnterExit() {
 }
 // boarding: jack the driver if there is one, take the wheel, wear the heat
 function enterCar(bc) {
+  // NUVOLA MOTORS: display iron is LOCKED until it's paid for — E buys it
+  // on the spot if the pocket covers the sticker
+  if (bc.dealer) {
+    const pr9 = dealerPrice(bc.kind);
+    if (player.cash < pr9) {
+      msg('NUVOLA MOTORS — ' + bc.kind.toUpperCase() + ': $' + pr9 + '. It\'s locked, and you\'re short.', 5);
+      return;
+    }
+    player.cash -= pr9;
+    bc.dealer = false;
+    msg('SOLD — ' + bc.kind.toUpperCase() + ', $' + pr9 + '. Full tank. She\'s yours.', 6);
+    sfx('pickup');
+  }
   doorSwing(bc, -1);                         // in through the driver's door
   if (bc.driver === 'ai') {
     if (bc.kind === 'cop') {
@@ -12774,6 +12883,26 @@ function update(dt) {
       pc.turret += angDiff(pc.turret, mouseYaw) * Math.min(1, dt * 6);   // mouse aims the turret
       pc.fireT -= dt;
       if ((mdown || padTankFire) && pc.fireT <= 0) { pc.fireT = 1.1; rumble(0.9, 0.3, 260); fireShell(pc, pc.turret, clamp(-mousePitch, 0, 0.785)); }   // pad: LB fires, RT is gas
+    } else if (pc.kind === 'humvee') {
+      // the M2 ring rides the CROSSHAIR: 360° yaw, all elevations — and the
+      // fire button pours fifty-cal at whatever sits in front of the muzzle
+      pc.turret += angDiff(pc.turret, mouseYaw) * Math.min(1, dt * 10);
+      pc.tpitch = clamp(-mousePitch, -0.55, 1.0);
+      pc.fireT -= dt;
+      if ((mdown || padTankFire) && pc.fireT <= 0) {
+        pc.fireT = 0.13;
+        const ct9 = crosshairPoint();
+        const mx9 = pc.x + Math.cos(pc.turret) * 26, my9 = pc.y + Math.sin(pc.turret) * 26;
+        const muzH9 = 5.1;
+        const ctD9 = Math.max(40, dist(mx9, my9, ct9.x, ct9.y));
+        const vh09 = clamp((ct9.h - muzH9) * 1400 / ctD9, -1400, 1400);
+        spawnBullet(mx9, my9, Math.cos(pc.turret) * 1400, Math.sin(pc.turret) * 1400, 0.8, 60, 16, 'p', muzH9, vh09);
+        addPart(mx9 + Math.cos(pc.turret) * 3, my9 + Math.sin(pc.turret) * 3, muzH9, 0, 0, 0, 0.05, 0xffe9a0, 1.7, true);
+        sfx('pistol');
+        rumble(0.25, 0.15, 90);
+        gunfireWitnessed();
+        scare(pc.x, pc.y, 260);
+      }
     } else if (pc.kind !== 'helo' && !cutscene && WEAPONS[player.weapon].thrown) {
       // grenades OUT THE WINDOW: same gauged arm as on foot — and the arm
       // you boarded with is still cooking. Have a plan.
@@ -12785,16 +12914,11 @@ function update(dt) {
         player.gCook = 0;
       }
     }
-    // reversing: the camera swings to look BEHIND the car; forward brings it home
-    if (pc.speed < -12) pc.revCamT = Math.min(1, (pc.revCamT || 0) + dt * 2.2);
-    else if (pc.speed > 6) pc.revCamT = Math.max(0, (pc.revCamT || 0) - dt * 2.6);
-    if (pc.revCamT > 0.02) {
-      mouseYaw += angDiff(mouseYaw, pc.angle + Math.PI * pc.revCamT) * Math.min(1, dt * 4);
-    } else if (Math.abs(pc.speed) > 8 && performance.now() - lastMouseMove > (pc.kind === 'tank' ? 3000 : 250)) {
-      // rolling: the camera comes home 0.25s after the player stops moving
-      // it — a TANK holds the gunner's line for a full 3s (shooting behind
-      // you is legal). Parked: fully free, it stays wherever you put it.
-      mouseYaw += angDiff(mouseYaw, pc.angle) * Math.min(1, dt * 2);
+    // FREE-FLOWING camera (Tank order): reverse NEVER hijacks the look —
+    // the mouse owns the camera in every vehicle. Idle auto-center only
+    // kicks in after a full 3 hands-off seconds, and gently.
+    if (Math.abs(pc.speed) > 8 && performance.now() - lastMouseMove > 3000) {
+      mouseYaw += angDiff(mouseYaw, pc.angle) * Math.min(1, dt * 1.2);
     }
     if (pc.hp < 15 && !godMode) {
       pc.burnT += dt;
@@ -13257,6 +13381,27 @@ function update(dt) {
   // chapel) — ensureShopkeeps is idempotent, so run it on a slow clock
   restaffT -= dt;
   if (restaffT <= 0) { restaffT = 25; ensureShopkeeps(); }
+  // NUVOLA MOTORS restock: an empty pad gets its model back on the floor
+  for (const dp9 of dealerPads) {
+    dp9.restockT -= dt;
+    if (dp9.restockT > 0) continue;
+    dp9.restockT = 5;
+    let has9 = false, clear9 = true;
+    for (const c9 of cars) {
+      if (c9.dead) continue;
+      const dd9 = dist(c9.x, c9.y, dp9.x, dp9.y);
+      if (c9.dealer && dd9 < 40) { has9 = true; break; }
+      if (dd9 < 55) clear9 = false;
+    }
+    if (has9 || !clear9 || dist(dp9.x, dp9.y, player.x, player.y) < 90) continue;
+    const nc9 = mkCar(dp9.x, dp9.y, 0, dp9.kind, null);
+    nc9.angle = dp9.ang;
+    nc9.dealer = true;
+    nc9.keep = true;
+    nc9.fuel = nc9.fuelCap;                    // full tank on the lot
+    attachCarMesh(nc9);
+    cars.push(nc9);
+  }
   for (let i = peds.length - 1; i >= 0; i--) {
     const p = peds[i];
     const d = dist(p.x, p.y, f.x, f.y);
@@ -13281,6 +13426,7 @@ function update(dt) {
     if (c !== player.car && c.driver === null) {
       const exempt =
         (mission && (mission.car === c || (mission.chasers && mission.chasers.indexOf(c) >= 0))) ||
+        c.dealer ||                              // the floor never gets towed
         (garagePad && dist(c.x, c.y, garagePad.x, garagePad.y) < 60);
       if (exempt) c.abandonT = 0;
       else {
@@ -13388,6 +13534,10 @@ function syncScene(dt, t) {
       for (const wr of c.mesh.userData.wheelRolls) wr.rotation.z = -c.wheelRoll;
     }
     if (c.mesh.userData.turret) c.mesh.userData.turret.rotation.y = -(c.turret - c.angle);
+    if (c.mesh.userData.hmvTurret) {
+      c.mesh.userData.hmvTurret.rotation.y = -((c.turret === undefined ? c.angle : c.turret) - c.angle);
+      c.mesh.userData.hmvGun.rotation.z = c.tpitch || 0;
+    }
     if (c.mesh.userData.copR) {
       if (c.driver === 'cop') {              // responding: bar flashes
         const flash = ((t * 6) | 0) % 2 === 0;
@@ -14583,6 +14733,28 @@ function spawnHomeTank() {
   return tk;
 }
 spawnHomeTank();
+// THE BASE HUMVEE (Tank order): military iron with the M2 ring, parked on
+// the base pad next to the tank — full tank of diesel, waiting
+function spawnHomeHumvee() {
+  const hv = mkCar(armyBase.x + 100, armyBase.y + 60, 3, 'humvee', null);
+  hv.keep = true;
+  hv.homeHumvee = true;
+  hv.fuel = hv.fuelCap;
+  const hx0 = Math.floor(hv.x / TILE), hy0 = Math.floor(hv.y / TILE);
+  placed: for (let r = 0; r < 20; r++) {
+    for (let iy = hy0 - r; iy <= hy0 + r; iy++)
+      for (let ix = hx0 - r; ix <= hx0 + r; ix++) {
+        if (Math.max(Math.abs(ix - hx0), Math.abs(iy - hy0)) !== r) continue;
+        const tt = tileAt(ix, iy);
+        if (tt !== T_LOT && tt !== T_GRASS) continue;
+        hv.x = (ix + 0.5) * TILE; hv.y = (iy + 0.5) * TILE;
+        if (!carHitsSolid(hv)) break placed;
+      }
+  }
+  attachCarMesh(hv);
+  cars.push(hv);
+}
+spawnHomeHumvee();
 // THE VELOCE (Tank order): one F40-class exotic, parked by the Capitol —
 // obtainable ONLY on Capitol Shores. Never enters traffic or parking pools.
 function spawnVeloce() {
@@ -15990,6 +16162,84 @@ if (location.hash === '#chapel') {
   }
   console.log('CHPDBG ' + RC.join(' ') + ' fails=' + cFails);
 }
+if (location.hash === '#humvee') {
+  // HUMVEE receipt (Tank order): M2 ring tracks the crosshair 360°/all
+  // heights, fire button pours .50 at rate, the base has one parked, the
+  // dealer floor carries the model — and REVERSE never steals the camera,
+  // in the humvee, the tank, or anything else.
+  window._noRender = true;
+  startGame();
+  let hvFails = 0;
+  const RH = [], ckH = (n, v) => { RH.push(n + '=' + v); if (!v) hvFails++; };
+  ckH('modelExists', !!CAR_KINDS.humvee && CAR_KINDS.humvee.fuelCap === 25);
+  ckH('onTheDealerFloor', dealerRoster().includes('humvee'));
+  ckH('parkedAtTheBase', cars.some(c9 => c9.kind === 'humvee' && c9.homeHumvee));
+  const hv9 = mkCar(29 * TILE, 60 * TILE, 0, 'humvee', 'player');
+  hv9.keep = true; attachCarMesh(hv9); cars.push(hv9);
+  player.car = hv9; player.x = hv9.x; player.y = hv9.y;
+  godMode = true; pardonMode = true;
+  mouseYaw = 2.2; mousePitch = -0.4;
+  for (let i = 0; i < 90; i++) update(1 / 60);
+  ckH('turretTracksCamera', Math.abs(angDiff(hv9.turret, 2.2)) < 0.05);
+  ckH('allHeightAngles', Math.abs(hv9.tpitch - 0.4) < 0.01);
+  const b0 = bullets.length;
+  mdown = true;
+  for (let i = 0; i < 60; i++) update(1 / 60);
+  mdown = false;
+  const fired9 = bullets.filter(b9 => b9.dmg === 60).length;
+  ckH('fiftyCalPours', fired9 >= 5 && fired9 <= 10);   // 0.13s rate over 1s
+  ckH('deathPerRound', bullets.length > b0 && (bullets[bullets.length - 1].dmg === 60));
+  // REVERSE never hijacks the camera — humvee, tank, anything
+  mouseYaw = 2.5;
+  for (let i = 0; i < 60; i++) { hv9.speed = -60; lastMouseMove = performance.now(); update(1 / 60); }
+  ckH('reverseCamFree', Math.abs(angDiff(mouseYaw, 2.5)) < 0.02);
+  const tk9 = cars.find(c9 => c9.kind === 'tank');
+  player.car = tk9; player.x = tk9.x; player.y = tk9.y;
+  mouseYaw = 1.1;
+  for (let i = 0; i < 60; i++) { tk9.speed = -40; lastMouseMove = performance.now(); update(1 / 60); }
+  ckH('tankReverseCamFree', Math.abs(angDiff(mouseYaw, 1.1)) < 0.02);
+  player.car = null;
+  console.log('HMVDBG ' + RH.join(' ') + ' fails=' + hvFails);
+}
+if (location.hash === '#dealer') {
+  // NUVOLA MOTORS receipt (Tank order): a lot with a showroom + every road
+  // model on display, locked until paid, full tanks, restocked as it sells.
+  window._noRender = true;
+  startGame();
+  let dlFails = 0;
+  const RDl = [], ckDl = (n, v) => { RDl.push(n + '=' + v); if (!v) dlFails++; };
+  ckDl('lotOnTheMap', landmarks.some(L9 => L9.sign === 'dealer'));
+  ckDl('padsMatchRoster', dealerPads.length === dealerRoster().length && dealerPads.length >= 4);
+  ckDl('exclusivesOffTheFloor', !dealerRoster().includes('cop') && !dealerRoster().includes('veloce'));
+  for (let i = 0; i < 60 * 7; i++) update(1 / 60);
+  const floor9 = cars.filter(c9 => c9.dealer && !c9.dead);
+  ckDl('floorStocked', floor9.length === dealerPads.length);
+  ckDl('fullTanks', floor9.every(c9 => c9.fuel === c9.fuelCap));
+  const buy9 = floor9[0];
+  player.x = buy9.x + 14; player.y = buy9.y;
+  player.cash = 0;
+  enterCar(buy9);
+  ckDl('lockedWhenBroke', buy9.dealer === true && player.car !== buy9);
+  player.cash = 9999;
+  const px9 = dealerPrice(buy9.kind);
+  enterCar(buy9);
+  ckDl('purchaseWorks', buy9.dealer === false && player.car === buy9 && player.cash === 9999 - px9);
+  buy9.x += 700; player.x = buy9.x; player.y = buy9.y;   // drive it off the lot
+  for (let i = 0; i < 60 * 9; i++) update(1 / 60);
+  ckDl('padRestocks', cars.filter(c9 => c9.dealer && !c9.dead).length === dealerPads.length);
+  console.log('DLRDBG ' + RDl.join(' ') + ' fails=' + dlFails);
+}
+if (location.hash === '#dealerview') {
+  // eyes-check: the showroom + display rows
+  startGame();
+  scene.fog = null;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+  for (let i = 0; i < 60 * 7; i++) update(1 / 60);       // let the floor stock
+  player.x = dealerPads[1].x + 30; player.y = dealerPads[0].y + 170;
+  player.angle = -Math.PI / 2;
+  mouseYaw = camYaw = -Math.PI / 2; mousePitch = 0.2; camZoom = 1.7;
+  for (let i = 0; i < 40; i++) syncScene(1 / 60, i / 60);
+}
 if (location.hash === '#phonebooth') {
   // eyes-check: the payphone kiosk at spot 0
   startGame();
@@ -16100,10 +16350,44 @@ if (location.hash === '#gpu') {
     ckG('acesToneMapping', renderer.toneMapping === THREE.ACESFilmicToneMapping);
     ckG('glowSized', GLOW.rtScene.width > 2 && GLOW.rtA.width > 2);
     ckG('gpuWindCompiled', window.__gpuWindOK === true);
-    ckG('moonFollowsPlayer', Math.abs(moonLight.target.position.x - player.x * RS) < 2);
+    ckG('moonFollowsPlayer', Math.abs(moonLight.target.position.x - player.x * RS) <= 8.01);   // 8-unit snap grid
     RG.push('drawCalls=' + renderer.info.render.calls + ' tris=' + Math.round(renderer.info.render.triangles / 1000) + 'k');
     console.log('GPUDBG ' + RG.join(' ') + ' fails=' + gFails);
   }, 900);
+}
+if (location.hash === '#perf') {
+  // FRAME-COST profiler (Tank: hold 60+, target ~120, at FULL quality):
+  // counts what each pass is actually paying for — meshes, shadow casters,
+  // flat-on-ground casters (dead weight in the depth pass), draw calls of
+  // a real frame with and without the shadow redraw, materials by kind.
+  startGame();
+  setTimeout(() => {
+    scene.updateMatrixWorld(true);
+    let nM = 0, nIM = 0, casts = 0, flat = 0;
+    const mats = new Map(), bb9 = new THREE.Box3();
+    scene.traverse(o9 => {
+      if (o9.isInstancedMesh) { nIM++; return; }
+      if (!o9.isMesh) return;
+      nM++;
+      if (o9.castShadow) {
+        casts++;
+        bb9.setFromObject(o9);
+        if (bb9.max.y < 0.35) flat++;
+      }
+      const m9 = Array.isArray(o9.material) ? o9.material[0] : o9.material;
+      if (m9 && m9.type) { const k9 = (m9.map ? 'tex' : 'plain') + ':' + m9.type.replace('Mesh', '').replace('Material', '') + (Array.isArray(o9.material) ? '[multi]' : ''); mats.set(k9, (mats.get(k9) || 0) + 1); }
+    });
+    renderer.info.autoReset = false;
+    renderer.info.reset(); renderer.shadowMap.needsUpdate = true; renderGPU();
+    const c1 = renderer.info.render.calls, t1 = renderer.info.render.triangles;
+    renderer.info.reset(); renderer.shadowMap.needsUpdate = false; renderGPU();
+    const c2 = renderer.info.render.calls;
+    renderer.info.autoReset = true;
+    console.log('PERFDBG meshes=' + nM + ' instanced=' + nIM + ' casters=' + casts +
+      ' flatCasters=' + flat + ' callsWithShadowPass=' + c1 + ' callsWithout=' + c2 +
+      ' shadowPassCalls=' + (c1 - c2) + ' tris=' + Math.round(t1 / 1000) + 'k | ' +
+      [...mats.entries()].sort((a, b) => b[1] - a[1]).map(e9 => e9[0] + 'x' + e9[1]).join(' '));
+  }, 1500);
 }
 if (location.hash === '#tbone') {
   // T-BONE receipt (Tank: "the windows and doors was not affected"): a hard
@@ -17750,6 +18034,207 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
   };
   for (const ch9 of scene.children) freeze9(ch9);
   console.log('GPUSTATIC ' + frozen9 + ' static matrices frozen (' + dyn9.size + ' dynamic roots live)');
+}
+// STATIC WORLD MERGE (Tank: full quality, 60+ always, ~120 target): every
+// tiny plain-color box costs a full CPU draw call in EVERY pass — main,
+// mirror, shadow. Bake all inert plain-Lambert / plain-Basic statics into
+// ONE mesh per material kind, material color moved to vertex colors —
+// pixel-identical Lambert math, thousands of draw calls collapse to two.
+// Anything that ever moves, blinks, toggles or pools stays live: dynamic
+// roots, bridge barriers, beams/rings, invisible pools, textured or
+// transparent or emissive materials.
+{
+  const skip9 = new Set();
+  const skipRoot9 = (r9) => { if (r9 && r9.traverse) r9.traverse(o9 => skip9.add(o9)); };
+  for (const g9 of barrierGroups) skipRoot9(g9);
+  skipRoot9(typeof objBeam !== 'undefined' ? objBeam : null);
+  skipRoot9(typeof fareBeam !== 'undefined' ? fareBeam : null);
+  skipRoot9(typeof fareRing !== 'undefined' ? fareRing : null);
+  skipRoot9(typeof aimRing !== 'undefined' ? aimRing : null);
+  skipRoot9(player.mesh); skipRoot9(ghostSeat); skipRoot9(capitolFlagM); skipRoot9(saveIcon);
+  for (const c9 of cars) skipRoot9(c9.mesh);
+  for (const p9 of peds) skipRoot9(p9.mesh);
+  scene.updateMatrixWorld(true);
+  const lamb9 = [], basi9 = [];
+  let skipped9 = 0;
+  scene.traverse(o9 => {
+    if (!o9.isMesh || o9.isInstancedMesh || skip9.has(o9)) return;
+    if (!o9.visible || o9.matrixAutoUpdate) return;          // pools / live movers
+    for (let p9 = o9.parent; p9; p9 = p9.parent) if (skip9.has(p9) || !p9.visible) return;
+    const m9 = o9.material;
+    if (!m9 || Array.isArray(m9) || m9.map || m9.transparent || m9.opacity < 1) return;
+    if (m9.blending !== THREE.NormalBlending) return;
+    if (!o9.geometry.attributes.position) return;
+    if (m9.type === 'MeshLambertMaterial') {
+      if (m9.emissive && (m9.emissive.r || m9.emissive.g || m9.emissive.b)) return;
+      if (!o9.geometry.attributes.normal) { skipped9++; return; }
+      lamb9.push(o9);
+    } else if (m9.type === 'MeshBasicMaterial') basi9.push(o9);
+  });
+  const bake9 = (list9, mat9, wantNor9) => {
+    let nv9 = 0, ni9 = 0;
+    for (const o9 of list9) {
+      const g9 = o9.geometry;
+      nv9 += g9.attributes.position.count;
+      ni9 += g9.index ? g9.index.count : g9.attributes.position.count;
+    }
+    const pos9 = new Float32Array(nv9 * 3), col9 = new Float32Array(nv9 * 3);
+    const nor9 = wantNor9 ? new Float32Array(nv9 * 3) : null;
+    const idx9 = new Uint32Array(ni9);
+    let vo9 = 0, io9 = 0;
+    const v9 = new THREE.Vector3(), nm9 = new THREE.Matrix3();
+    for (const o9 of list9) {
+      const g9 = o9.geometry, pa9 = g9.attributes.position, na9 = g9.attributes.normal;
+      const mc9 = o9.material.color;
+      // ground/patch meshes carry their paint IN vertex colors already —
+      // the shader multiplies material color × vertex color, so the bake
+      // must do exactly that (stamping material color alone whited them out)
+      const ca9 = (o9.material.vertexColors && g9.attributes.color) ? g9.attributes.color : null;
+      if (nor9) nm9.getNormalMatrix(o9.matrixWorld);
+      for (let i9 = 0; i9 < pa9.count; i9++) {
+        const w9 = (vo9 + i9) * 3;
+        v9.fromBufferAttribute(pa9, i9).applyMatrix4(o9.matrixWorld);
+        pos9[w9] = v9.x; pos9[w9 + 1] = v9.y; pos9[w9 + 2] = v9.z;
+        if (nor9 && na9) {
+          v9.fromBufferAttribute(na9, i9).applyMatrix3(nm9).normalize();
+          nor9[w9] = v9.x; nor9[w9 + 1] = v9.y; nor9[w9 + 2] = v9.z;
+        }
+        col9[w9] = mc9.r * (ca9 ? ca9.getX(i9) : 1);
+        col9[w9 + 1] = mc9.g * (ca9 ? ca9.getY(i9) : 1);
+        col9[w9 + 2] = mc9.b * (ca9 ? ca9.getZ(i9) : 1);
+      }
+      if (g9.index) { for (let i9 = 0; i9 < g9.index.count; i9++) idx9[io9 + i9] = g9.index.getX(i9) + vo9; io9 += g9.index.count; }
+      else { for (let i9 = 0; i9 < pa9.count; i9++) idx9[io9 + i9] = vo9 + i9; io9 += pa9.count; }
+      vo9 += pa9.count;
+    }
+    const gg9 = new THREE.BufferGeometry();
+    gg9.setAttribute('position', new THREE.BufferAttribute(pos9, 3));
+    if (nor9) gg9.setAttribute('normal', new THREE.BufferAttribute(nor9, 3));
+    gg9.setAttribute('color', new THREE.BufferAttribute(col9, 3));
+    gg9.setIndex(new THREE.BufferAttribute(idx9, 1));
+    const mm9 = new THREE.Mesh(gg9, mat9);
+    mm9.castShadow = true;                         // both kinds cast, exactly as they did unmerged
+    mm9.receiveShadow = wantNor9;                  // receiving is a lit-material concept — Basic ignores it
+    mm9.frustumCulled = false;                     // the city is always on screen
+    mm9.matrixAutoUpdate = false; mm9.updateMatrix();
+    scene.add(mm9);
+    return mm9;
+  };
+  if (lamb9.length) bake9(lamb9, new THREE.MeshLambertMaterial({ vertexColors: true }), true);
+  if (basi9.length) bake9(basi9, new THREE.MeshBasicMaterial({ vertexColors: true }), false);
+  for (const o9 of lamb9) o9.parent.remove(o9);
+  for (const o9 of basi9) o9.parent.remove(o9);
+  console.log('GPUMERGE lambert=' + lamb9.length + ' basic=' + basi9.length + ' noNormalSkipped=' + skipped9);
+  // phase 2 — TEXTURED statics. A multi-material box pays one draw call
+  // PER FACE GROUP (a facade building = up to 6 calls) in every pass.
+  // Textures are shared via the TEXS cache, so bucketing groups by exact
+  // material signature (same map + colors + side) collapses hundreds of
+  // buildings into one draw call per signature. A mesh merges only if
+  // EVERY group qualifies — anything transparent keeps the whole mesh live.
+  const texM9 = [];
+  scene.traverse(o9 => {
+    if (!o9.isMesh || o9.isInstancedMesh || skip9.has(o9)) return;
+    if (!o9.visible || o9.matrixAutoUpdate) return;
+    for (let p9 = o9.parent; p9; p9 = p9.parent) if (skip9.has(p9) || !p9.visible) return;
+    const g9 = o9.geometry;
+    if (!g9.attributes.position || !g9.attributes.normal || !g9.attributes.uv) return;
+    const mats9 = Array.isArray(o9.material) ? o9.material : [o9.material];
+    if (!mats9.length || !mats9.some(m9 => m9 && m9.map)) return;   // plains handled in phase 1
+    for (const m9 of mats9) {
+      if (!m9 || m9.transparent || m9.opacity < 1 || m9.blending !== THREE.NormalBlending) return;
+      if (m9.type !== 'MeshLambertMaterial' && m9.type !== 'MeshBasicMaterial') return;
+    }
+    texM9.push(o9);
+  });
+  const buckets9 = new Map();
+  // buildings CLONE the shared TEXS textures to vary their repeat — same
+  // image, fresh uuid. Key on the IMAGE and bake each clone's uv transform
+  // into the merged uvs (fract sampling is identical either way); the
+  // per-building tints ride the vertex colors.
+  const imgIds9 = new Map();
+  let imgSeq9 = 0;
+  const imgId9 = (t9) => {
+    if (!t9 || !t9.image) return '-';
+    if (!imgIds9.has(t9.image)) imgIds9.set(t9.image, ++imgSeq9);
+    return imgIds9.get(t9.image) + '/' + t9.wrapS + '/' + t9.wrapT + '/' + t9.magFilter + '/' + t9.minFilter;
+  };
+  for (const o9 of texM9) {
+    const g9 = o9.geometry;
+    const mats9 = Array.isArray(o9.material) ? o9.material : [o9.material];
+    const grps9 = (g9.groups && g9.groups.length) ? g9.groups
+      : [{ start: 0, count: g9.index ? g9.index.count : g9.attributes.position.count, materialIndex: 0 }];
+    for (const gr9 of grps9) {
+      if (!gr9.count) continue;
+      const m9 = mats9[gr9.materialIndex] || mats9[0];
+      const k9 = m9.type + '|' + imgId9(m9.map) +
+        '|' + (m9.emissive ? m9.emissive.getHexString() : '-') + '|' + m9.side;
+      let b9 = buckets9.get(k9);
+      if (!b9) { b9 = { mat: m9, parts: [], nv: 0, ni: 0 }; buckets9.set(k9, b9); }
+      b9.parts.push({ o9, gr9, m9 });
+      b9.nv += g9.attributes.position.count;
+      b9.ni += gr9.count;
+    }
+  }
+  const v9 = new THREE.Vector3(), nm9 = new THREE.Matrix3();
+  for (const b9 of buckets9.values()) {
+    const isLam9 = b9.mat.type === 'MeshLambertMaterial';
+    const pos9 = new Float32Array(b9.nv * 3), uv9 = new Float32Array(b9.nv * 2), tcol9 = new Float32Array(b9.nv * 3);
+    const nor9 = isLam9 ? new Float32Array(b9.nv * 3) : null;
+    const idx9 = new Uint32Array(b9.ni);
+    let vo9 = 0, io9 = 0;
+    const uvv9 = new THREE.Vector3();
+    for (const { o9, gr9, m9 } of b9.parts) {
+      const g9 = o9.geometry, pa9 = g9.attributes.position, na9 = g9.attributes.normal, ua9 = g9.attributes.uv;
+      const tc9 = m9.color;
+      const ca9 = (m9.vertexColors && g9.attributes.color) ? g9.attributes.color : null;
+      const mp9 = m9.map;
+      let uvM9 = null;
+      if (mp9) { mp9.updateMatrix(); uvM9 = mp9.matrix; }
+      if (nor9) nm9.getNormalMatrix(o9.matrixWorld);
+      for (let i9 = 0; i9 < pa9.count; i9++) {
+        const w9 = (vo9 + i9) * 3;
+        v9.fromBufferAttribute(pa9, i9).applyMatrix4(o9.matrixWorld);
+        pos9[w9] = v9.x; pos9[w9 + 1] = v9.y; pos9[w9 + 2] = v9.z;
+        if (nor9) {
+          v9.fromBufferAttribute(na9, i9).applyMatrix3(nm9).normalize();
+          nor9[w9] = v9.x; nor9[w9 + 1] = v9.y; nor9[w9 + 2] = v9.z;
+        }
+        uvv9.set(ua9.getX(i9), ua9.getY(i9), 1);
+        if (uvM9) uvv9.applyMatrix3(uvM9);
+        uv9[(vo9 + i9) * 2] = uvv9.x; uv9[(vo9 + i9) * 2 + 1] = uvv9.y;
+        tcol9[w9] = tc9.r * (ca9 ? ca9.getX(i9) : 1);
+        tcol9[w9 + 1] = tc9.g * (ca9 ? ca9.getY(i9) : 1);
+        tcol9[w9 + 2] = tc9.b * (ca9 ? ca9.getZ(i9) : 1);
+      }
+      for (let i9 = 0; i9 < gr9.count; i9++)
+        idx9[io9 + i9] = (g9.index ? g9.index.getX(gr9.start + i9) : gr9.start + i9) + vo9;
+      io9 += gr9.count;
+      vo9 += pa9.count;
+    }
+    const gg9 = new THREE.BufferGeometry();
+    gg9.setAttribute('position', new THREE.BufferAttribute(pos9, 3));
+    if (nor9) gg9.setAttribute('normal', new THREE.BufferAttribute(nor9, 3));
+    gg9.setAttribute('uv', new THREE.BufferAttribute(uv9, 2));
+    gg9.setAttribute('color', new THREE.BufferAttribute(tcol9, 3));
+    gg9.setIndex(new THREE.BufferAttribute(idx9, 1));
+    const bm9 = b9.mat.clone();
+    bm9.color.set(0xffffff); bm9.vertexColors = true;   // tint now rides the verts
+    if (bm9.map) {
+      // the uv transform is baked into the merged uvs — the bucket's map
+      // must sample with an identity transform
+      bm9.map = bm9.map.clone();
+      bm9.map.offset.set(0, 0); bm9.map.repeat.set(1, 1); bm9.map.rotation = 0;
+      bm9.map.updateMatrix();
+      bm9.map.needsUpdate = true;
+    }
+    const mm9 = new THREE.Mesh(gg9, bm9);
+    mm9.castShadow = true; mm9.receiveShadow = true;
+    mm9.frustumCulled = false;
+    mm9.matrixAutoUpdate = false; mm9.updateMatrix();
+    scene.add(mm9);
+  }
+  for (const o9 of texM9) o9.parent.remove(o9);
+  console.log('GPUMERGE2 texturedMeshes=' + texM9.length + ' buckets=' + buckets9.size);
 }
   console.log('GTA3 BOOT OK — buildings=' + buildings.length + ' lamps=' + lamps.length + ' peds=' + peds.length + ' cars=' + cars.length);
   console.log('CITYARCH styles=' + Object.keys(styles).map(k => k + ':' + styles[k]).join(' '));

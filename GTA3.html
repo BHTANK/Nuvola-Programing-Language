@@ -17737,9 +17737,15 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
   let frozen9 = 0;
   const freeze9 = (o9) => {
     if (dyn9.has(o9)) return;
-    o9.updateMatrix();
-    o9.matrixAutoUpdate = false;
-    frozen9++;
+    // ONLY visible static meshes freeze. Everything pooled (bullets,
+    // shells, grenades, flame/smoke sprites, gibs) boots INVISIBLE and
+    // must stay live — the first freeze pass locked every projectile in
+    // the game at the origin. Lights, sprites and groups stay live too.
+    if ((o9.isMesh || o9.isInstancedMesh) && o9.visible) {
+      o9.updateMatrix();
+      o9.matrixAutoUpdate = false;
+      frozen9++;
+    }
     for (const ch9 of o9.children) freeze9(ch9);
   };
   for (const ch9 of scene.children) freeze9(ch9);

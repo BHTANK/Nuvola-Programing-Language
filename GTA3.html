@@ -248,6 +248,96 @@ function padTrigLabel(which) {
 function dz(v) { return Math.abs(v) < 0.16 ? 0 : v; }
 let remapMode = null;   // { idx } while capturing a custom layout
 let trigCal = null;     // trigger calibration capture: { phase 'rt'|'lt', rest snapshots, best channel }
+// ---- MOBILE TOUCH RIG (Tank order): Android AND iPhone get the same
+// controls — floating thumb joystick on the left, GAS / BRAKE / FIRE /
+// USE thumb buttons on the right, drag-to-look on the free right area,
+// and a simpler HUD with a smaller map. Everything feeds the SAME pad
+// globals the gamepad uses, so every vehicle and weapon path just works.
+function mobileFrom(ua9, maxTouch9) {
+  if (/Android/i.test(ua9)) return 'android';
+  if (/iPhone|iPad|iPod/i.test(ua9)) return 'ios';
+  if ((maxTouch9 || 0) > 1 && /Macintosh/i.test(ua9)) return 'ios';   // iPadOS masquerades as a Mac
+  return null;
+}
+const MOBILE = mobileFrom(navigator.userAgent, navigator.maxTouchPoints);
+const TOUCH = {
+  on: !!MOBILE,
+  stick: null,                  // { id, ax, ay, dx, dy } floating joystick
+  look: null,                   // { id, lx, ly } camera drag
+  held: {},                     // button name -> touch id (ids can be 0!)
+  useEdge: false
+};
+function touchMapW() { return TOUCH.on ? 112 : 208; }   // phone screens get the small map
+function touchButtons() {
+  // context layout: driving shows the pedals, on foot FIRE takes the big
+  // bottom-right spot — all sized for thumbs, off the screen edges
+  const r9 = clamp(Math.min(VW, VH) * 0.075, 34, 54);
+  const b9 = [];
+  if (player.car) {
+    b9.push({ n: 'gas', label: 'GAS', x: VW - r9 - 24, y: VH - r9 - 46, r: r9 * 1.15 });
+    b9.push({ n: 'brake', label: 'BRK', x: VW - r9 * 3.5 - 30, y: VH - r9 - 24, r: r9 });
+    b9.push({ n: 'fire', label: 'FIRE', x: VW - r9 - 30, y: VH - r9 * 3.7 - 50, r: r9 });
+    b9.push({ n: 'use', label: 'USE', x: VW - r9 * 3.6 - 36, y: VH - r9 * 3.3 - 32, r: r9 * 0.85 });
+  } else {
+    b9.push({ n: 'fire', label: 'FIRE', x: VW - r9 - 24, y: VH - r9 - 46, r: r9 * 1.15 });
+    b9.push({ n: 'use', label: 'USE', x: VW - r9 * 3.5 - 30, y: VH - r9 - 24, r: r9 });
+  }
+  return b9;
+}
+TOUCH._start = (id9, x9, y9) => {
+  for (const b9 of touchButtons()) {
+    if (Math.hypot(x9 - b9.x, y9 - b9.y) <= b9.r * 1.25) {
+      TOUCH.held[b9.n] = id9;
+      if (b9.n === 'use') TOUCH.useEdge = true;
+      return;
+    }
+  }
+  if (x9 < VW * 0.42) { TOUCH.stick = { id: id9, ax: x9, ay: y9, dx: 0, dy: 0 }; return; }
+  TOUCH.look = { id: id9, lx: x9, ly: y9 };
+};
+TOUCH._move = (id9, x9, y9) => {
+  if (TOUCH.stick && TOUCH.stick.id === id9) {
+    TOUCH.stick.dx = clamp(x9 - TOUCH.stick.ax, -60, 60);
+    TOUCH.stick.dy = clamp(y9 - TOUCH.stick.ay, -60, 60);
+  } else if (TOUCH.look && TOUCH.look.id === id9) {
+    mouseYaw += (x9 - TOUCH.look.lx) * 0.0062;
+    mousePitch = clamp(mousePitch + (y9 - TOUCH.look.ly) * 0.005, -1.45, 1.45);
+    TOUCH.look.lx = x9; TOUCH.look.ly = y9;
+    lastMouseMove = performance.now();
+  }
+};
+TOUCH._end = (id9) => {
+  if (TOUCH.stick && TOUCH.stick.id === id9) TOUCH.stick = null;
+  if (TOUCH.look && TOUCH.look.id === id9) TOUCH.look = null;
+  for (const n9 in TOUCH.held) if (TOUCH.held[n9] === id9) delete TOUCH.held[n9];
+};
+if (TOUCH.on) {
+  window.addEventListener('touchstart', (e9) => {
+    e9.preventDefault();
+    for (const t9 of e9.changedTouches) TOUCH._start(t9.identifier, t9.clientX, t9.clientY);
+    if (state === 'menu' || paused) pressed.add('Enter');   // a tap works the menus
+  }, { passive: false });
+  window.addEventListener('touchmove', (e9) => {
+    e9.preventDefault();
+    for (const t9 of e9.changedTouches) TOUCH._move(t9.identifier, t9.clientX, t9.clientY);
+  }, { passive: false });
+  for (const ev9 of ['touchend', 'touchcancel'])
+    window.addEventListener(ev9, (e9) => {
+      e9.preventDefault();
+      for (const t9 of e9.changedTouches) TOUCH._end(t9.identifier);
+    }, { passive: false });
+}
+function applyTouch() {
+  if (!TOUCH.on) return;
+  if (TOUCH.stick) {
+    const nx9 = clamp(TOUCH.stick.dx / 52, -1, 1), ny9 = clamp(TOUCH.stick.dy / 52, -1, 1);
+    if (Math.hypot(nx9, ny9) > 0.14) { padLX = padLX || nx9; padLY = padLY || ny9; }
+  }
+  if (TOUCH.held.gas !== undefined) padThrottle = Math.max(padThrottle, 1);
+  if (TOUCH.held.brake !== undefined) padBrakeV = Math.max(padBrakeV, 1);
+  if (TOUCH.held.fire !== undefined) padFire = true;
+  if (TOUCH.useEdge) { pressed.add('KeyE'); TOUCH.useEdge = false; }
+}
 function pollPad(dt) {
   padLX = padLY = padThrottle = padBrakeV = 0;
   padFire = padAim = padSprint = padHand = padDive = false;
@@ -1469,6 +1559,7 @@ const WORLD_W = TILE * GRID_W, WORLD_H = TILE * GRID_H;
 const T_ROAD = 0, T_SIDE = 1, T_GRASS = 2, T_WATER = 3, T_LOT = 4, T_BLD = 5;
 const tiles = new Uint8Array(GRID_W * GRID_H);
 const solid = new Uint8Array(GRID_W * GRID_H);
+const drivable = new Uint8Array(GRID_W * GRID_H);      // roads + lots: where wheels BELONG
 const heightMap = new Float32Array(GRID_W * GRID_H);   // rooftop heights (render units) for the chopper
 const waterDepth = new Float32Array(GRID_W * GRID_H);  // seafloor depth per water tile (render units)
 // cols 64/76 and rows 110/122/134 only ever meet land on Capitol Shores
@@ -1613,6 +1704,9 @@ function dealerPrice(kind) {
 }
 const trafficLights = [];                        // { x, y, key } pole spots (logic px)
 const tlGrid = new Map();                        // tile key -> pole indices (feet + car hits)
+const phoneGrid = new Map();                     // tile key -> phone indices (same pole law)
+const brokenPhones = [];
+let phoneMeshes = null;                          // the 7 instanced kiosk parts
 let tlMeshes = null;                             // instanced pole/housing meshes
 const brokenTLs = [];                            // poles down, waiting on the city truck
 const signalized = new Map();                    // 'cx,cy' -> { off, ewG, nsG }
@@ -1673,6 +1767,16 @@ function islandUnlocked(isl) {
   return true;                               // island 0 — home soil
 }
 
+// street lamps and traffic-light poles live at tile centers but never
+// enter the solids grid (feet-blocking is their own lampBlockAt path) —
+// so a spot picker must ask the registries directly, or it hands out a
+// pole's own tile (Tank caught a payphone kiosk impaled on a street lamp)
+function furnitureOnTile(ix, iy) {
+  const x0 = ix * TILE, y0 = iy * TILE, x1 = x0 + TILE, y1 = y0 + TILE;
+  for (const L of lamps) if (L.x >= x0 && L.x < x1 && L.y >= y0 && L.y < y1) return true;
+  for (const s of trafficLights) if (s.x >= x0 && s.x < x1 && s.y >= y0 && s.y < y1) return true;
+  return false;
+}
 function findTileNear(tx, ty, type) {
   for (let r = 0; r < 30; r++) {
     for (let iy = ty - r; iy <= ty + r; iy++) {
@@ -1683,6 +1787,7 @@ function findTileNear(tx, ty, type) {
         // SOLIDS: never hand out a spot inside a prop's footprint (kiosk,
         // cart, pole…) — a body spawned inside a solid can't walk out
         if (type !== T_WATER && solidAtPx(cx9, cy9)) continue;
+        if (type !== T_WATER && furnitureOnTile(ix, iy)) continue;
         return { x: cx9, y: cy9 };
       }
     }
@@ -1930,29 +2035,32 @@ function genCity() {
         markSolidRect(x0 + 1, y0 + 1, 6, 5);
         buildings.push({ tx: x0 + 1, ty: y0 + 1, tw: 6, th: 5, floors: 2.6, tint: 0x565a63, tex: 'conc', style: 'mall', store: true, sign: 'mall' });
       } else if (kind === 'garage') {
-        // Full-block multi-storey parkade: 6×6 tiles, tall decks, 2-tile
-        // ramp bay with a long gentle run so cars can climb without scraping.
+        // Full-block multi-storey parkade: 8×8 tiles (Tank order: room to
+        // maneuver TO the ramps and FROM them) — the block's sidewalk ring
+        // lives OUTSIDE the 8×8, so peds lose nothing. Wide ramp bay, a
+        // long gentle run, and 1.5-tile flat aprons at BOTH ramp ends.
         paveAll(x0, y0);
-        markSolidRect(x0 + 1, y0 + 1, 6, 6);
+        markSolidRect(x0, y0, 8, 8);
         const deckH = 6.4;                       // headroom to look around
         const top = 5;                           // decks 0..5 (roof)
-        const ggx = (x0 + 1) * TILE, ggy = (y0 + 1) * TILE;
-        const gw = 6 * TILE, gh = 6 * TILE;
+        const ggx = x0 * TILE, ggy = y0 * TILE;
+        const gw = 8 * TILE, gh = 8 * TILE;
         const garIdx = garages.length;
         garages.push({
           x0: ggx, y0: ggy, x1: ggx + gw, y1: ggy + gh,
-          // 2-tile wide entrance on the south face (cars are ~40px long)
-          ex0: ggx + 2 * TILE - 4, ex1: ggx + 4 * TILE + 4,
-          // 2-tile wide ramp bay on the east — room for sedan + wall clearance
-          rx0: ggx + 4 * TILE, rx1: ggx + 6 * TILE,
-          // long ramp run (≈4.5 tiles) — gentle climb between decks
-          ry0: ggy + Math.floor(0.6 * TILE),
-          ry1: ggy + Math.floor(5.2 * TILE),
+          // 3-tile entrance on the south face, east edge meeting the ramp
+          // bay mouth — drive straight in and up, or swing left to park
+          ex0: ggx + 2.5 * TILE - 4, ex1: ggx + 5.5 * TILE + 4,
+          // 2.5-tile ramp bay on the east — sedan + real wall clearance
+          rx0: ggx + 5.5 * TILE, rx1: ggx + 8 * TILE,
+          // 5-tile run with 1.5-tile flat aprons at the high AND low ends
+          ry0: ggy + Math.floor(1.5 * TILE),
+          ry1: ggy + Math.floor(6.5 * TILE),
           top, deckH, blk: []
         });
         // garIdx ties the mesh to the garage even if footprint shrinks later
         buildings.push({
-          tx: x0 + 1, ty: y0 + 1, tw: 6, th: 6,
+          tx: x0, ty: y0, tw: 8, th: 8,
           floors: Math.ceil((top + 0.4) * deckH / FLOOR_H),
           tint: 0x62656c, tex: 'garage', style: 'garage', garIdx
         });
@@ -2325,6 +2433,10 @@ function setBarrier(which, on) {
 }
 var _coresReady = false;
 genCity();
+// the drivable mask (roads + lots: where wheels BELONG) — right after the
+// tiles are final: receipts run at top-level eval, long before the boot
+// tail (an empty mask silently turned the road-first pass into a no-op)
+for (let n9 = 0; n9 < tiles.length; n9++) drivable[n9] = (tiles[n9] === T_ROAD || tiles[n9] === T_LOT) ? 1 : 0;
 // City-wide: NO two buildings may share a tile or a coplanar wall plane.
 // Applies to every style (tenement, commercial, civic, motel, towers, …).
 function resolveBuildingSeams() {
@@ -5540,8 +5652,9 @@ function lampBlockAt(x, y, fx, fy) {
   // lamps sit at tile centers (24px from any edge) and the 4px footprint
   // never crosses a tile line — the target's own bucket is the only one
   const arr = lampGrid.get(Math.floor(x / TILE) + ',' + Math.floor(y / TILE));
-  if (!arr) return false;
-  for (const i of arr) {
+  // no early return: a lampless tile can still hold a TL pole or a phone
+  // kiosk (bailing here made phones ghost-walkable — caught by receipt)
+  if (arr) for (const i of arr) {
     const L = lamps[i];
     if (L.broken) continue;                    // leaning / felled: walk past
     const dx = x - L.x, dy = y - L.y;
@@ -5563,6 +5676,38 @@ function lampBlockAt(x, y, fx, fy) {
     if (fdx * fdx + fdy * fdy < nd) continue;
     return true;
   }
+  // PAYPHONE kiosks stop feet under the same rule (Tank order) — and a
+  // felled one lets everybody walk past
+  const parr = phoneGrid.get(Math.floor(x / TILE) + ',' + Math.floor(y / TILE));
+  if (parr) for (const i of parr) {
+    const ph = phones[i];
+    if (ph.broken) continue;
+    const dx = x - ph.x, dy = y - ph.y;
+    const nd = dx * dx + dy * dy;
+    if (nd >= 16) continue;
+    const fdx = fx - ph.x, fdy = fy - ph.y;
+    if (fdx * fdx + fdy * fdy < nd) continue;
+    return true;
+  }
+  return false;
+}
+// WHISKER EYES FOR POLES (Tank: cops mow lamps, signals, phones — one
+// blew up from the accumulated hits): upright street furniture is
+// invisible to solidAtPx BY DESIGN (the pole law keeps it out of the
+// solids grid), so the driving AI asks the registries directly and swings
+// around a pole exactly like a wall.
+function poleAtPx(x, y) {
+  const tx9 = Math.floor(x / TILE), ty9 = Math.floor(y / TILE);
+  for (let oy9 = -1; oy9 <= 1; oy9++)
+    for (let ox9 = -1; ox9 <= 1; ox9++) {
+      const k9 = (tx9 + ox9) + ',' + (ty9 + oy9);
+      const la9 = lampGrid.get(k9);
+      if (la9) for (const i9 of la9) { const L9 = lamps[i9]; if (!L9.broken && dist(x, y, L9.x, L9.y) < 10) return true; }
+      const ta9 = tlGrid.get(k9);
+      if (ta9) for (const i9 of ta9) { const s9 = trafficLights[i9]; if (!s9.broken && dist(x, y, s9.x, s9.y) < 10) return true; }
+      const pa9 = phoneGrid.get(k9);
+      if (pa9) for (const i9 of pa9) { const p9 = phones[i9]; if (!p9.broken && dist(x, y, p9.x, p9.y) < 10) return true; }
+    }
   return false;
 }
 // TRAFFIC LIGHT POLES live under the SAME law as street lamps (Tank order):
@@ -5657,6 +5802,10 @@ function checkTLHits(c) {
         const s = trafficLights[i];
         const d2 = dist(c.x, c.y, s.x, s.y);
         if (d2 >= reach) continue;
+        // the BODY must touch the pole — the length-radius circle alone
+        // phantom-struck signals 8px off the curb from INSIDE the lane
+        // (Tank heard corner signals dying under ordinary traffic)
+        if (carBodyDist(c, s.x, s.y) > 4) continue;
         if (s.broken) {
           if (s.maxAng < 1.4 && sp >= 110) { s.poseDirty = true; breakTL(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c); }
           continue;
@@ -5688,6 +5837,8 @@ function checkLampHits(c) {
         const L = lamps[i];
         const d2 = dist(c.x, c.y, L.x, L.y);
         if (d2 >= reach) continue;
+        if (carBodyDist(c, L.x, L.y) > 4) continue;   // body contact only — no phantom strikes
+
         if (L.broken) {
           // a leaning post yields to a HARD follow-up; otherwise drive past
           if (L.maxAng < 1.4 && sp >= 110) {
@@ -6405,7 +6556,8 @@ function placeBeam(px, py, colorHex, radius, height) {
   staticBeams.push(b);
   return b;
 }
-for (const ph of phones) placeBeam(ph.x, ph.y, 0x3fdc5f, 1.6, 7);
+for (const ph of phones) ph.beam = placeBeam(ph.x, ph.y, 0x3fdc5f, 1.6, 7);   // the beam dies with the phone
+const _phYawM = new THREE.Matrix4();             // before the kiosk block: setPhonePose runs at eval
 // ACTUAL PAYPHONES (Tank order): every phone spot is a real kiosk — steel
 // post, half-booth hood, phone unit, a handset on the hook — faced toward
 // the street. The green beam stays: that is the job marker.
@@ -6423,32 +6575,133 @@ for (const ph of phones) placeBeam(ph.x, ph.y, 0x3fdc5f, 1.6, 7);
     const topIM = mkIM9(0.62, 0.09, 0.95, shell9);
     const unitIM = mkIM9(0.14, 0.55, 0.4, unitM9);
     const setIM = mkIM9(0.1, 0.4, 0.12, steel9);
-    const M9 = new THREE.Matrix4(), Q9 = new THREE.Quaternion(), P9 = new THREE.Vector3(), S19 = new THREE.Vector3(1, 1, 1);
-    const UPy9 = new THREE.Vector3(0, 1, 0);
+    phoneMeshes = { post: postIM, back: backIM, sideL: sideLIM, sideR: sideRIM, top: topIM, unit: unitIM, set: setIM };
     phones.forEach((ph, i) => {
       const tx9 = Math.floor(ph.x / TILE), ty9 = Math.floor(ph.y / TILE);
       let yaw9 = Math.PI / 2;
       for (const [dx9, dy9, a9] of [[1, 0, 0], [0, 1, Math.PI / 2], [-1, 0, Math.PI], [0, -1, -Math.PI / 2]])
         if (tileAt(tx9 + dx9, ty9 + dy9) === T_ROAD) { yaw9 = a9; break; }
-      Q9.setFromAxisAngle(UPy9, -yaw9);
-      const x9 = ph.x * RS, z9 = ph.y * RS;
-      const loc9 = (lx9, ly9, lz9, im9) => {
-        const wx9 = x9 + Math.cos(yaw9) * lx9 - Math.sin(yaw9) * lz9;
-        const wz9 = z9 + Math.sin(yaw9) * lx9 + Math.cos(yaw9) * lz9;
-        M9.compose(P9.set(wx9, ly9, wz9), Q9, S19);
-        im9.setMatrixAt(i, M9);
-      };
-      loc9(-0.28, 1.35, 0, postIM);              // post carries the booth
-      loc9(-0.28, 2.1, 0, backIM);               // open side faces the street
-      loc9(0, 2.1, -0.45, sideLIM);
-      loc9(0, 2.1, 0.45, sideRIM);
-      loc9(-0.02, 2.78, 0, topIM);
-      loc9(-0.19, 2.0, 0, unitIM);
-      loc9(-0.16, 1.72, 0.17, setIM);            // the handset on its hook
-      addBlocker(ph.x, ph.y, 4);                 // solids by default
+      ph.yaw = yaw9;
+      ph.broken = false;
+      // feet + car hits ride the SAME pole law as lamps/TLs — no static
+      // blocker (a felled phone must be walkable), the grid + lampBlockAt
+      // carry the footprint instead
+      const k9 = tx9 + ',' + ty9;
+      if (!phoneGrid.has(k9)) phoneGrid.set(k9, []);
+      phoneGrid.get(k9).push(i);
+      setPhonePose(i, 0);
     });
     console.log('PAYPHONES ' + nP9 + ' kiosks planted');
   }
+}
+// PAYPHONES live under the SAME law as street lamps and traffic lights
+// (Tank order): slow hits bend the kiosk, fast hits snap it flat, feet
+// walk past a felled one, the city replaces it in 60 seconds — and a
+// phone broke from the ground CANNOT be used until it respawns.
+function setPhonePose(i, ang) {
+  const ph = phones[i], x = ph.x * RS, z = ph.y * RS;
+  _lampAxis.set(-Math.sin(ph.fallDir || 0), 0, Math.cos(ph.fallDir || 0));
+  _lampR.makeRotationAxis(_lampAxis, ang);
+  _phYawM.makeRotationY(-ph.yaw);
+  const put9 = (im9, lx9, ly9, lz9) => {
+    const ox9 = Math.cos(ph.yaw) * lx9 - Math.sin(ph.yaw) * lz9;
+    const oz9 = Math.sin(ph.yaw) * lx9 + Math.cos(ph.yaw) * lz9;
+    _lampT.makeTranslation(ox9, ly9, oz9);
+    _lampM.makeTranslation(x, 0, z);
+    _lampM.multiply(_lampR).multiply(_lampT).multiply(_phYawM);
+    im9.setMatrixAt(i, _lampM);
+    im9.instanceMatrix.needsUpdate = true;
+  };
+  put9(phoneMeshes.post, -0.28, 1.35, 0);        // post carries the booth
+  put9(phoneMeshes.back, -0.28, 2.1, 0);         // open side faces the street
+  put9(phoneMeshes.sideL, 0, 2.1, -0.45);
+  put9(phoneMeshes.sideR, 0, 2.1, 0.45);
+  put9(phoneMeshes.top, -0.02, 2.78, 0);
+  put9(phoneMeshes.unit, -0.19, 2.0, 0);
+  put9(phoneMeshes.set, -0.16, 1.72, 0.17);      // the handset on its hook
+}
+function breakPhone(i, dirAngRender, byCar) {
+  const ph = phones[i];
+  const sp = byCar ? Math.abs(byCar.speed) : 200;
+  const full = sp >= 110;
+  const target = full ? 1.45 : 0.2 + clamp((sp - 40) / 70, 0, 1) * 0.5;
+  if (ph.broken) {
+    if (target <= ph.maxAng + 0.05) return;
+    ph.maxAng = target;
+    ph.respawnT = 60;
+  } else {
+    ph.broken = true;
+    ph.fallT = 0;
+    ph.maxAng = target;
+    ph.fallDir = dirAngRender;
+    ph.respawnT = 60;
+    brokenPhones.push(i);
+  }
+  if (ph.beam) ph.beam.visible = false;          // dead line: the job marker goes out
+  sfx('crash', ph.x, ph.y);
+  sparks(ph.x, ph.y);
+  if (byCar) {
+    carDamage(byCar, Math.min(30, sp * 0.06), null);
+    dentCar(byCar, ph.x, ph.y, sp + 70);
+    byCar.speed *= full ? 0.86 : 0.93;
+    if (byCar === player.car) rumble(full ? 0.5 : 0.3, 0.35, 200);
+  }
+}
+function updPhoneBroken(dt) {
+  for (let bi = brokenPhones.length - 1; bi >= 0; bi--) {
+    const i = brokenPhones[bi];
+    const ph = phones[i];
+    if (ph.fallT < 1) {
+      ph.fallT = Math.min(1, ph.fallT + dt * 1.7);
+      setPhonePose(i, ph.fallT * ph.maxAng);
+    } else if (ph.poseDirty) {
+      ph.poseDirty = false;
+      setPhonePose(i, ph.maxAng);
+    }
+    ph.respawnT -= dt;
+    if (ph.respawnT <= 0) {
+      ph.broken = false;
+      setPhonePose(i, 0);
+      if (ph.beam) ph.beam.visible = true;       // line restored: jobs flow again
+      brokenPhones.splice(bi, 1);
+    }
+  }
+}
+function checkPhoneHits(c) {
+  if ((c.alt || 0) > 4 || !phoneMeshes) return;
+  const sp = Math.abs(c.speed);
+  if (sp < 2) return;
+  const cx2 = Math.floor(c.x / TILE), cy2 = Math.floor(c.y / TILE);
+  const reach = c.len / 2 + 5;
+  for (let oy = -1; oy <= 1; oy++)
+    for (let ox = -1; ox <= 1; ox++) {
+      const arr = phoneGrid.get((cx2 + ox) + ',' + (cy2 + oy));
+      if (!arr) continue;
+      for (const i of arr) {
+        const ph = phones[i];
+        const d2 = dist(c.x, c.y, ph.x, ph.y);
+        if (d2 >= reach) continue;
+        if (carBodyDist(c, ph.x, ph.y) > 4) continue;   // body contact only — no phantom strikes
+
+        if (ph.broken) {
+          // a leaning kiosk yields to a HARD follow-up; otherwise drive past
+          if (ph.maxAng < 1.4 && sp >= 110) {
+            ph.poseDirty = true;
+            breakPhone(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c);
+          }
+          continue;
+        }
+        if (sp >= 110) { breakPhone(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c); continue; }
+        if (sp >= 40) breakPhone(i, Math.atan2(Math.sin(c.angle), Math.cos(c.angle)), c);
+        else if (sp > 18) { sfx('crash', ph.x, ph.y); dentCar(c, ph.x, ph.y, sp + 90); if (c === player.car) rumble(0.3, 0.18, 120); }
+        // the kiosk HOLDS below snap speed: push the car out
+        const px2 = c.x - ph.x, py2 = c.y - ph.y;
+        const pd = Math.max(1, Math.hypot(px2, py2));
+        c.x = ph.x + px2 / pd * reach;
+        c.y = ph.y + py2 / pd * reach;
+        c.speed *= 0.4;
+      }
+    }
 }
 for (const gs of gunShops) placeBeam(gs.x, gs.y, 0xff9030, 1.6, 7);
 for (const pd of pads) placeBeam(pd.x, pd.y, 0x40e0d0, 2.4, 6);
@@ -8249,6 +8502,22 @@ function attachPedMesh(p) {
     baton.visible = false;
     (ud.handR || ud.armR.userData.hand).add(baton);
     ud.baton = baton;
+    // PROPER BLACK POLICE HAT (Tank order): peaked patrol cap — banded
+    // crown, flared flat top, visor forward (+X with the rig). Beat cops
+    // only: SWAT wear helmets, CIA plainclothes, the army its own gear.
+    if (!p.unit || p.unit === 'cop') {
+      const hatM = new THREE.MeshLambertMaterial({ color: 0x0b0c10 });
+      const crown9 = new THREE.Mesh(new THREE.CylinderGeometry(0.44, 0.46, 0.2, 10), hatM);
+      crown9.position.y = 3.42;
+      const top9 = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.44, 0.09, 10), hatM);
+      top9.position.y = 3.56;
+      const visor9 = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.05, 0.52), hatM);
+      visor9.position.set(0.42, 3.36, 0);
+      for (const h9 of [crown9, top9, visor9]) {
+        h9.castShadow = true; h9.receiveShadow = true;   // markShadows already ran
+        p.mesh.add(h9);
+      }
+    }
   }
   scene.add(p.mesh);
 }
@@ -9175,7 +9444,7 @@ function updCopCar(c, dt) {
   // the fastest tile path around the blocks, whiskers handling the close-in
   let tx9 = t.x, ty9 = t.y;
   if (!c.quarry && !hasLOS(c.x, c.y, t.x, t.y)) { tx9 = lastSeenX; ty9 = lastSeenY; }
-  const wp9 = chaseWaypoint(c, tx9, ty9, dt, 4);
+  const wp9 = chaseWaypoint(c, tx9, ty9, dt, 4, true);   // wheels: roads first
   chaseSteer(c, wp9 ? wp9.x : tx9, wp9 ? wp9.y : ty9, dt, 2.3);   // cops obey the same tire physics
   tireGrip(c, dt, 1);
   if (c.revT > 0) {
@@ -10450,7 +10719,7 @@ const _pfPrev = new Int32Array(GRID_W * GRID_H);
 const _pfSeen = new Uint16Array(GRID_W * GRID_H);
 const _pfQ = new Int32Array(GRID_W * GRID_H);
 let _pfStamp = 0;
-function pathNext(fx, fy, tx, ty, lookahead) {
+function _pathBFS(fx, fy, tx, ty, lookahead, roadPass) {
   const si = Math.floor(fx / TILE), sj = Math.floor(fy / TILE);
   const gi = Math.floor(tx / TILE), gj = Math.floor(ty / TILE);
   if (!inGrid(si, sj) || !inGrid(gi, gj)) return null;
@@ -10470,7 +10739,10 @@ function pathNext(fx, fy, tx, ty, lookahead) {
       if (ni < 0 || nj < 0 || ni >= GRID_W || nj >= GRID_H) continue;
       const n = nj * GRID_W + ni;
       if (_pfSeen[n] === _pfStamp) continue;
-      if (solid[n] === 1 && n !== goal) continue;    // buildings are walls; route around
+      // buildings are walls; on the road pass, so is everything that
+      // isn't pavement — wheels stay TRUE TO THE ROAD (Tank order),
+      // which keeps them off the pole-bearing sidewalk corners entirely
+      if ((solid[n] === 1 || (roadPass && !drivable[n])) && n !== goal) continue;
       _pfSeen[n] = _pfStamp;
       _pfPrev[n] = cur;
       _pfQ[qt++] = n;
@@ -10484,15 +10756,19 @@ function pathNext(fx, fy, tx, ty, lookahead) {
   const n2 = chain[k];
   return { x: ((n2 % GRID_W) + 0.5) * TILE, y: (((n2 / GRID_W) | 0) + 0.5) * TILE };
 }
+function pathNext(fx, fy, tx, ty, lookahead, roadOnly) {
+  const r9 = roadOnly ? _pathBFS(fx, fy, tx, ty, lookahead, 1) : null;
+  return r9 || _pathBFS(fx, fy, tx, ty, lookahead, 0);   // roads first, any path as fallback
+}
 // per-pursuer waypoint cache: repath ~1/s or when the target changes tiles
-function chaseWaypoint(o, tx, ty, dt, look) {
+function chaseWaypoint(o, tx, ty, dt, look, road) {
   o.pfT = (o.pfT || 0) - dt;
   const gi = Math.floor(tx / TILE), gj = Math.floor(ty / TILE);
   if (o.pfT <= 0 || o.pfGi !== gi || o.pfGj !== gj) {
     o.pfT = 0.8 + Math.random() * 0.4;
     o.pfGi = gi; o.pfGj = gj;
-    if (CORES.on()) CORES.plan(o, o.x, o.y, tx, ty, look || 3);   // fresh leg lands async; walk the old one meanwhile
-    else o.pfWp = pathNext(o.x, o.y, tx, ty, look || 3);
+    if (CORES.on()) CORES.plan(o, o.x, o.y, tx, ty, look || 3, road);   // fresh leg lands async; walk the old one meanwhile
+    else o.pfWp = pathNext(o.x, o.y, tx, ty, look || 3, road);
   }
   if (o.pfWp && dist(o.x, o.y, o.pfWp.x, o.pfWp.y) < 30) o.pfT = 0;   // leg done: next
   return o.pfWp;
@@ -10509,8 +10785,8 @@ const CORES = (() => {
   let seq9 = 0, rr9 = 0, armed9 = false;
   const stats9 = { workers: 0, jobs: 0, replies: 0 };
   const src9 =
-    'let W=0,H=0,TILE=48,solid=null,prev=null,seen=null,q=null,stamp=0;\n' +
-    'function bfs(fx,fy,tx,ty,look){\n' +
+    'let W=0,H=0,TILE=48,solid=null,drive=null,prev=null,seen=null,q=null,stamp=0;\n' +
+    'function bfs(fx,fy,tx,ty,look,pass){\n' +
     ' const si=Math.floor(fx/TILE),sj=Math.floor(fy/TILE),gi=Math.floor(tx/TILE),gj=Math.floor(ty/TILE);\n' +
     ' if(si<0||sj<0||si>=W||sj>=H||gi<0||gj<0||gi>=W||gj>=H)return null;\n' +
     ' if(si===gi&&sj===gj)return{x:tx,y:ty};\n' +
@@ -10527,7 +10803,7 @@ const CORES = (() => {
     '   if(ni<0||nj<0||ni>=W||nj>=H)continue;\n' +
     '   const n=nj*W+ni;\n' +
     '   if(seen[n]===stamp)continue;\n' +
-    '   if(solid[n]===1&&n!==goal)continue;\n' +
+    '   if((solid[n]===1||(pass&&!drive[n]))&&n!==goal)continue;\n' +
     '   seen[n]=stamp;prev[n]=cur;q[qt++]=n;\n' +
     '  }\n' +
     ' }\n' +
@@ -10540,11 +10816,12 @@ const CORES = (() => {
     '}\n' +
     'onmessage=(e)=>{\n' +
     ' const d=e.data;\n' +
-    ' if(d.grid){W=d.w;H=d.h;TILE=d.tile;solid=new Uint8Array(d.grid);prev=new Int32Array(W*H);seen=new Uint16Array(W*H);q=new Int32Array(W*H);stamp=0;return;}\n' +
-    ' const req=new Float64Array(d.req),n=req.length/6,out=new Float64Array(n*4);\n' +
+    ' if(d.grid){W=d.w;H=d.h;TILE=d.tile;solid=new Uint8Array(d.grid);drive=new Uint8Array(d.drive);prev=new Int32Array(W*H);seen=new Uint16Array(W*H);q=new Int32Array(W*H);stamp=0;return;}\n' +
+    ' const req=new Float64Array(d.req),n=req.length/7,out=new Float64Array(n*4);\n' +
     ' for(let i=0;i<n;i++){\n' +
-    '  const r=bfs(req[i*6+1],req[i*6+2],req[i*6+3],req[i*6+4],req[i*6+5]);\n' +
-    '  out[i*4]=req[i*6];out[i*4+1]=r?1:0;out[i*4+2]=r?r.x:0;out[i*4+3]=r?r.y:0;\n' +
+    '  const road=req[i*7+6];\n' +
+    '  const r=(road?bfs(req[i*7+1],req[i*7+2],req[i*7+3],req[i*7+4],req[i*7+5],1):null)||bfs(req[i*7+1],req[i*7+2],req[i*7+3],req[i*7+4],req[i*7+5],0);\n' +
+    '  out[i*4]=req[i*7];out[i*4+1]=r?1:0;out[i*4+2]=r?r.x:0;out[i*4+3]=r?r.y:0;\n' +
     ' }\n' +
     ' postMessage({res:out.buffer},[out.buffer]);\n' +
     '};';
@@ -10574,14 +10851,14 @@ const CORES = (() => {
     on() { return armed9 && pool9.length > 0 && (!location.hash || this._force); },
     arm() {
       if (!pool9.length) return;
-      for (const w9 of pool9) w9.postMessage({ grid: solid.slice(0).buffer, w: GRID_W, h: GRID_H, tile: TILE });
+      for (const w9 of pool9) w9.postMessage({ grid: solid.slice(0).buffer, drive: drivable.slice(0).buffer, w: GRID_W, h: GRID_H, tile: TILE });
       armed9 = true;
     },
-    plan(o9, fx9, fy9, tx9, ty9, look9) {
+    plan(o9, fx9, fy9, tx9, ty9, look9, road9) {
       if (o9._pfId === undefined) o9._pfId = ++seq9;
       if (wait9.has(o9._pfId)) return;             // one in flight per pursuer
       wait9.set(o9._pfId, o9);
-      queue9.push(o9._pfId, fx9, fy9, tx9, ty9, look9 || 3);
+      queue9.push(o9._pfId, fx9, fy9, tx9, ty9, look9 || 3, road9 ? 1 : 0);
       stats9.jobs++;
     },
     flush() {
@@ -10617,8 +10894,14 @@ function chaseSteer(c, tx, ty, dt, turnRate) {
   const ta = Math.atan2(ty - c.y, tx - c.x);
   let want = ta;
   const look = c.len / 2 + 34;
-  const probe = (da) => solidAtPx(c.x + Math.cos(c.angle + da) * look, c.y + Math.sin(c.angle + da) * look);
-  const fwd = probe(0), sL = probe(-0.55), sR = probe(0.55);
+  const probe = (da) => {
+    const px9 = c.x + Math.cos(c.angle + da) * look, py9 = c.y + Math.sin(c.angle + da) * look;
+    return solidAtPx(px9, py9) || poleAtPx(px9, py9);   // poles are walls to wheels
+  };
+  // a pole dead ahead at pursuit speed needs an EARLIER swing than the
+  // wall probe gives — one extra far look straight down the nose
+  const fwd = probe(0) || poleAtPx(c.x + Math.cos(c.angle) * look * 1.9, c.y + Math.sin(c.angle) * look * 1.9);
+  const sL = probe(-0.55), sR = probe(0.55);
   if (fwd || sL || sR) {
     if (fwd && !sL && sR) want = c.angle - 1.1;
     else if (fwd && sL && !sR) want = c.angle + 1.1;
@@ -12553,6 +12836,7 @@ function updMission(dt) {
 function tryPhone() {
   if (mission || player.car) return false;
   for (const ph of phones) {
+    if (ph.broken) continue;                     // broke from the ground: dead line til respawn
     if (dist(ph.x, ph.y, player.x, player.y) < 20) { startMission(ph.island); return true; }   // arm's reach of the booth
   }
   return false;
@@ -12584,6 +12868,7 @@ function nearestAction() {
   }
   if (!mission) {
     for (const ph of phones) {
+      if (ph.broken) continue;                   // dead line til respawn
       const d = pd(ph.x, ph.y);
       if (d < 20) acts.push({ d, go: () => startMission(ph.island) });
     }
@@ -12733,6 +13018,7 @@ function onClick() {
 // ---------------------------------------------------------------- update (sim)
 function update(dt) {
   pollPad(dt);
+  applyTouch();                     // the phone rig merges into the pad globals
   CORES.flush();                    // last frame's queued path plans hit the cores
   updMusic();
   updWind(dt);                                   // the one air state the world receives
@@ -13156,8 +13442,9 @@ function update(dt) {
       }
     }
   }
-  for (const c of cars) if (!c.dead && (c.driver || Math.abs(c.speed) > 40)) { checkLampHits(c); checkTLHits(c); }
+  for (const c of cars) if (!c.dead && (c.driver || Math.abs(c.speed) > 40)) { checkLampHits(c); checkTLHits(c); checkPhoneHits(c); }
   updTLBroken(dt);
+  updPhoneBroken(dt);
   updLamps(dt);
   updDropped(dt);
   updExhaust(dt);
@@ -14298,7 +14585,7 @@ function drawHUD(t) {
     }
   }
   // minimap
-  const MW = 208, MH = Math.round(MW * GRID_H / GRID_W), mxp = 14, myp = VH - MH - 14;
+  const MW = touchMapW(), MH = Math.round(MW * GRID_H / GRID_W), mxp = 14, myp = VH - MH - 14;
   hctx.fillStyle = 'rgba(0,0,0,0.6)';
   hctx.fillRect(mxp - 3, myp - 3, MW + 6, MH + 6);
   hctx.drawImage(mm, 0, 0, mm.width, mm.height, mxp, myp, MW, MH);
@@ -14318,7 +14605,7 @@ function drawHUD(t) {
     hctx.fillText(L.letter, lx, ly + 3);
   }
   hctx.textAlign = 'left';
-  for (const ph of phones) blip(ph.x, ph.y, '#3fdc5f', 2);
+  for (const ph of phones) if (!ph.broken) blip(ph.x, ph.y, '#3fdc5f', 2);   // a dead line leaves the map
   if (atmSpot) blip(atmSpot.x, atmSpot.y, '#7dffa0', 3);
   for (const c of cars) if (c.kind === 'boat' && !c.dead) blip(c.x, c.y, '#38d0ff', 2);
   for (const gs of gunShops) blip(gs.x, gs.y, '#ff9030', 2);
@@ -14461,7 +14748,9 @@ function drawHUD(t) {
     const hpMax9 = vk9.hp + (vc9.mods ? vc9.mods.arm * 40 : 0);
     const hpF9 = clamp(vc9.hp / hpMax9, 0, 1);
     const fuF9 = clamp(vc9.fuel / vk9.fuelCap, 0, 1);
-    const bh9 = 64, bw9 = 13, by9 = VH - 44 - bh9, bx9 = VW - 56;
+    // on the phone the GAS thumb button owns the bottom-right corner —
+    // the gauges slide to bottom-center where no thumb ever rests
+    const bh9 = 64, bw9 = 13, by9 = VH - 44 - bh9, bx9 = TOUCH.on ? Math.round(VW * 0.5) - 16 : VW - 56;
     hctx.fillStyle = 'rgba(6,8,14,0.55)';
     hctx.fillRect(bx9 - 5, by9 - 5, bw9 * 2 + 16, bh9 + 10);
     hctx.fillStyle = '#101623';
@@ -14485,8 +14774,8 @@ function drawHUD(t) {
     hctx.fillStyle = '#ffd21a';
     hctx.fillText('CHEATER', VW - 18, VH - 18);
   }
-  // pointer-lock hint
-  if (!ptrLocked && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !priestOpen && !bankOpen) {
+  // pointer-lock hint — meaningless on a phone
+  if (!TOUCH.on && !ptrLocked && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !priestOpen && !bankOpen) {
     hctx.textAlign = 'center';
     hctx.font = 'bold 15px monospace';
     hctx.fillStyle = '#3fdc5f';
@@ -14785,6 +15074,32 @@ function drawHUD(t) {
       hctx.fillText('[' + (i === 10 ? '0' : i) + '] ' + (sum || 'empty'), col, row);
     }
     hctx.textAlign = 'center';
+  }
+  // ---- the phone thumb rig (Tank order): joystick ghost bottom-left
+  // (live at wherever the thumb landed), buttons lit while held
+  if (TOUCH.on && state === 'play' && !paused && !shopOpen && !saveHouseOpen && !modShopOpen && !priestOpen && !bankOpen && !cutscene) {
+    const jx9 = TOUCH.stick ? TOUCH.stick.ax : Math.max(touchMapW() + 92, VW * 0.2);   // ghost clears the map
+    const jy9 = TOUCH.stick ? TOUCH.stick.ay : VH - 120;
+    hctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    hctx.lineWidth = 3;
+    hctx.beginPath(); hctx.arc(jx9, jy9, 52, 0, TAU); hctx.stroke();
+    hctx.fillStyle = 'rgba(255,255,255,' + (TOUCH.stick ? 0.5 : 0.22) + ')';
+    hctx.beginPath();
+    hctx.arc(jx9 + (TOUCH.stick ? TOUCH.stick.dx : 0), jy9 + (TOUCH.stick ? TOUCH.stick.dy : 0), 24, 0, TAU);
+    hctx.fill();
+    hctx.font = 'bold 15px monospace';
+    hctx.textAlign = 'center';
+    for (const b9 of touchButtons()) {
+      const on9 = TOUCH.held[b9.n] !== undefined;
+      hctx.fillStyle = on9 ? 'rgba(63,220,95,0.45)' : 'rgba(10,14,22,0.5)';
+      hctx.beginPath(); hctx.arc(b9.x, b9.y, b9.r, 0, TAU); hctx.fill();
+      hctx.strokeStyle = on9 ? '#3fdc5f' : 'rgba(255,255,255,0.55)';
+      hctx.lineWidth = 2.5;
+      hctx.beginPath(); hctx.arc(b9.x, b9.y, b9.r, 0, TAU); hctx.stroke();
+      hctx.fillStyle = '#fff';
+      hctx.fillText(b9.label, b9.x, b9.y + 5);
+    }
+    hctx.textAlign = 'left';
   }
   if (state === 'over') {
     hctx.fillStyle = 'rgba(0,0,0,0.55)';
@@ -15728,6 +16043,61 @@ if (location.hash === '#copnav') {
   peds.push(cop2);
   for (let i = 0; i < 10 * 60; i++) updPed(cop2, 1 / 60);
   ck('copsHuntLastKnown', dist(cop2.x, cop2.y, bx, southY) < dist(cop2.x, cop2.y, player.x, player.y));
+  cop2.dead = true;
+  // SMARTER WHEELS (Tank: lamps/signals/phones mowed down constantly, one
+  // cop blew up from the hits): whiskers see poles, the wheel path prefers
+  // pavement — a pursuit past a signalized intersection breaks NOTHING
+  const s0n = trafficLights[0];
+  ck('poleEyesLamp', poleAtPx(lamps[0].x, lamps[0].y) === true);
+  ck('poleEyesPhone', poleAtPx(phones[0].x, phones[0].y) === true);
+  const openRd9 = (() => { for (let iy9 = 0; iy9 < GRID_H; iy9++) for (let ix9 = 0; ix9 < GRID_W; ix9++) { const cx9 = (ix9 + 0.5) * TILE, cy9 = (iy9 + 0.5) * TILE; if (tiles[iy9 * GRID_W + ix9] === T_ROAD && !poleAtPx(cx9, cy9)) return { x: cx9, y: cy9 }; } })();
+  ck('poleEyesOpenRoad', poleAtPx(openRd9.x, openRd9.y) === false);
+  // road-true tests start and end ON the road, like real cruisers do
+  const findRoad9 = (tx0, ty0) => {
+    for (let r9 = 0; r9 < 8; r9++)
+      for (let oy9 = -r9; oy9 <= r9; oy9++)
+        for (let ox9 = -r9; ox9 <= r9; ox9++) {
+          const ix9 = tx0 + ox9, iy9 = ty0 + oy9;
+          if (ix9 >= 0 && iy9 >= 0 && ix9 < GRID_W && iy9 < GRID_H && tiles[iy9 * GRID_W + ix9] === T_ROAD)
+            return { x: (ix9 + 0.5) * TILE, y: (iy9 + 0.5) * TILE };
+        }
+    return null;
+  };
+  const rdA9 = findRoad9(Math.floor(s0n.x / TILE) - 3, Math.floor(s0n.y / TILE));
+  const rdB9 = findRoad9(Math.floor(s0n.x / TILE) + 3, Math.floor(s0n.y / TILE) + 3);
+  const wpR9 = pathNext(rdA9.x, rdA9.y, rdB9.x, rdB9.y, 3, true);
+  ck('wheelsWaypointOnRoad', !!wpR9 && drivable[Math.floor(wpR9.y / TILE) * GRID_W + Math.floor(wpR9.x / TILE)] === 1);
+  const nB0 = brokenLamps.length + brokenTLs.length + brokenPhones.length;
+  player.x = rdB9.x; player.y = rdB9.y;
+  lastSeenX = player.x; lastSeenY = player.y;
+  const cruz2 = mkCar(rdA9.x, rdA9.y, 0, 'cop', 'cop');
+  attachCarMesh(cruz2);
+  cars.push(cruz2);
+  for (let i = 0; i < 15 * 60 && dist(cruz2.x, cruz2.y, player.x, player.y) > 170; i++) {
+    updCopCar(cruz2, 1 / 60);
+    checkLampHits(cruz2); checkTLHits(cruz2); checkPhoneHits(cruz2);
+  }
+  const nB1 = brokenLamps.length + brokenTLs.length + brokenPhones.length;
+  ck('prowlReaches', dist(cruz2.x, cruz2.y, player.x, player.y) <= 170);
+  ck('prowlSparesThePoles', nB1 === nB0);
+  ck('prowlSurvives', !cruz2.dead && cruz2.hp > 0);
+  cruz2.dead = true;
+  // PHANTOM STRIKES (Tank: signals dying on corners under ordinary
+  // traffic): a pole hit needs the BODY to touch — an in-lane pass 20px
+  // off the pole is CLEAN, a dead-on ram still snaps it
+  const tlx9 = trafficLights[0];
+  const brush9 = mkCar(tlx9.x + 20, tlx9.y, 1, 'sedan', 'ai');   // dir 1: rolling past, 20px abeam
+  attachCarMesh(brush9); cars.push(brush9);
+  brush9.speed = 90;
+  checkTLHits(brush9);
+  ck('laneBrushSparesTheSignal', tlx9.broken !== true);
+  brush9.dead = true;
+  const ram9b = mkCar(tlx9.x - 6, tlx9.y, 0, 'sedan', 'ai');
+  attachCarMesh(ram9b); cars.push(ram9b);
+  ram9b.speed = 90;
+  checkTLHits(ram9b);
+  ck('bodyContactStillBreaks', tlx9.broken === true);
+  ram9b.dead = true;
   console.log('CNAVDBG ' + R.join(' ') + ' fails=' + R.filter(s9 => s9.slice(-6) === '=false').length);
 }
 if (location.hash === '#pullover') {
@@ -16393,7 +16763,45 @@ if (location.hash === '#tlpole') {
   bend9.speed = 60;
   checkTLHits(bend9);
   ckL('slowHitBends', s1.broken === true && s1.maxAng < 1.4);
-  ckL('payphonesPlanted', phones.length >= 20 && solidAtPx(phones[0].x, phones[0].y) === true);
+  console.log('PHDBG len=' + phones.length + ' ph0=' + JSON.stringify({ x: phones[0].x, y: phones[0].y, broken: phones[0].broken, yaw: phones[0].yaw }) +
+    ' bucket=' + JSON.stringify(phoneGrid.get(Math.floor(phones[0].x / TILE) + ',' + Math.floor(phones[0].y / TILE)) || null) +
+    ' gridKeys=' + phoneGrid.size + ' block=' + lampBlockAt(phones[0].x, phones[0].y, phones[0].x + 10, phones[0].y));
+  ckL('payphonesPlanted', phones.length >= 20 && lampBlockAt(phones[0].x, phones[0].y, phones[0].x + 10, phones[0].y) === true);
+  // no kiosk shares its tile with a lamp or a TL pole (Tank caught a
+  // payphone impaled on a street lamp) — and the pickers stay clean for
+  // every OTHER handed-out spot too
+  let clear9 = true;
+  const sameTile9 = (a9, b9) => Math.floor(a9.x / TILE) === Math.floor(b9.x / TILE) && Math.floor(a9.y / TILE) === Math.floor(b9.y / TILE);
+  for (const ph9 of phones)
+    for (const f9 of [...lamps, ...trafficLights])
+      if (sameTile9(ph9, f9)) clear9 = false;
+  ckL('phonesClearOfPoles', clear9);
+  let shopsClear9 = true;
+  for (const g9 of gunShops)
+    for (const f9 of [...lamps, ...trafficLights])
+      if (sameTile9(g9, f9)) shopsClear9 = false;
+  ckL('shopSpotsClearOfPoles', shopsClear9);
+  // PAYPHONES under the pole law (Tank order): bend, snap, walk past,
+  // dead line while down, respawn brings the dial tone back
+  const ph0 = phones[0];
+  const pcar9 = mkCar(ph0.x - 12, ph0.y, 0, 'sedan', 'player');
+  pcar9.keep = true; attachCarMesh(pcar9); cars.push(pcar9);
+  pcar9.speed = 60;
+  checkPhoneHits(pcar9);
+  ckL('phoneSlowHitBends', ph0.broken === true && ph0.maxAng < 1.4);
+  ckL('brokenPhoneWalkable', lampBlockAt(ph0.x, ph0.y, ph0.x + 10, ph0.y) === false);
+  ckL('beamDarkWhenBroken', !!ph0.beam && ph0.beam.visible === false);
+  player.x = ph0.x; player.y = ph0.y; player.car = null;
+  ckL('brokenPhoneDeadLine', tryPhone() === false && !mission);
+  pcar9.x = ph0.x - 12; pcar9.y = ph0.y;         // the slow hit pushed the car out to arm's length
+  pcar9.speed = 130;
+  checkPhoneHits(pcar9);
+  ckL('phoneFastHitSnaps', ph0.maxAng > 1.4);
+  ph0.respawnT = 0.02;
+  updPhoneBroken(0.05);
+  ckL('phoneRespawns', ph0.broken === false && lampBlockAt(ph0.x, ph0.y, ph0.x + 10, ph0.y) === true && ph0.beam.visible === true);
+  ckL('respawnedPhoneRings', tryPhone() === true && !!mission);
+  mission = null;
   console.log('TLPDBG ' + RTl.join(' ') + ' fails=' + tFails);
 }
 if (location.hash === '#exhaust') {
@@ -16542,7 +16950,7 @@ if (location.hash === '#cores') {
     }
     const reqs9 = [];
     for (let i9 = 0; i9 + 1 < pts9.length; i9 += 2)
-      reqs9.push(i9, pts9[i9][0], pts9[i9][1], pts9[i9 + 1][0], pts9[i9 + 1][1], 3);
+      reqs9.push(i9, pts9[i9][0], pts9[i9][1], pts9[i9 + 1][0], pts9[i9 + 1][1], 3, 0);
     const out9 = await CORES.probeOn(0, reqs9);
     let match9 = 0, total9 = 0;
     for (let i9 = 0; i9 + 1 < pts9.length; i9 += 2) {
@@ -16554,6 +16962,20 @@ if (location.hash === '#cores') {
       if (hitOk9 && xyOk9) match9++;
     }
     ckC('exactParity', total9 >= 40 && match9 === total9);
+    // same pairs through the ROAD-FIRST pass: worker == pathNext(road) exactly
+    const rreq9 = [];
+    for (let i9 = 0; i9 + 1 < pts9.length; i9 += 2)
+      rreq9.push(i9, pts9[i9][0], pts9[i9][1], pts9[i9 + 1][0], pts9[i9 + 1][1], 3, 1);
+    const rout9 = await CORES.probeOn(0, rreq9);
+    let rmatch9 = 0;
+    for (let i9 = 0; i9 + 1 < pts9.length; i9 += 2) {
+      const ref9 = pathNext(pts9[i9][0], pts9[i9][1], pts9[i9 + 1][0], pts9[i9 + 1][1], 3, true);
+      const j9 = (i9 / 2) * 4;
+      const hitOk9 = (rout9[j9 + 1] === 1) === !!ref9;
+      const xyOk9 = !ref9 || (Math.abs(rout9[j9 + 2] - ref9.x) < 0.01 && Math.abs(rout9[j9 + 3] - ref9.y) < 0.01);
+      if (hitOk9 && xyOk9) rmatch9++;
+    }
+    ckC('roadParity', rmatch9 === total9);
     // a live pursuer: plan queued, flushed, answer lands ASYNC off-thread
     const fake9 = { x: pts9[0][0], y: pts9[0][1] };
     chaseWaypoint(fake9, pts9[1][0], pts9[1][1], 1, 3);
@@ -16564,14 +16986,14 @@ if (location.hash === '#cores') {
     const heavy9 = [];
     for (let r9 = 0; r9 < 20; r9++)
       for (let i9 = 0; i9 + 1 < pts9.length; i9 += 2)
-        heavy9.push(heavy9.length, pts9[i9][0], pts9[i9][1], pts9[i9 + 1][0], pts9[i9 + 1][1], 3);
-    const nJobs9 = heavy9.length / 6;
+        heavy9.push(heavy9.length, pts9[i9][0], pts9[i9][1], pts9[i9 + 1][0], pts9[i9 + 1][1], 3, 0);
+    const nJobs9 = heavy9.length / 7;
     let t09 = performance.now();
-    for (let i9 = 0; i9 < heavy9.length; i9 += 6)
+    for (let i9 = 0; i9 < heavy9.length; i9 += 7)
       pathNext(heavy9[i9 + 1], heavy9[i9 + 2], heavy9[i9 + 3], heavy9[i9 + 4], heavy9[i9 + 5]);
     const mainMs9 = performance.now() - t09;
     const nW9 = Math.max(1, CORES.stats.workers);
-    const per9 = Math.ceil(nJobs9 / nW9) * 6;
+    const per9 = Math.ceil(nJobs9 / nW9) * 7;
     t09 = performance.now();
     await Promise.all(Array.from({ length: nW9 }, (_, w9) => {
       const s9 = heavy9.slice(w9 * per9, (w9 + 1) * per9);
@@ -16584,6 +17006,63 @@ if (location.hash === '#cores') {
       ' workers=' + nW9 + ' speedup=' + (poolMs9 > 0 ? (mainMs9 / poolMs9).toFixed(2) : '-') + 'x');
     console.log('CORDBG ' + RC.join(' ') + ' fails=' + cFails);
   }, 800);
+}
+if (location.hash === '#touch') {
+  // MOBILE RIG receipt (Tank order: Android AND iPhone get the same
+  // controls): detection reads the right platforms, the thumb stick and
+  // every button feed the pad globals, USE edges exactly once, a look
+  // drag turns the camera, and phones get the small map.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let uFails = 0;
+    const RU = [], ckU = (n9, v9) => { RU.push(n9 + '=' + v9); if (!v9) uFails++; };
+    ckU('androidDetected', mobileFrom('Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/125 Mobile Safari/537.36', 5) === 'android');
+    ckU('iphoneDetected', mobileFrom('Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Version/17.5 Mobile/15E148 Safari/604.1', 5) === 'ios');
+    ckU('ipadDetected', mobileFrom('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.5 Safari/605.1.15', 5) === 'ios');
+    ckU('desktopClean', mobileFrom('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36', 0) === null);
+    const wasOn9 = TOUCH.on;
+    TOUCH.on = true;
+    ckU('mapShrinksOnPhone', touchMapW() === 132);
+    // the stick: anchor on the left, thumb pushed right+down
+    TOUCH._start(7, VW * 0.2, VH * 0.6);
+    TOUCH._move(7, VW * 0.2 + 40, VH * 0.6 + 22);
+    padLX = padLY = 0;
+    applyTouch();
+    ckU('stickDrivesPad', padLX > 0.5 && padLY > 0.25);
+    TOUCH._end(7);
+    // pedals need a car under the player
+    const tc9 = mkCar(player.x, player.y, 0, 'sedan', 'player');
+    tc9.keep = true; attachCarMesh(tc9); cars.push(tc9);
+    player.car = tc9;
+    const hit9 = (n9, id9) => { const b9 = touchButtons().find(b2 => b2.n === n9); TOUCH._start(id9, b9.x, b9.y); };
+    hit9('gas', 11); hit9('brake', 12); hit9('fire', 13);
+    padThrottle = padBrakeV = 0; padFire = false;
+    applyTouch();
+    ckU('gasPedal', padThrottle === 1);
+    ckU('brakePedal', padBrakeV === 1);
+    ckU('fireButton', padFire === true);
+    TOUCH._end(11); TOUCH._end(12); TOUCH._end(13);
+    // USE is an EDGE: exactly one KeyE per press
+    pressed.delete('KeyE');
+    hit9('use', 14);
+    applyTouch();
+    const use19 = pressed.has('KeyE');
+    pressed.delete('KeyE');
+    applyTouch();
+    ckU('useEdgesOnce', use19 && !pressed.has('KeyE'));
+    TOUCH._end(14);
+    player.car = null;
+    // a right-side drag turns the camera
+    const yaw09 = mouseYaw;
+    TOUCH._start(21, VW * 0.8, VH * 0.4);
+    TOUCH._move(21, VW * 0.8 + 60, VH * 0.4);
+    ckU('dragLooks', Math.abs(mouseYaw - yaw09) > 0.2);
+    TOUCH._end(21);
+    ckU('desktopKeepsBigMap', (TOUCH.on = false, touchMapW() === 208));
+    TOUCH.on = wasOn9;
+    console.log('TOUCHDBG ' + RU.join(' ') + ' fails=' + uFails);
+  }, 400);
 }
 if (location.hash === '#tbone') {
   // T-BONE receipt (Tank: "the windows and doors was not affected"): a hard
@@ -18432,7 +18911,8 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
   for (const o9 of texM9) o9.parent.remove(o9);
   console.log('GPUMERGE2 texturedMeshes=' + texM9.length + ' buckets=' + buckets9.size);
 }
-// the city is final — mirror the tile grid into the worker cores
+// the city is final — mirror both grids into the worker cores (the
+// drivable mask was baked right after genCity, where receipts can see it)
 CORES.arm();
 console.log('CORES ' + CORES.stats.workers + ' workers armed with the ' + GRID_W + 'x' + GRID_H + ' grid');
   console.log('GTA3 BOOT OK — buildings=' + buildings.length + ' lamps=' + lamps.length + ' peds=' + peds.length + ' cars=' + cars.length);

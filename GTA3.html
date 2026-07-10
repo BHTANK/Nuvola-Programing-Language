@@ -787,6 +787,7 @@ function saveGame(slot) {
     bridges: [bridgesOpen[0], bridgesOpen[1], bridgesOpen[2], bridgesOpen[3]], heat: heat, god: godMode, pardon: pardonMode,
     stats: STATS,
     bank: bankBalance,
+    season: WEATHER.seasonStart,               // the snow week rides the save
     garage: garageSnapshot()
   };
   try {
@@ -829,6 +830,7 @@ function loadGame(slot) {
   disarmT = 0; disarmCool = 8;
   godMode = !!data.god;
   pardonMode = !!data.pardon;
+  WEATHER.seasonStart = data.season || null;   // old saves: the week has passed
   // saved flag OR derived from progress — old saves stay honest about new bridges
   for (let i = 0; i < 4; i++) {
     bridgesOpen[i] = !!(data.bridges && data.bridges[i]) || missionsDone >= BRIDGE_GATES[i];
@@ -3031,6 +3033,7 @@ const WEATHER = {
   inten: 0,                   // 0..1 ramp of the current spell
   wet: 0, snow: 0,            // ground memory: soak + accumulation
   deep: 0,                    // BLIZZARD depth: 1 = waist-high powder
+  seasonStart: null,          // new save opens ONE WEEK of snow season (system calendar)
   flashT: 0, flash2: 0,       // sky-flash envelope + queued second blink
   thunderQ: [],               // rolling claps on a delay
   boltT: 0,
@@ -3530,11 +3533,21 @@ function updWeather(dt) {
   // brisk pace; in play, clear skies trade with rain or snow at random
   W9.t -= dt;
   if (W9.t <= 0) {
-    if (state === 'menu') {
+    // debug hashes pin clear skies — a snow spell mid-receipt would skew
+    // every driving sim through the traction law (#weather runs its own)
+    if (location.hash && location.hash !== '#weather') { W9.mode = 'clear'; W9.t = 9999; }
+    else if (state === 'menu') {
       W9.mode = MENU_WX9[menuWxI9++ % MENU_WX9.length];
       W9.t = W9.mode === 'clear' ? 13 : 24;
-    } else if (W9.mode === 'clear') { W9.mode = Math.random() < 0.55 ? 'rain' : 'snow'; W9.t = rndf(55, 115); }
-    else { W9.mode = 'clear'; W9.t = rndf(100, 210); }
+    } else if (W9.mode === 'clear') {
+      // SEASON LAW (Tank): every 30 calendar days brings 7 days of snow,
+      // anchored at the save's birth — snow week bars rain entirely, the
+      // other 23 days run random rain. Lightning rides either (thundersnow).
+      const age9 = W9.seasonStart ? Date.now() - W9.seasonStart : 8 * 86400e3;
+      const season9 = (age9 % (30 * 86400e3)) < 7 * 86400e3 && W9.seasonStart;
+      W9.mode = season9 ? 'snow' : 'rain';
+      W9.t = rndf(55, 115);
+    } else { W9.mode = 'clear'; W9.t = rndf(100, 210); }
   }
   const want9 = W9.mode === 'clear' ? 0 : 1;
   W9.inten += (want9 - W9.inten) * Math.min(1, dt * 0.4);
@@ -3615,7 +3628,7 @@ function updWeather(dt) {
   if (W9.flash2 > 0) { W9.flash2 -= dt; if (W9.flash2 <= 0) W9.flashT = 0.12; }
   if (W9.flashT > 0) W9.flashT -= dt;
   hemiLight.intensity = HEMI_BASE + (W9.flashT > 0 ? clamp(W9.flashT / 0.2, 0, 1) * 5 : 0);
-  if (W9.mode === 'rain' && W9.inten > 0.5 && Math.random() < dt * 0.07) {
+  if (W9.mode !== 'clear' && W9.inten > 0.5 && Math.random() < dt * 0.07) {   // thundersnow is real
     W9.flashT = 0.16;
     W9.flash2 = rndf(0.15, 0.32);
     W9.thunderQ.push({ d: rndf(0.5, 2.2) });
@@ -3625,8 +3638,8 @@ function updWeather(dt) {
     if (W9.thunderQ[i9].d <= 0) { sfx('thunder'); W9.thunderQ.splice(i9, 1); }
   }
   if (W9.boltT > 0) { W9.boltT -= dt; if (W9.boltT <= 0) boltGrp.visible = false; }
-  // the 0.001% bolt (per character, per moment, storms only)
-  if (W9.mode === 'rain' && W9.inten > 0.5 && state === 'play') {
+  // the 0.001% bolt (per character, per moment — any live storm, snow included)
+  if (W9.mode !== 'clear' && W9.inten > 0.5 && state === 'play') {
     if (!player.dead && Math.random() < W9.STRIKE_P) lightningStrike(player.x, player.y, player);
     for (const p9 of peds) {
       if (p9.dead) continue;
@@ -13676,6 +13689,7 @@ function startGame() {
   player.y = playerStart.y;
   mouseYaw = player.angle;
   cheated = false;
+  WEATHER.seasonStart = Date.now();          // a NEW save opens the snow week (loads restore their own)
   state = 'play';
   mdown = false;                             // the click that started the game is not a trigger pull
   ensureShopkeeps();
@@ -17887,8 +17901,8 @@ if (location.hash === '#weather') {
     for (let i9 = 0; i9 < 12; i9++) digSnow(vx9, vy9, 6, 0.9);
     ckW('feetCarveTrails', virgin9 > 0.9 && deepAt(vx9, vy9) < 0.45);
     // the powder DRAGS: same push, deep drift vs plowed trail — measured
-    // on FRESH ground (the receipt loop already trampled the spawn spot)
-    player.x += 300;
+    // on guaranteed-virgin far-corner ground (peds trample near spawn)
+    player.x = (GRID_W - 12) * TILE; player.y = (GRID_H - 12) * TILE;
     player._wdPX = player.x; player._wdPY = player.y;
     const px09 = player.x;
     player.x += 10;
@@ -17913,6 +17927,45 @@ if (location.hash === '#weather') {
     WEATHER.deep = 0.5;
     for (let i9 = 0; i9 < 400; i9++) updWeather(0.1);
     ckW('clearMeltsTheDrift', WEATHER.deep < 0.05);
+    // SEASON LAW: the new-save snow week bars rain; normal days bar snow
+    ckW('newSaveOpensTheWeek', typeof WEATHER.seasonStart === 'number' && Date.now() - WEATHER.seasonStart < 60000);
+    let sawRain9 = false, sawSnow9 = false;
+    for (let c9 = 0; c9 < 6; c9++) {
+      WEATHER.mode = 'clear'; WEATHER.t = 0;
+      updWeather(0.01);
+      if (WEATHER.mode === 'rain') sawRain9 = true;
+      if (WEATHER.mode === 'snow') sawSnow9 = true;
+    }
+    ckW('snowWeekBarsRain', sawSnow9 && !sawRain9);
+    WEATHER.seasonStart = Date.now() - 8 * 86400e3;
+    sawRain9 = false; sawSnow9 = false;
+    for (let c9 = 0; c9 < 6; c9++) {
+      WEATHER.mode = 'clear'; WEATHER.t = 0;
+      updWeather(0.01);
+      if (WEATHER.mode === 'rain') sawRain9 = true;
+      if (WEATHER.mode === 'snow') sawSnow9 = true;
+    }
+    ckW('normalDaysRainNoSnow', sawRain9 && !sawSnow9);
+    // day 31 = one day into the NEXT 30-day cycle: winter is back
+    WEATHER.seasonStart = Date.now() - 31 * 86400e3;
+    WEATHER.mode = 'clear'; WEATHER.t = 0;
+    updWeather(0.01);
+    ckW('winterReturnsEvery30', WEATHER.mode === 'snow');
+    // thundersnow: lightning CAN fire during a snow spell
+    WEATHER.mode = 'snow'; WEATHER.t = 600; WEATHER.inten = 1; WEATHER.flashT = 0;
+    let sawFlash9 = false;
+    for (let i9 = 0; i9 < 1200 && !sawFlash9; i9++) { updWeather(0.1); if (WEATHER.flashT > 0) sawFlash9 = true; }
+    ckW('thundersnowLives', sawFlash9);
+    // the week rides the save (slot 10 snapshot-and-restore — never
+    // clobber a real save)
+    const bak9 = localStorage.getItem('gta3_save_10');
+    WEATHER.seasonStart = 424242;
+    saveGame(10);
+    WEATHER.seasonStart = 999;
+    loadGame(10);
+    ckW('seasonRidesTheSave', WEATHER.seasonStart === 424242);
+    if (bak9 === null) localStorage.removeItem('gta3_save_10'); else localStorage.setItem('gta3_save_10', bak9);
+    WEATHER.seasonStart = Date.now();
     runConsole('weather clear');
     console.log('WTHDBG ' + RW.join(' ') + ' fails=' + wFails);
   }, 400);

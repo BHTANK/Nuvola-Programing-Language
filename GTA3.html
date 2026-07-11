@@ -746,6 +746,9 @@ function runConsole(raw) {
         : w9 === 'rain' ? 'Storm rolling in.'
           : w9 === 'blizzard' ? 'WHITEOUT — waist-deep and rising.' : 'Snow rolling in.';
     }
+  } else if (cmd === "it's raining meatballs") {
+    METEOR.on = !METEOR.on;
+    out = METEOR.on ? 'THE SKY OPENS. Meatballs, extra hot.' : 'The sky forgives. Storm over.';
   } else if (cmd === 'stats') {
     msg('CARS DESTROYED ' + STATS.carsDestroyed + ' · RUN OVER ' + STATS.pedsRunOver + ' · CIVILIANS ' + STATS.civiliansKilled + ' · COPS ' + STATS.copsKilled + ' · COMBINE ' + STATS.goonsKilled, 12);
     msg('SHOTS ' + STATS.ammoSpent + ' · ACCURACY ' + statAccuracy() + '% · LONGEST WANTED ' + Math.round(STATS.longestWanted) + 's', 12);
@@ -3313,6 +3316,64 @@ function updDeepSnow(dt) {
   snowSheet.position.y = W9.deep * 1.2;          // beyond the fog the flat sheet still carries
   snowSheet.updateMatrix();
 }
+// ---- "IT'S RAINING MEATBALLS" (Tank cheat): fiery meteors out of a sky
+// burned red — land strikes blow craters of fire and rock debris, water
+// strikes fountain white. Toggle on, toggle off; the sky heals after.
+const METEOR = { on: false, meteors: [], cool: 0, landHits: 0, waterHits: 0 };
+const _skyCol9 = new THREE.Color(0x101a2a), _fogCol9 = new THREE.Color(0x101a2a);
+const _skyRed9 = new THREE.Color(0x3a0d08), _fogRed9 = new THREE.Color(0x40120a);
+function spawnMeteor9(tx9, ty9) {
+  const m9 = new THREE.Mesh(new THREE.SphereGeometry(rndf(1.1, 2.1), 7, 6),
+    new THREE.MeshBasicMaterial({ color: 0xffb050 }));
+  // a slanted fall that lands EXACTLY on the target
+  const vx9 = rndf(-18, 18), vz9 = rndf(-18, 18), vy9 = -rndf(60, 85);
+  const t09 = 100 / -vy9;
+  m9.position.set(tx9 * RS - vx9 * t09, 100, ty9 * RS - vz9 * t09);
+  scene.add(m9);
+  METEOR.meteors.push({ mesh: m9, vx: vx9, vy: vy9, vz: vz9 });
+}
+function updMeteors9(dt) {
+  const M9 = METEOR;
+  // the sky burns toward red while the storm is on, heals when it's off
+  if (scene.fog) scene.fog.color.lerp(M9.on ? _fogRed9 : _fogCol9, Math.min(1, dt * 1.2));
+  if (scene.background && scene.background.isColor) scene.background.lerp(M9.on ? _skyRed9 : _skyCol9, Math.min(1, dt * 1.2));
+  if (M9.on && state === 'play' && !paused) {
+    M9.cool -= dt;
+    if (M9.cool <= 0 && M9.meteors.length < 7) {
+      M9.cool = rndf(0.35, 1.1);
+      const a9 = Math.random() * Math.PI * 2, d9 = rndf(60, 700);
+      spawnMeteor9(player.x + Math.cos(a9) * d9, player.y + Math.sin(a9) * d9);
+    }
+  }
+  for (let i9 = M9.meteors.length - 1; i9 >= 0; i9--) {
+    const m9 = M9.meteors[i9];
+    const p9 = m9.mesh.position;
+    p9.x += m9.vx * dt; p9.y += m9.vy * dt; p9.z += m9.vz * dt;
+    // the burning tail
+    addPart(p9.x / RS, p9.z / RS, p9.y, rndf(-14, 14), rndf(-14, 14), rndf(-4, 10),
+      rndf(0.25, 0.5), Math.random() < 0.5 ? 0xff7020 : 0xffc060, rndf(0.8, 1.6), true);
+    if (p9.y > 1.2) continue;
+    // IMPACT
+    scene.remove(m9.mesh);
+    m9.mesh.geometry.dispose();
+    m9.mesh.material.dispose();
+    M9.meteors.splice(i9, 1);
+    const lx9 = p9.x / RS, ly9 = p9.z / RS;
+    if (waterAt(lx9, ly9)) {
+      M9.waterHits++;
+      sfx('boom', lx9, ly9);
+      for (let k9 = 0; k9 < 26; k9++)            // the sea answers with a white column
+        addPart(lx9 + rndf(-6, 6), ly9 + rndf(-6, 6), 0.5, rndf(-30, 30), rndf(-30, 30), rndf(18, 46),
+          rndf(0.8, 1.5), k9 % 3 ? 0xbfe0ff : 0xffffff, rndf(1.2, 2.4), false);
+    } else {
+      M9.landHits++;
+      explodeAt(lx9, ly9, null, 80, 150);
+      for (let k9 = 0; k9 < 22; k9++)            // rock chunks + embers
+        addPart(lx9 + rndf(-4, 4), ly9 + rndf(-4, 4), rndf(0.5, 2), rndf(-60, 60), rndf(-60, 60), rndf(10, 40),
+          rndf(0.7, 1.4), k9 % 3 ? 0x3a3026 : 0xff8030, rndf(0.7, 1.5), k9 % 3 === 0);
+    }
+  }
+}
 // THE MOON (Tank order): Earth's near side, hung where the light comes
 // from — maria, Tycho's rays, storm clouds dim it
 const MOON_DIR = new THREE.Vector3(120, 200, 60).normalize();
@@ -3727,6 +3788,7 @@ function updWeather(dt) {
   moonDisc.lookAt(camera.position);
   moonDisc.material.opacity = 1 - W9.inten * 0.75;
   updDeepSnow(dt);                               // the blizzard drift, if any
+  updMeteors9(dt);                               // the meatballs, if Tank called them
   updMarks(dt);                                  // the world remembers who moved through it
 }
 // the moon CASTS: a follow-box of real shadow around the player
@@ -17995,6 +18057,41 @@ if (location.hash === '#peds') {
     cop9.dead = true;
     console.log('PEDDBG ' + RP.join(' ') + ' fails=' + pFails);
   }, 500);
+}
+if (location.hash === '#meteors') {
+  // MEATBALL receipt (Tank cheat): the toggle brands the run and burns the
+  // sky red, meteors fall, a land strike EXPLODES, a water strike counts
+  // a splash, and turning it off heals the sky.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let mFails = 0;
+    const RM = [], ckM = (n9, v9) => { RM.push(n9 + '=' + v9); if (!v9) mFails++; };
+    cheated = false;
+    runConsole("it's raining meatballs");
+    ckM('cheatTogglesAndBrands', METEOR.on === true && cheated === true);
+    for (let i9 = 0; i9 < 120; i9++) updMeteors9(1 / 30);
+    ckM('skyBurnsRed', scene.background.r > scene.background.b);
+    ckM('meteorsFall', METEOR.meteors.length > 0 || METEOR.landHits + METEOR.waterHits > 0);
+    // spawner off, drain the sky, then AIMED strikes with exact counters
+    runConsole("it's raining meatballs");
+    for (let i9 = 0; i9 < 600 && METEOR.meteors.length > 0; i9++) updMeteors9(1 / 30);
+    const l09 = METEOR.landHits;
+    spawnMeteor9(player.x + 100, player.y);
+    for (let i9 = 0; i9 < 400 && METEOR.landHits === l09; i9++) updMeteors9(1 / 30);
+    ckM('landStrikeExplodes', METEOR.landHits === l09 + 1);
+    let wx9 = -1, wy9 = -1;
+    for (let iy9 = 0; iy9 < GRID_H && wx9 < 0; iy9++)
+      for (let ix9 = 0; ix9 < GRID_W; ix9++)
+        if (tiles[iy9 * GRID_W + ix9] === T_WATER) { wx9 = (ix9 + 0.5) * TILE; wy9 = (iy9 + 0.5) * TILE; break; }
+    const w09 = METEOR.waterHits;
+    spawnMeteor9(wx9, wy9);
+    for (let i9 = 0; i9 < 400 && METEOR.waterHits === w09; i9++) updMeteors9(1 / 30);
+    ckM('waterStrikeSplashes', METEOR.waterHits === w09 + 1);
+    for (let i9 = 0; i9 < 300; i9++) updMeteors9(1 / 30);
+    ckM('skyHeals', METEOR.on === false && Math.abs(scene.background.b - 0x2a / 255) < 0.03 && scene.background.b > scene.background.r);
+    console.log('MTRDBG ' + RM.join(' ') + ' fails=' + mFails);
+  }, 400);
 }
 if (location.hash === '#weather') {
   // WEATHER receipt (Tank order): rain wets the ground and wakes the

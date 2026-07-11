@@ -749,6 +749,9 @@ function runConsole(raw) {
   } else if (cmd === "it's raining meatballs") {
     METEOR.on = !METEOR.on;
     out = METEOR.on ? 'THE SKY OPENS. Meatballs, extra hot.' : 'The sky forgives. Storm over.';
+  } else if (/^it'?s gojillia!?$/.test(cmd)) {
+    if (GOJI.state === 'off') { GOJI.on = true; spawnGoji9(); out = 'THE KING HAS RISEN. Run.'; }
+    else { GOJI.on = false; GOJI.state = 'leave'; out = 'The King returns to the deep.'; }
   } else if (cmd === 'stats') {
     msg('CARS DESTROYED ' + STATS.carsDestroyed + ' · RUN OVER ' + STATS.pedsRunOver + ' · CIVILIANS ' + STATS.civiliansKilled + ' · COPS ' + STATS.copsKilled + ' · COMBINE ' + STATS.goonsKilled, 12);
     msg('SHOTS ' + STATS.ammoSpent + ' · ACCURACY ' + statAccuracy() + '% · LONGEST WANTED ' + Math.round(STATS.longestWanted) + 's', 12);
@@ -1246,6 +1249,15 @@ function sfx(k, x, y, v9) {
     noise(0.3, 0.3, 1800, 'bandpass', 3);          // sizzle
     tone(3200, 300, 0.18, 'sawtooth', 0.06);       // arc whine falling
     tone(70, 24, 0.5, 'sine', 0.25);               // the crack's body
+  } else if (k === 'roar') {
+    noise(1.5, 0.5, 320, 'bandpass', 1.6);         // throat rasp
+    tone(150, 60, 1.4, 'sawtooth', 0.28);          // the bellow falls
+    tone(95, 40, 1.6, 'square', 0.12);
+    tone(52, 30, 1.8, 'sine', 0.3);                // chest sub
+    sendVerbFrom(sfxDest, 0.5, true);
+  } else if (k === 'stomp') {
+    tone(52, 26, 0.28, 'sine', 0.4);               // the street takes the weight
+    noise(0.14, 0.3, 220, 'lowpass');
   } else if (k === 'pickup') {
     tone(880, 1320, 0.09, 'triangle', 0.07);
     tone(1320, 1760, 0.1, 'triangle', 0.05);
@@ -3374,8 +3386,255 @@ function updMeteors9(dt) {
     }
   }
 }
-// THE MOON (Tank order): Earth's near side, hung where the light comes
-// from — maria, Tycho's rays, storm clouds dim it
+// ---- "IT'S GOJILLIA!" (Tank cheat): the King rises from the harbor.
+// Beam of death (sweeping atomic breath), a tail that TOPPLES buildings
+// (crumples their vertices inside the merged city), powerful hands that
+// slam, and feet that crush whatever they land on.
+const mergedStatics9 = [];                       // filled by the boot merge
+const GOJI = {
+  on: false, grp: null, state: 'off',
+  x: 0, y: 0, angle: 0, riseT: 0, walkPh: 0,
+  tgtX: 0, tgtY: 0, retgtT: 0,
+  breathCool: 6, breathT: 0, breathA: 0,
+  tailCool: 5, tailT: 0, smashCool: 4, smashT: 0,
+  roarT: 2, stompT: 0, crushT: 0,
+  topples: 0, breaths: 0, smashes: 0, crushes: 0,
+  head: null, jaw: null, tail: null, armL: null, armR: null, legL: null, legR: null,
+  beam: null, beamGlow: null
+};
+function buildGoji9() {
+  const g9 = new THREE.Group();
+  const hide9 = new THREE.MeshLambertMaterial({ color: 0x39493c });
+  const belly9 = new THREE.MeshLambertMaterial({ color: 0x6a705c });
+  const fin9 = new THREE.MeshLambertMaterial({ color: 0x7a8a6a });
+  const bx9 = (w9, h9, d9, mat9, x9, y9, z9) => {
+    const m9 = new THREE.Mesh(new THREE.BoxGeometry(w9, h9, d9), mat9);
+    m9.position.set(x9, y9, z9);
+    m9.castShadow = true; m9.receiveShadow = true;
+    return m9;
+  };
+  g9.add(bx9(6.5, 9.5, 4.6, hide9, 0, 12.5, 0));           // body
+  g9.add(bx9(4.6, 7.5, 0.8, belly9, 2.6, 12, 0));          // belly plate (faces +X)
+  const legL9 = bx9(2.4, 8, 3, hide9, 0.4, 4, -1.9);
+  const legR9 = bx9(2.4, 8, 3, hide9, 0.4, 4, 1.9);
+  g9.add(legL9); g9.add(legR9);
+  const head9 = new THREE.Group();
+  head9.position.set(1.4, 19.5, 0);
+  head9.add(bx9(3.4, 3, 3, hide9, 0, 1, 0));               // skull
+  head9.add(bx9(2.6, 1.3, 2, hide9, 2.2, 0.7, 0));         // snout
+  const jaw9 = bx9(2.4, 0.8, 1.8, belly9, 2.1, -0.35, 0);  // jaw
+  head9.add(jaw9);
+  g9.add(head9);
+  const armL9 = bx9(1.3, 4.6, 1.3, hide9, 2.6, 14.5, -2.6);
+  const armR9 = bx9(1.3, 4.6, 1.3, hide9, 2.6, 14.5, 2.6);
+  const handL9 = bx9(1.8, 1.6, 1.8, belly9, 0, -2.8, 0);
+  const handR9 = bx9(1.8, 1.6, 1.8, belly9, 0, -2.8, 0);
+  armL9.add(handL9); armR9.add(handR9);
+  g9.add(armL9); g9.add(armR9);
+  const tail9 = new THREE.Group();
+  tail9.position.set(-3, 10.5, 0);
+  for (let i9 = 0; i9 < 5; i9++) {
+    const s9 = 3 - i9 * 0.5;
+    tail9.add(bx9(4.2, s9, s9, hide9, -2 - i9 * 3.8, -i9 * 0.9, 0));
+  }
+  g9.add(tail9);
+  for (let i9 = 0; i9 < 4; i9++) {                          // dorsal fins
+    const f9 = bx9(1.6, 1.6, 0.5, fin9, -1.5 - i9 * 1.2, 17.5 + (i9 < 2 ? i9 * 1.4 : (3 - i9) * 1.4), 0);
+    f9.rotation.x = Math.PI / 4;
+    g9.add(f9);
+  }
+  // the beam of death — repositioned every breathing frame
+  const beam9 = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 1.4, 1, 8, 1, true),
+    new THREE.MeshBasicMaterial({ color: 0xbdf2ff, transparent: true, opacity: 0.95, depthWrite: false }));
+  const beamGlow9 = new THREE.Mesh(new THREE.CylinderGeometry(1.1, 2.6, 1, 8, 1, true),
+    new THREE.MeshBasicMaterial({ color: 0x3f9fff, transparent: true, opacity: 0.35, depthWrite: false }));
+  beam9.visible = beamGlow9.visible = false;
+  scene.add(beam9); scene.add(beamGlow9);
+  Object.assign(GOJI, { grp: g9, head: head9, jaw: jaw9, tail: tail9, armL: armL9, armR: armR9, legL: legL9, legR: legR9, beam: beam9, beamGlow: beamGlow9 });
+  scene.add(g9);
+}
+function toppleBuilding9(b9) {
+  if (b9.toppled || b9.style === 'garage' || b9.garIdx != null) return false;
+  b9.toppled = true;
+  GOJI.topples++;
+  const x09 = b9.tx * TILE * RS, x19 = (b9.tx + b9.tw) * TILE * RS;
+  const z09 = b9.ty * TILE * RS, z19 = (b9.ty + b9.th) * TILE * RS;
+  const rub9 = rndf(2.2, 4.2);
+  for (const mm9 of mergedStatics9) {
+    const pa9 = mm9.geometry.attributes.position;
+    let touched9 = false;
+    for (let i9 = 0; i9 < pa9.count; i9++) {
+      const px9 = pa9.getX(i9), pz9 = pa9.getZ(i9);
+      if (px9 < x09 || px9 > x19 || pz9 < z09 || pz9 > z19) continue;
+      if (pa9.getY(i9) <= rub9) continue;
+      pa9.setY(i9, rub9 * (0.45 + 0.55 * Math.abs(Math.sin(px9 * 12.9 + pz9 * 7.7))));   // jagged heap
+      touched9 = true;
+    }
+    if (touched9) pa9.needsUpdate = true;
+  }
+  const cx9 = ((x09 + x19) / 2) / RS, cy9 = ((z09 + z19) / 2) / RS;
+  explodeAt(cx9, cy9, null, 70, 60);
+  for (let k9 = 0; k9 < 40; k9++)
+    addPart(cx9 + rndf(-b9.tw, b9.tw) * TILE * 0.4, cy9 + rndf(-b9.th, b9.th) * TILE * 0.4,
+      rndf(1, 12), rndf(-40, 40), rndf(-40, 40), rndf(-4, 22), rndf(1, 2.2), 0x8a8478, rndf(1.4, 2.8), false);
+  return true;
+}
+function spawnGoji9() {
+  if (!GOJI.grp) buildGoji9();
+  // the King rises from the nearest open water
+  let bw9 = null, bd9 = 1e9;
+  for (let iy9 = 2; iy9 < GRID_H - 2; iy9 += 2)
+    for (let ix9 = 2; ix9 < GRID_W - 2; ix9 += 2)
+      if (tiles[iy9 * GRID_W + ix9] === T_WATER) {
+        const d9 = dist((ix9 + 0.5) * TILE, (iy9 + 0.5) * TILE, player.x, player.y);
+        if (d9 < bd9) { bd9 = d9; bw9 = { x: (ix9 + 0.5) * TILE, y: (iy9 + 0.5) * TILE }; }
+      }
+  GOJI.x = bw9 ? bw9.x : player.x + 400;
+  GOJI.y = bw9 ? bw9.y : player.y;
+  GOJI.state = 'rise';
+  GOJI.riseT = 0;
+  GOJI.retgtT = 0;
+  GOJI.grp.visible = true;
+  sfx('roar');
+  msg('SOMETHING RISES FROM THE HARBOR.', 7);
+}
+function updGoji(dt) {
+  const G9 = GOJI;
+  if (G9.state === 'off') return;
+  const g9 = G9.grp;
+  if (G9.state === 'rise') {
+    G9.riseT += dt;
+    g9.position.set(G9.x * RS, -28 + Math.min(1, G9.riseT / 2.8) * 28, G9.y * RS);
+    for (let k9 = 0; k9 < 3; k9++)
+      addPart(G9.x + rndf(-24, 24), G9.y + rndf(-24, 24), 0.5, rndf(-20, 20), rndf(-20, 20), rndf(10, 30), rndf(0.6, 1.2), 0xbfe0ff, rndf(1.2, 2.2), false);
+    if (G9.riseT >= 2.8) { G9.state = 'roam'; sfx('roar'); }
+    return;
+  }
+  if (G9.state === 'leave') {
+    g9.position.y -= dt * 9;
+    if (g9.position.y < -30) { g9.visible = false; G9.beam.visible = G9.beamGlow.visible = false; G9.state = 'off'; }
+    return;
+  }
+  // ---- roam: pick somewhere to ruin; the player nearby is a magnet
+  G9.retgtT -= dt;
+  if (G9.retgtT <= 0) {
+    G9.retgtT = rndf(9, 16);
+    if (dist(G9.x, G9.y, player.x, player.y) < 700) { G9.tgtX = player.x; G9.tgtY = player.y; }
+    else {
+      const b9 = buildings[(Math.random() * buildings.length) | 0];
+      G9.tgtX = (b9.tx + b9.tw / 2) * TILE; G9.tgtY = (b9.ty + b9.th / 2) * TILE;
+    }
+  }
+  const ta9 = Math.atan2(G9.tgtY - G9.y, G9.tgtX - G9.x);
+  G9.angle += angDiff(G9.angle, ta9) * Math.min(1, dt * 1.2);
+  const spd9 = G9.breathT > 0 ? 0 : 52;
+  G9.x += Math.cos(G9.angle) * spd9 * dt;
+  G9.y += Math.sin(G9.angle) * spd9 * dt;
+  G9.walkPh += dt * (spd9 > 0 ? 3.2 : 0);
+  g9.position.set(G9.x * RS, Math.abs(Math.sin(G9.walkPh)) * 0.5, G9.y * RS);
+  g9.rotation.y = -G9.angle;
+  G9.legL.rotation.z = Math.sin(G9.walkPh) * 0.35;
+  G9.legR.rotation.z = -Math.sin(G9.walkPh) * 0.35;
+  G9.tail.rotation.y = Math.sin(G9.walkPh * 0.5) * 0.3 + (G9.tailT > 0 ? Math.sin(G9.tailT * Math.PI / 0.7) * 1.3 : 0);
+  G9.armL.rotation.z = G9.smashT > 0 ? -1.6 * Math.sin(G9.smashT * Math.PI / 0.5) : Math.sin(G9.walkPh) * 0.15;
+  G9.armR.rotation.z = G9.smashT > 0 ? -1.6 * Math.sin(G9.smashT * Math.PI / 0.5) : -Math.sin(G9.walkPh) * 0.15;
+  // stomps shake the street
+  G9.stompT -= dt;
+  if (spd9 > 0 && G9.stompT <= 0) {
+    G9.stompT = 0.62;
+    sfx('stomp', G9.x, G9.y);
+    const dp9 = dist(G9.x, G9.y, player.x, player.y);
+    if (dp9 < 500) rumble(clamp(0.7 - dp9 / 800, 0.1, 0.6), 0.2, 140);
+  }
+  G9.roarT -= dt;
+  if (G9.roarT <= 0) { G9.roarT = rndf(9, 15); sfx('roar', G9.x, G9.y); scare(G9.x, G9.y, 800); }
+  // feet + hull crush whatever they land on
+  G9.crushT -= dt;
+  if (G9.crushT <= 0) {
+    G9.crushT = 0.25;
+    for (const c9 of cars)
+      if (!c9.dead && (c9.alt || 0) < 2 && dist(c9.x, c9.y, G9.x, G9.y) < 26) { explodeCar(c9); G9.crushes++; }
+    for (const p9 of peds)
+      if (!p9.dead && dist(p9.x, p9.y, G9.x, G9.y) < 18) { p9.hp = 0; p9.dead = true; gibBurst(p9.x, p9.y, p9.shirt); if (p9.mesh) p9.mesh.visible = false; G9.crushes++; }
+    for (const b9 of buildings)
+      if (!b9.toppled && dist((b9.tx + b9.tw / 2) * TILE, (b9.ty + b9.th / 2) * TILE, G9.x, G9.y) < 95) toppleBuilding9(b9);
+  }
+  // ---- BEAM OF DEATH: a sweeping line of ruin
+  G9.breathCool -= dt;
+  if (G9.breathCool <= 0 && G9.breathT <= 0) {
+    G9.breathCool = rndf(7, 11);
+    G9.breathT = 2.1;
+    G9.breathA = dist(G9.x, G9.y, player.x, player.y) < 600 ? Math.atan2(player.y - G9.y, player.x - G9.x) : G9.angle;
+    G9.breathTick = 0;
+    sfx('roar', G9.x, G9.y);
+  }
+  if (G9.breathT > 0) {
+    G9.breathT -= dt;
+    const sw9 = 1 - G9.breathT / 2.1;
+    const ba9 = G9.breathA + (sw9 - 0.5) * 1.0;
+    const bd9 = 130 + sw9 * 110;
+    const gx9 = G9.x + Math.cos(ba9) * bd9, gy9 = G9.y + Math.sin(ba9) * bd9;
+    // the beam mesh spans mouth -> ground point
+    const m09 = new THREE.Vector3(G9.x * RS + Math.cos(G9.angle) * 3.4, 20.2, G9.y * RS + Math.sin(G9.angle) * 3.4);
+    const m19 = new THREE.Vector3(gx9 * RS, 0.5, gy9 * RS);
+    const dir9 = m19.clone().sub(m09);
+    const len9 = dir9.length();
+    for (const bm9 of [G9.beam, G9.beamGlow]) {
+      bm9.visible = true;
+      bm9.position.copy(m09).addScaledVector(dir9, 0.5);
+      bm9.scale.set(1, len9, 1);
+      bm9.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir9.normalize());
+    }
+    G9.breathTick -= dt;
+    if (G9.breathTick <= 0) {
+      G9.breathTick = 0.16;
+      explodeAt(gx9, gy9, null, 55, 90);
+      G9.breaths++;
+    }
+    if (G9.breathT <= 0) { G9.beam.visible = G9.beamGlow.visible = false; }
+  }
+  // ---- TAIL: swing when there is something worth toppling or flinging
+  G9.tailCool -= dt;
+  if (G9.tailT > 0) G9.tailT -= dt;
+  if (G9.tailCool <= 0 && G9.tailT <= 0) {
+    let worth9 = 0;
+    for (const c9 of cars) if (!c9.dead && dist(c9.x, c9.y, G9.x, G9.y) < 170) worth9++;
+    for (const b9 of buildings) if (!b9.toppled && b9.style !== 'garage' && dist((b9.tx + b9.tw / 2) * TILE, (b9.ty + b9.th / 2) * TILE, G9.x, G9.y) < 210) worth9 += 2;
+    if (worth9 >= 2) {
+      G9.tailCool = rndf(6, 9);
+      G9.tailT = 0.7;
+      for (const c9 of cars)
+        if (!c9.dead && dist(c9.x, c9.y, G9.x, G9.y) < 170) {
+          c9.speed += rndf(200, 320) * (Math.random() < 0.5 ? 1 : -1);
+          dentCar(c9, G9.x, G9.y, 300);
+          carDamage(c9, 55, null);
+        }
+      for (const b9 of buildings)
+        if (!b9.toppled && dist((b9.tx + b9.tw / 2) * TILE, (b9.ty + b9.th / 2) * TILE, G9.x, G9.y) < 210) toppleBuilding9(b9);
+      for (let i9 = 0; i9 < lamps.length; i9++)
+        if (!lamps[i9].broken && dist(lamps[i9].x, lamps[i9].y, G9.x, G9.y) < 170) breakLamp(i9, Math.atan2(lamps[i9].y - G9.y, lamps[i9].x - G9.x), null);
+      for (let i9 = 0; i9 < trafficLights.length; i9++)
+        if (!trafficLights[i9].broken && dist(trafficLights[i9].x, trafficLights[i9].y, G9.x, G9.y) < 170) breakTL(i9, Math.atan2(trafficLights[i9].y - G9.y, trafficLights[i9].x - G9.x), null);
+      for (let i9 = 0; i9 < phones.length; i9++)
+        if (!phones[i9].broken && dist(phones[i9].x, phones[i9].y, G9.x, G9.y) < 170) breakPhone(i9, Math.atan2(phones[i9].y - G9.y, phones[i9].x - G9.x), null);
+      sfx('crash', G9.x, G9.y);
+    } else G9.tailCool = 2;
+  }
+  // ---- POWERFUL HANDS: the slam for whatever stands its ground ahead
+  G9.smashCool -= dt;
+  if (G9.smashT > 0) G9.smashT -= dt;
+  if (G9.smashCool <= 0 && G9.smashT <= 0) {
+    const fx9 = G9.x + Math.cos(G9.angle) * 55, fy9 = G9.y + Math.sin(G9.angle) * 55;
+    let ahead9 = dist(player.x, player.y, fx9, fy9) < 55;
+    if (!ahead9) for (const c9 of cars) if (!c9.dead && dist(c9.x, c9.y, fx9, fy9) < 55) { ahead9 = true; break; }
+    if (ahead9) {
+      G9.smashCool = rndf(5, 8);
+      G9.smashT = 0.5;
+      explodeAt(fx9, fy9, null, 72, 145);
+      G9.smashes++;
+    } else G9.smashCool = 1.2;
+  }
+}
 const MOON_DIR = new THREE.Vector3(120, 200, 60).normalize();
 const moonDisc = (() => {
   const c9 = document.createElement('canvas');
@@ -3789,6 +4048,7 @@ function updWeather(dt) {
   moonDisc.material.opacity = 1 - W9.inten * 0.75;
   updDeepSnow(dt);                               // the blizzard drift, if any
   updMeteors9(dt);                               // the meatballs, if Tank called them
+  updGoji(dt);                                   // the King, if Tank woke him
   updMarks(dt);                                  // the world remembers who moved through it
 }
 // the moon CASTS: a follow-box of real shadow around the player
@@ -18058,6 +18318,51 @@ if (location.hash === '#peds') {
     console.log('PEDDBG ' + RP.join(' ') + ' fails=' + pFails);
   }, 500);
 }
+if (location.hash === '#goji') {
+  // GOJILLIA receipt (Tank cheat): the King rises and brands the run,
+  // walks, breathes ruin, topples a building with vertex-crumple, slams
+  // what stands ahead, crushes what's underfoot, and leaves when told.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let gFails9 = 0;
+    const RG9 = [], ckG9 = (n9, v9) => { RG9.push(n9 + '=' + v9); if (!v9) gFails9++; };
+    cheated = false;
+    runConsole("it's gojillia!");
+    ckG9('kingRisesAndBrands', GOJI.state === 'rise' && cheated === true && GOJI.grp !== null);
+    for (let i9 = 0; i9 < 120; i9++) updGoji(1 / 30);
+    ckG9('kingWalks', GOJI.state === 'roam');
+    const x09 = GOJI.x, y09 = GOJI.y;
+    for (let i9 = 0; i9 < 200; i9++) updGoji(1 / 30);
+    ckG9('kingRoams', dist(GOJI.x, GOJI.y, x09, y09) > 100);
+    GOJI.breathCool = 0; GOJI.breathT = 0;
+    const br09 = GOJI.breaths;
+    for (let i9 = 0; i9 < 120; i9++) updGoji(1 / 30);
+    ckG9('beamOfDeath', GOJI.breaths > br09);
+    const tb9 = buildings.find(b9 => !b9.toppled && b9.style !== 'garage' && b9.garIdx == null);
+    GOJI.x = (tb9.tx + tb9.tw / 2) * TILE + 150;
+    GOJI.y = (tb9.ty + tb9.th / 2) * TILE;
+    GOJI.tailCool = 0; GOJI.tailT = 0; GOJI.breathT = 0; GOJI.breathCool = 99; GOJI.retgtT = 99;
+    const tp09 = GOJI.topples;
+    for (let i9 = 0; i9 < 30; i9++) updGoji(1 / 30);
+    ckG9('tailTopplesBuildings', GOJI.topples > tp09 && tb9.toppled === true);
+    GOJI.smashCool = 0; GOJI.smashT = 0; GOJI.breathCool = 99;
+    const sc9 = mkCar(GOJI.x + Math.cos(GOJI.angle) * 55, GOJI.y + Math.sin(GOJI.angle) * 55, 0, 'sedan', null);
+    attachCarMesh(sc9); cars.push(sc9);
+    const sm09 = GOJI.smashes;
+    for (let i9 = 0; i9 < 40; i9++) updGoji(1 / 30);
+    ckG9('powerfulHands', GOJI.smashes > sm09);
+    const cc9 = mkCar(GOJI.x, GOJI.y, 0, 'sedan', null);
+    attachCarMesh(cc9); cars.push(cc9);
+    GOJI.crushT = 0;
+    for (let i9 = 0; i9 < 10; i9++) updGoji(1 / 30);
+    ckG9('feetCrush', cc9.dead === true);
+    runConsole("it's gojillia!");
+    for (let i9 = 0; i9 < 400; i9++) updGoji(1 / 30);
+    ckG9('kingLeaves', GOJI.state === 'off' && GOJI.grp.visible === false);
+    console.log('GOJDBG ' + RG9.join(' ') + ' fails=' + gFails9);
+  }, 400);
+}
 if (location.hash === '#meteors') {
   // MEATBALL receipt (Tank cheat): the toggle brands the run and burns the
   // sky red, meteors fall, a land strike EXPLODES, a water strike counts
@@ -20015,8 +20320,8 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
     scene.add(mm9);
     return mm9;
   };
-  if (lamb9.length) bake9(lamb9, new THREE.MeshLambertMaterial({ vertexColors: true }), true);
-  if (basi9.length) bake9(basi9, new THREE.MeshBasicMaterial({ vertexColors: true }), false);
+  if (lamb9.length) mergedStatics9.push(bake9(lamb9, new THREE.MeshLambertMaterial({ vertexColors: true }), true));
+  if (basi9.length) mergedStatics9.push(bake9(basi9, new THREE.MeshBasicMaterial({ vertexColors: true }), false));
   for (const o9 of lamb9) o9.parent.remove(o9);
   for (const o9 of basi9) o9.parent.remove(o9);
   console.log('GPUMERGE lambert=' + lamb9.length + ' basic=' + basi9.length + ' noNormalSkipped=' + skipped9);
@@ -20127,6 +20432,7 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
     mm9.frustumCulled = false;
     mm9.matrixAutoUpdate = false; mm9.updateMatrix();
     scene.add(mm9);
+    mergedStatics9.push(mm9);                    // GOJILLIA needs to know what to crumple
   }
   for (const o9 of texM9) o9.parent.remove(o9);
   console.log('GPUMERGE2 texturedMeshes=' + texM9.length + ' buckets=' + buckets9.size);

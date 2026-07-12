@@ -132,15 +132,25 @@ const pressed = new Set();
 let mdown = false, rdown = false;
 window.addEventListener('keydown', e => {
   if (document.activeElement === consoleEl) return;   // typing in the cheat console
-  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  // THE GAME OWNS THE KEYBOARD while playing (Tank: the browser was
+  // stealing input — quick-find, space-scroll, Tab focus walks). Browser
+  // chords (Ctrl/Meta) pass through except the zoom keys handled in head;
+  // F5/F11/F12 stay the browser's.
+  if (state === 'play' && !e.ctrlKey && !e.metaKey && !/^F(5|11|12)$/.test(e.key)) e.preventDefault();
+  else if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
   if (!keys[e.code]) pressed.add(e.code);
   keys[e.code] = true;
   if (e.code === 'KeyQ' && !e.repeat) openWheel('key');
 });
 window.addEventListener('keyup', e => {
+  if (document.activeElement !== consoleEl && state === 'play') e.preventDefault();
   keys[e.code] = false;
   if (e.code === 'KeyQ' && wheelSrc === 'key') closeWheel(true);
 });
+// middle-click autoscroll and the back/forward thumb buttons are browser
+// actions — dead while the game runs
+window.addEventListener('auxclick', e => { if (state === 'play') e.preventDefault(); });
+window.addEventListener('mousedown', e => { if (state === 'play' && e.button !== 0 && e.target !== consoleEl) e.preventDefault(); });
 window.addEventListener('mousedown', e => {
   if (e.target === consoleEl) return;       // typing/clicking the console is not gameplay
   if (e.button !== 0) {
@@ -582,8 +592,9 @@ window.addEventListener('mousemove', e => {
     return;
   }
   if (!ptrLocked) return;
-  mouseYaw += (e.movementX || 0) * 0.0032;
-  mousePitch = clamp(mousePitch + (e.movementY || 0) * 0.0022, -1.45, 1.45);   // near-vertical both ways
+  const adsS9 = ADS.on ? camera.fov / 62 : 1;   // glass slows the hand with the zoom
+  mouseYaw += (e.movementX || 0) * 0.0032 * adsS9;
+  mousePitch = clamp(mousePitch + (e.movementY || 0) * 0.0022 * adsS9, -1.45, 1.45);   // near-vertical both ways
   lastMouseMove = performance.now();
 });
 // Ctrl+wheel → player camera distance (page zoom blocked in <head>)
@@ -596,6 +607,24 @@ window.__gta3CamWheel = function (deltaY) {
 // Plain wheel (no Ctrl) still cycles weapons
 window.addEventListener('wheel', e => {
   if (e.ctrlKey || e.metaKey) { e.preventDefault(); return; }   // camera-only: page zoom dies here too
+  if (state === 'play' && e.target !== consoleEl) e.preventDefault();   // the wheel is the GAME'S while playing
+  // THE RING IS ALWAYS LIVE (Tank: zoom must work the instant the scope
+  // comes up, and never drop mid-firefight): computed from the RAW held
+  // button + weapon, never from the once-per-frame ADS snapshot — no
+  // first-frame race, no gap when a shove or a pause blip flickers ADS.
+  if (rdown && state === 'play' && !player.car && OPTICS[player.weapon] === 'scope') {
+    let d9 = e.deltaY || e.deltaX || 0;
+    if (e.deltaMode === 1) d9 *= 33;             // line-mode mice
+    else if (e.deltaMode === 2) d9 *= 120;       // page-mode
+    if (d9) {
+      // exponential response: classic detents (±120) and high-res
+      // fractional wheels both land ~30% per notch-worth of travel
+      ADS.mag = clamp(ADS.mag * Math.pow(1.0022, -d9), 4, 14);
+      ADS.magPulse = 0.8;                        // the readout flashes: the ring MOVED
+    }
+    return;
+  }
+  if (rdown || ADS.on) return;                   // aiming ANY glass: the wheel never swaps weapons
   if (state !== 'play' || paused || shopOpen || saveHouseOpen || modShopOpen || priestOpen || player.car) return;
   const i = WORDER.indexOf(player.weapon);
   const step = e.deltaY > 0 ? 1 : WORDER.length - 1;
@@ -794,6 +823,9 @@ function saveGame(slot) {
     stats: STATS,
     bank: bankBalance,
     season: WEATHER.seasonStart,               // the snow week rides the save
+    // the SKY rides the save too, stamped with device time — loading
+    // fast-forwards it by however long the player was really gone
+    wx: { mode: WEATHER.mode, t: WEATHER.t, inten: WEATHER.inten, wet: WEATHER.wet, snow: WEATHER.snow, deep: WEATHER.deep, at: Date.now() },
     garage: garageSnapshot()
   };
   try {
@@ -837,6 +869,24 @@ function loadGame(slot) {
   godMode = !!data.god;
   pardonMode = !!data.pardon;
   WEATHER.seasonStart = data.season || null;   // old saves: the week has passed
+  if (data.wx) {
+    // resume the saved sky, advanced by REAL device time away: a spell
+    // with time left continues; one that ran out has cleared, and the
+    // ground dried/melted at the clear-weather rates meanwhile
+    const gap9 = Math.max(0, (Date.now() - (data.wx.at || 0)) / 1000);
+    if (data.wx.mode !== 'clear' && gap9 < data.wx.t) {
+      WEATHER.mode = data.wx.mode;
+      WEATHER.t = data.wx.t - gap9;
+      WEATHER.inten = data.wx.inten;
+    } else {
+      WEATHER.mode = 'clear';
+      WEATHER.t = rndf(30, 120);
+      WEATHER.inten = 0;
+    }
+    WEATHER.wet = Math.max(0, (data.wx.wet || 0) - gap9 / 50);
+    WEATHER.snow = Math.max(0, (data.wx.snow || 0) - gap9 / 110);
+    WEATHER.deep = Math.max(0, (data.wx.deep || 0) - gap9 / 60);
+  }
   // saved flag OR derived from progress — old saves stay honest about new bridges
   for (let i = 0; i < 4; i++) {
     bridgesOpen[i] = !!(data.bridges && data.bridges[i]) || missionsDone >= BRIDGE_GATES[i];
@@ -2877,7 +2927,7 @@ function wheelSelFromAngle(ang) {
   return Math.round(a / (2 * Math.PI / WORDER.length)) % WORDER.length;
 }
 function openWheel(srcKind) {
-  if (wheelOpen || state !== 'play' || paused || shopOpen || saveHouseOpen || modShopOpen || priestOpen || bankOpen || player.car) return;
+  if (wheelOpen || state !== 'play' || paused || shopOpen || saveHouseOpen || modShopOpen || priestOpen || bankOpen || player.car || ADS.on) return;
   wheelOpen = true; wheelSrc = srcKind; wheelPX = 0; wheelPY = 0;
   wheelSel = Math.max(0, WORDER.indexOf(player.weapon));
   sfx('enter');
@@ -2961,6 +3011,116 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x101a2a);
 scene.fog = new THREE.Fog(0x101a2a, 40, 200);   // horizon-matched indigo haze
 const camera = new THREE.PerspectiveCamera(62, 1, 0.5, 340);
+// ---- AIM DOWN SIGHTS (Tank order): RIGHT MOUSE goes first-person over
+// the weapon. Each gun carries its real glass — Barrett a variable sniper
+// scope (mouse wheel turns the magnification ring, 4x–14x), M4 a fixed
+// ACOG, Uzi a red dot, the rest plain iron sights sitting exactly on the
+// bullet's line of travel (the crosshair ray IS screen center).
+const OPTICS = { pistol: 'iron', uzi: 'reddot', shotgun: 'iron', m4: 'acog', barrett: 'scope', rpg: 'iron', flame: null, grenade: null, fist: null };
+const ADS_FOV = { iron: 46, reddot: 44, acog: 62 / 4 };
+const ADS = { on: false, optic: null, mag: 8, drawn: '' };
+// the RPG rides the ADS camera as a REAL 3D VIEWMODEL — 2D canvas art
+// kept lying about the perspective; the engine renders it honestly.
+// Tube + wooden heat-guard + collar, warhead (tapered body + cone nose)
+// pointing DOWNRANGE, seated small at the far muzzle under the sights.
+scene.add(camera);                               // camera children must live in the graph
+const rpgVM9 = (() => {
+  const g9 = new THREE.Group();
+  const steel9 = new THREE.MeshLambertMaterial({ color: 0x3a4232 });
+  const wood9 = new THREE.MeshLambertMaterial({ color: 0x5a3819 });
+  const olive9 = new THREE.MeshLambertMaterial({ color: 0x57633c });
+  // everything lives BEYOND the 0.5 near plane — a clipped tube shows its
+  // hollow inside and reads as a broken shell
+  const tube9 = new THREE.Mesh(new THREE.CylinderGeometry(0.085, 0.085, 1.5, 12), steel9);
+  tube9.rotation.x = Math.PI / 2;
+  tube9.position.set(0, 0, -1.3);
+  g9.add(tube9);
+  const guard9 = new THREE.Mesh(new THREE.CylinderGeometry(0.105, 0.105, 0.42, 12), wood9);
+  guard9.rotation.x = Math.PI / 2;
+  guard9.position.set(0, 0, -0.78);
+  g9.add(guard9);
+  const collar9 = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.12, 12), steel9);
+  collar9.rotation.x = Math.PI / 2;
+  collar9.position.set(0, 0, -2.0);
+  g9.add(collar9);
+  const wh9 = new THREE.Group();
+  // the PG-7 round is over TWICE its tube's width — the bulge must read
+  const body9 = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.19, 0.34, 12), olive9);
+  body9.rotation.x = -Math.PI / 2;               // narrow shoulder forward
+  body9.position.set(0, 0, -2.22);
+  wh9.add(body9);
+  const nose9 = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.34, 12), olive9);
+  nose9.rotation.x = -Math.PI / 2;               // apex DOWNRANGE
+  nose9.position.set(0, 0, -2.56);
+  wh9.add(nose9);
+  g9.add(wh9);
+  g9.userData.warhead = wh9;
+  // IRON SIGHTS ON THE TUBE (Tank's reference photos: the sights ride
+  // ABOVE the tube) — front post near the muzzle, rear notch frame near
+  // the eye, tips landing exactly on the view axis = the aim line
+  // TALL RISERS (Tank's reference: launcher irons stand well above the
+  // tube) — the tube drops below the frame so its open rear end never
+  // faces the eye, and the sight blades climb to the view axis
+  const sightM9 = new THREE.MeshLambertMaterial({ color: 0x14170f });
+  const fpost9 = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.24, 0.022), sightM9);
+  fpost9.position.set(0.026, 0.205, -1.95);
+  g9.add(fpost9);
+  const rearL9 = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.2, 0.02), sightM9);
+  rearL9.position.set(-0.019, 0.21, -0.85);
+  g9.add(rearL9);
+  const rearR9 = rearL9.clone();
+  rearR9.position.x = 0.071;
+  g9.add(rearR9);
+  const rearBar9 = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.02, 0.02), sightM9);
+  rearBar9.position.set(0.026, 0.155, -0.85);
+  g9.add(rearBar9);
+  // shoulder-true hold: tube low on the shoulder, a touch left (Tank-
+  // tuned) — the sight offsets cancel it so the aim line stays centered
+  g9.position.set(-0.026, -0.31, 0);
+  g9.visible = false;
+  camera.add(g9);
+  return g9;
+})();
+// INPUT MODES (Tank order): three worlds that never touch — ADS (move,
+// sprint, mouse aim, fire, scope ring — NOTHING else), on-foot (normal),
+// vehicle (driving's own controls). Gates live at the consumption sites.
+function inputMode() { return ADS.on ? 'ads' : player.car ? 'drive' : 'foot'; }
+function adsCamera(dt) {
+  const want9 = rdown && state === 'play' && !paused && !player.car && !player.dead && !player.rag
+    && !wheelOpen && !cutscene && !shopOpen && !saveHouseOpen && !modShopOpen && !priestOpen && !bankOpen
+    ? OPTICS[player.weapon] : null;
+  ADS.on = !!want9;
+  ADS.optic = want9 || null;
+  const tf9 = ADS.on ? (ADS.optic === 'scope' ? 62 / ADS.mag : ADS_FOV[ADS.optic]) : 62;
+  if (Math.abs(camera.fov - tf9) > 0.05) {
+    camera.fov += (tf9 - camera.fov) * Math.min(1, (dt || 0.016) * 14);
+    camera.updateProjectionMatrix();
+  }
+  if (player.mesh) player.mesh.visible = !ADS.on;
+  if (ADS.magPulse > 0) ADS.magPulse -= dt || 0.016;
+  // the 3D launcher viewmodel: visible on the sights, warhead seated only
+  // while a rocket is actually loaded — never a view down the bore
+  const rpgOn9 = ADS.on && player.weapon === 'rpg';
+  rpgVM9.visible = rpgOn9;
+  if (rpgOn9) {
+    const loaded9 = player.fireT <= 0 && player.ammo.rpg > 0;
+    rpgVM9.userData.warhead.visible = loaded9;
+    ADS.rpgLoaded = loaded9;
+  }
+  if (!ADS.on) return;
+  // keyboard ring: + / - always turn the scope, whatever the mouse does
+  if (ADS.optic === 'scope') {
+    const k9 = (key('Equal') || key('NumpadAdd') ? 1 : 0) - (key('Minus') || key('NumpadSubtract') ? 1 : 0);
+    if (k9) { ADS.mag = clamp(ADS.mag * (1 + k9 * 1.7 * (dt || 0.016)), 4, 14); ADS.magPulse = 0.8; }
+  }
+  // the eye rides the weapon: camera at head height, looking down the aim
+  const e9 = -mousePitch;
+  const a9 = mouseYaw;
+  const ex9 = player.x * RS + Math.cos(a9) * 0.5;
+  const ez9 = player.y * RS + Math.sin(a9) * 0.5;
+  camera.position.set(ex9, 3.02, ez9);
+  camera.lookAt(ex9 + Math.cos(a9) * Math.cos(e9), 3.02 + Math.sin(e9), ez9 + Math.sin(a9) * Math.cos(e9));
+}
 let VW = 0, VH = 0;
 const hud = document.getElementById('hud');
 const hctx = hud.getContext('2d');
@@ -3039,6 +3199,22 @@ const HEMI_BASE = 1.75;                          // lightning flashes ride on to
 const moonLight = new THREE.DirectionalLight(0x9aa6d0, 1.05);
 moonLight.position.set(120, 200, 60);
 scene.add(moonLight);
+// ---- MESH-TRUE BALLISTICS (Tank order): a bullet lands only if its
+// flight segment TOUCHES the actual mesh — no more boxed hit circles.
+// The old distance checks survive as cheap broad-phase gates.
+const _mhRC9 = new THREE.Raycaster();
+const _mhO9 = new THREE.Vector3(), _mhD9 = new THREE.Vector3();
+function meshHit9(root9, x09, y09, h09, x19, y19, h19) {
+  _mhO9.set(x09 * RS, h09, y09 * RS);
+  _mhD9.set(x19 * RS - _mhO9.x, h19 - _mhO9.y, y19 * RS - _mhO9.z);
+  const len9 = _mhD9.length();
+  if (len9 < 1e-4) return null;
+  _mhRC9.set(_mhO9, _mhD9.divideScalar(len9));
+  _mhRC9.near = 0;
+  _mhRC9.far = len9 + 0.5;                       // a hair beyond: same-frame touches count
+  const hits9 = _mhRC9.intersectObject(root9, true);
+  return hits9.length ? hits9[0] : null;
+}
 // ================= WEATHER (Tank order): snow that falls AND lays, storms
 // with lightning + thunder, wet streets with puddles that answer the rain —
 // and a 0.001% chance per moment that any character (player included)
@@ -3052,7 +3228,7 @@ const WEATHER = {
   flashT: 0, flash2: 0,       // sky-flash envelope + queued second blink
   thunderQ: [],               // rolling claps on a delay
   boltT: 0,
-  STRIKE_P: 0.00001,          // 0.001% per character per moment
+  STRIKE_P: 0.000001,         // 0.0001% per character per moment (Tank: much less likely)
   rainSrc: null, rainGain: null
 };
 const RAIN_N = 850, SNOW_N = 1300, RAIN_BOX = 130, RAIN_H = 70;
@@ -3683,12 +3859,16 @@ const moonDisc = (() => {
   scene.add(m9);
   return m9;
 })();
-// the bolt: 8 jagged segments, repositioned per strike
+// the bolt: a COMPLETELY random arc every strike (Tank order) — zig-zag
+// snake channel from the sky to whatever it finds (ground, water, roof,
+// or a head), forking branches, restrike flicker, and light + sound
+// radiating from the arc itself
 const boltGrp = new THREE.Group();
 const boltSegs9 = [];
+const boltMat9 = new THREE.MeshBasicMaterial({ color: 0xeaf2ff, transparent: true, opacity: 1, depthWrite: false });
 {
-  const bm9 = new THREE.MeshBasicMaterial({ color: 0xeaf2ff });
-  for (let i9 = 0; i9 < 8; i9++) {
+  const bm9 = boltMat9;
+  for (let i9 = 0; i9 < 34; i9++) {
     const s9 = new THREE.Mesh(new THREE.BoxGeometry(0.26, 1, 0.26), bm9);
     boltSegs9.push(s9);
     boltGrp.add(s9);
@@ -3696,32 +3876,97 @@ const boltSegs9 = [];
   boltGrp.visible = false;
   scene.add(boltGrp);
 }
-function boltTo9(x9, y9) {
-  const up9 = new THREE.Vector3(0, 1, 0), dir9 = new THREE.Vector3();
-  let px9 = x9 * RS + rndf(-8, 8), pz9 = y9 * RS + rndf(-8, 8), py9 = 86;
-  for (let i9 = 0; i9 < boltSegs9.length; i9++) {
-    const last9 = i9 === boltSegs9.length - 1;
-    const nx9 = last9 ? x9 * RS : px9 + rndf(-6, 6);
-    const nz9 = last9 ? y9 * RS : pz9 + rndf(-6, 6);
-    const ny9 = last9 ? 1 : py9 - 86 / boltSegs9.length;
-    const s9 = boltSegs9[i9];
-    dir9.set(nx9 - px9, ny9 - py9, nz9 - pz9);
-    const len9 = Math.max(0.01, dir9.length());
-    s9.position.set((px9 + nx9) / 2, (py9 + ny9) / 2, (pz9 + nz9) / 2);
-    s9.scale.set(1, len9, 1);
-    s9.quaternion.setFromUnitVectors(up9, dir9.normalize());
-    px9 = nx9; py9 = ny9; pz9 = nz9;
+const boltLightA9 = new THREE.PointLight(0xcfe6ff, 0, 140);   // at the strike
+const boltLightB9 = new THREE.PointLight(0xbfd8ff, 0, 170);   // mid-channel
+scene.add(boltLightA9); scene.add(boltLightB9);
+const _bUp9 = new THREE.Vector3(0, 1, 0), _bDir9 = new THREE.Vector3();
+function genBolt9(x9, y9, topY9, endY9) {
+  // the snake: a random walk down the sky, wobble tightening toward the
+  // strike point — regenerated mid-strike so the arc CRAWLS
+  const n9 = 9 + ((Math.random() * 5) | 0);
+  const pts9 = [];
+  let px9 = x9 * RS + rndf(-16, 16), pz9 = y9 * RS + rndf(-16, 16);
+  for (let i9 = 0; i9 <= n9; i9++) {
+    const t9 = i9 / n9;
+    const wob9 = (1 - t9) * 7.5 + 1.1;
+    const nx9 = i9 === n9 ? x9 * RS : px9 + rndf(-wob9, wob9);
+    const nz9 = i9 === n9 ? y9 * RS : pz9 + rndf(-wob9, wob9);
+    pts9.push([nx9, topY9 + (endY9 - topY9) * t9 + (i9 && i9 < n9 ? rndf(-2.2, 2.2) : 0), nz9]);
+    px9 = nx9; pz9 = nz9;
   }
+  let used9 = 0;
+  const put9 = (a9, b9, w9) => {
+    if (used9 >= boltSegs9.length) return;
+    const s9 = boltSegs9[used9++];
+    s9.visible = true;
+    _bDir9.set(b9[0] - a9[0], b9[1] - a9[1], b9[2] - a9[2]);
+    const len9 = Math.max(0.01, _bDir9.length());
+    s9.position.set((a9[0] + b9[0]) / 2, (a9[1] + b9[1]) / 2, (a9[2] + b9[2]) / 2);
+    s9.scale.set(w9, len9, w9);
+    s9.quaternion.setFromUnitVectors(_bUp9, _bDir9.normalize());
+  };
+  for (let i9 = 0; i9 < n9; i9++) put9(pts9[i9], pts9[i9 + 1], 1);
+  // forked branches: tongues that die in the air
+  const nb9 = 1 + ((Math.random() * 3) | 0);
+  for (let b9 = 0; b9 < nb9; b9++) {
+    const j9 = 1 + ((Math.random() * (n9 - 3)) | 0);
+    let bp9 = pts9[j9];
+    const dir9 = Math.random() * Math.PI * 2;
+    const steps9 = 2 + ((Math.random() * 2) | 0);
+    for (let k9 = 0; k9 < steps9; k9++) {
+      const np9 = [
+        bp9[0] + Math.cos(dir9 + rndf(-0.7, 0.7)) * rndf(3, 7),
+        bp9[1] - rndf(2.5, 6),
+        bp9[2] + Math.sin(dir9 + rndf(-0.7, 0.7)) * rndf(3, 7)
+      ];
+      put9(bp9, np9, 0.4);
+      bp9 = np9;
+    }
+  }
+  for (; used9 < boltSegs9.length; used9++) boltSegs9[used9].visible = false;
   boltGrp.visible = true;
+  // the arc radiates its own light: strike point + mid-channel
+  boltLightA9.position.set(x9 * RS, endY9 + 2.5, y9 * RS);
+  const mid9 = pts9[(n9 / 2) | 0];
+  boltLightB9.position.set(mid9[0], mid9[1], mid9[2]);
 }
 function lightningStrike(x9, y9, victim9) {
-  boltTo9(x9, y9);
-  WEATHER.boltT = 0.22;
+  // where the arc ENDS: a head, open water, a rooftop, or the street
+  let endY9 = 1.2, kind9 = 'char';
+  if (!victim9) {
+    // whoever stands at the strike point IS the strike
+    if (!player.dead && !player.car && dist(player.x, player.y, x9, y9) < 15) victim9 = player;
+    else victim9 = peds.find(p9 => !p9.dead && dist(p9.x, p9.y, x9, y9) < 15) || null;
+  }
+  if (!victim9) {
+    const ix9 = Math.floor(x9 / TILE), iy9 = Math.floor(y9 / TILE);
+    const roof9 = ix9 >= 0 && iy9 >= 0 && ix9 < GRID_W && iy9 < GRID_H ? heightMap[idx(ix9, iy9)] : 0;
+    if (waterAt(x9, y9)) { kind9 = 'water'; endY9 = 0.3; }
+    else if (roof9 > 2) { kind9 = 'roof'; endY9 = roof9; }
+    else { kind9 = 'ground'; endY9 = 0.4; }
+  }
+  WEATHER.boltCtx = { x: x9, y: y9, topY: 84 + rndf(-6, 12), endY: endY9, re: 0.06 };
+  WEATHER.boltT = 1.2;                           // the arc STANDS a full second, then dies fast
   WEATHER.flashT = 0.2;
   WEATHER.flash2 = 0.12;
+  genBolt9(x9, y9, WEATHER.boltCtx.topY, endY9);
   sfx('zap', x9, y9);
   sfx('thunder');
   sparks(x9, y9);
+  if (kind9 === 'water') {
+    for (let k9 = 0; k9 < 18; k9++)
+      addPart(x9 + rndf(-5, 5), y9 + rndf(-5, 5), 0.5, rndf(-26, 26), rndf(-26, 26), rndf(14, 40),
+        rndf(0.7, 1.3), k9 % 3 ? 0xbfe0ff : 0xffffff, rndf(1, 2), false);
+  } else if (kind9 === 'ground') {
+    stampMark(x9, y9, rndf(0, 6.28), 3.2, 3.2, 'oil', 30, 0.14);   // the scorch
+    for (let k9 = 0; k9 < 10; k9++)
+      addPart(x9 + rndf(-4, 4), y9 + rndf(-4, 4), 0.6, rndf(-40, 40), rndf(-40, 40), rndf(8, 30),
+        rndf(0.4, 0.8), k9 % 2 ? 0xffd080 : 0xbfe0ff, rndf(0.6, 1.1), true);
+  } else if (kind9 === 'roof') {
+    for (let k9 = 0; k9 < 12; k9++)
+      addPart(x9 + rndf(-5, 5), y9 + rndf(-5, 5), endY9 + rndf(0, 1.5), rndf(-30, 30), rndf(-30, 30), rndf(4, 20),
+        rndf(0.4, 0.9), k9 % 2 ? 0xffd080 : 0xbfe0ff, rndf(0.6, 1.2), true);
+  }
   if (victim9 === player) {
     hurtPlayer(70);
     if (player.car) carDamage(player.car, 25, null);
@@ -3840,7 +4085,7 @@ function updMarks(dt) {
     const pa9 = ent9.angle + Math.PI / 2;
     // a real boot print: toes to the travel direction, left/right mirrored
     stampMark(ent9.x + Math.cos(pa9) * ent9._mkSide * 1.6, ent9.y + Math.sin(pa9) * ent9._mkSide * 1.6,
-      ent9.angle, 0.34 * ent9._mkSide, 0.62, k9, k9 === 'wet' ? 0.16 : k9 === 'snow' ? 45 : 25, 0.18, true);   // rain prints flash and are gone (Tank: ~0.15s)
+      ent9.angle, 0.34 * ent9._mkSide, 0.62, k9, k9 === 'wet' ? 0.25 : k9 === 'snow' ? 45 : 25, 0.18, true);   // rain prints last a quarter second (Tank-tuned)
   };
   if (!player.car && !player.dead && !player.rag) foot9(player);
   for (const p9 of peds) if (!p9.dead && !p9.rag && !p9.riding) foot9(p9);
@@ -3869,7 +4114,7 @@ function updMarks(dt) {
           const seg9 = dist(wx09, wy09, wx19, wy19);
           if (seg9 < 1) continue;
           stampMark((wx09 + wx19) / 2, (wy09 + wy19) / 2, Math.atan2(wy19 - wy09, wx19 - wx09),
-            0.32, seg9 * RS * 1.14, k9, k9 === 'wet' ? 6 : k9 === 'snow' ? 45 : 20, 0.18);
+            0.32, seg9 * RS * 1.14, k9, k9 === 'wet' ? 0.5 : k9 === 'snow' ? 45 : 20, 0.18);   // rain tracks fade in half a second (Tank)
         }
     }
     c9._mkPX = c9.x; c9._mkPY = c9.y; c9._mkPA = c9.angle;
@@ -3939,7 +4184,10 @@ function updWeather(dt) {
       // SEASON LAW (Tank): every 30 calendar days brings 7 days of snow,
       // anchored at the save's birth — snow week bars rain entirely, the
       // other 23 days run random rain. Lightning rides either (thundersnow).
-      const age9 = W9.seasonStart ? Date.now() - W9.seasonStart : 8 * 86400e3;
+      // age is clamped at 0: a system clock stepped BACKWARD past the
+      // save's birth would give a negative modulo (JS keeps the sign)
+      // and lock the save in permanent snow week
+      const age9 = W9.seasonStart ? Math.max(0, Date.now() - W9.seasonStart) : 8 * 86400e3;
       const season9 = (age9 % (30 * 86400e3)) < 7 * 86400e3 && W9.seasonStart;
       W9.mode = season9 ? 'snow' : 'rain';
       W9.t = rndf(55, 115);
@@ -4028,15 +4276,36 @@ function updWeather(dt) {
   if (W9.flashT > 0) W9.flashT -= dt;
   hemiLight.intensity = HEMI_BASE + (W9.flashT > 0 ? clamp(W9.flashT / 0.2, 0, 1) * 5 : 0);
   if (W9.mode !== 'clear' && W9.inten > 0.5 && Math.random() < dt * 0.07) {   // thundersnow is real
-    W9.flashT = 0.16;
-    W9.flash2 = rndf(0.15, 0.32);
-    W9.thunderQ.push({ d: rndf(0.5, 2.2) });
+    if (Math.random() < 0.45 && state === 'play') {
+      // a VISIBLE strike lands somewhere in the neighborhood — ground,
+      // water, a rooftop, or whoever is standing on the spot
+      const sa9 = Math.random() * Math.PI * 2, sd9 = rndf(80, 620);
+      lightningStrike(player.x + Math.cos(sa9) * sd9, player.y + Math.sin(sa9) * sd9, null);
+    } else {
+      W9.flashT = 0.16;
+      W9.flash2 = rndf(0.15, 0.32);
+      W9.thunderQ.push({ d: rndf(0.5, 2.2) });
+    }
   }
   for (let i9 = W9.thunderQ.length - 1; i9 >= 0; i9--) {
     W9.thunderQ[i9].d -= dt;
     if (W9.thunderQ[i9].d <= 0) { sfx('thunder'); W9.thunderQ.splice(i9, 1); }
   }
-  if (W9.boltT > 0) { W9.boltT -= dt; if (W9.boltT <= 0) boltGrp.visible = false; }
+  if (W9.boltT > 0) {
+    W9.boltT -= dt;
+    const bc9 = W9.boltCtx;
+    if (bc9) {
+      // restrike flicker: the channel CRAWLS while it lives
+      bc9.re -= dt;
+      if (bc9.re <= 0 && W9.boltT > 0.15) { genBolt9(bc9.x, bc9.y, bc9.topY, bc9.endY); bc9.re = 0.06; }
+      // full presence for the first second, then a FAST fade-out
+      const k9 = clamp(W9.boltT / 0.2, 0, 1);
+      boltMat9.opacity = k9;
+      boltLightA9.intensity = 30 * k9 * k9;
+      boltLightB9.intensity = 20 * k9 * k9;
+    }
+    if (W9.boltT <= 0) { boltGrp.visible = false; boltLightA9.intensity = 0; boltLightB9.intensity = 0; }
+  }
   // the 0.001% bolt (per character, per moment — any live storm, snow included)
   if (W9.mode !== 'clear' && W9.inten > 0.5 && state === 'play') {
     if (!player.dead && Math.random() < W9.STRIKE_P) lightningStrike(player.x, player.y, player);
@@ -8521,15 +8790,73 @@ function buildCarMesh(c) {
   const roof = new THREE.Mesh(new THREE.BoxGeometry(cabL * 0.88, 0.1, W * 0.78, 3, 1, 3), roofMat);
   roof.position.set(cabX - 0.06, 2.5, 0);
   g.add(roof);
-  // A-pillars raked with the glass
+  // A / B / C pillars + roof rails — door openings must not show empty void
+  // behind the skin (open door / side view used to punch straight through)
+  const doorLenFill = Math.min(L * 0.30, cabL * 0.62);
   for (const pz of [W * 0.38, -W * 0.38]) {
     const pilF = new THREE.Mesh(new THREE.BoxGeometry(0.12, 1.15, 0.12), roofMat);
     pilF.position.set(cabX + cabL / 2 - 0.18, 1.92, pz);
     pilF.rotation.z = -0.12;
     g.add(pilF);
+    // B-pillar at the rear of the door aperture
+    const pilB = new THREE.Mesh(new THREE.BoxGeometry(0.14, 1.12, 0.13), roofMat);
+    pilB.position.set(cowlX - doorLenFill * 0.92, 1.9, pz);
+    g.add(pilB);
     const pilR = new THREE.Mesh(new THREE.BoxGeometry(0.12, 1.1, 0.12), roofMat);
     pilR.position.set(cabX - cabL / 2 + 0.14, 1.9, pz);
     g.add(pilR);
+    // roof side rail over the door
+    const rail = new THREE.Mesh(new THREE.BoxGeometry(cabL * 0.82, 0.07, 0.1), roofMat);
+    rail.position.set(cabX - 0.04, 2.48, pz);
+    g.add(rail);
+    // rocker outer skin under the door sill
+    const rocker = new THREE.Mesh(new THREE.BoxGeometry(doorLenFill * 1.05, 0.22, 0.1), bodyMat);
+    rocker.position.set(cowlX - doorLenFill * 0.5, 0.62, (pz > 0 ? 1 : -1) * (W * 0.47 - 0.05));
+    g.add(rocker);
+  }
+  // firewall plate: seals cabin from the open engine bay (full width face)
+  const firePlate = new THREE.Mesh(new THREE.BoxGeometry(0.14, beltY - 0.5, W * 0.9), bodyMat);
+  firePlate.position.set(firewallX - 0.04, (beltY + 0.5) / 2, 0);
+  g.add(firePlate);
+  // rear cabin bulkhead (parcel shelf wall) — closes the cabin before the trunk
+  const rearBulk = new THREE.Mesh(new THREE.BoxGeometry(0.12, beltY - wellY + 0.2, W * 0.86), bodyMat);
+  rearBulk.position.set(cabRX + 0.04, (beltY + wellY) / 2, 0);
+  g.add(rearBulk);
+  // trunk / bed floor plate so the well isn't a bottomless hole
+  if (!isTruck) {
+    const tLen = Math.max(0.4, (cabRX - 0.08) - (-L / 2 + 0.12));
+    const tFloor = new THREE.Mesh(new THREE.BoxGeometry(tLen, 0.08, W * 0.82),
+      new THREE.MeshLambertMaterial({ color: 0x191d24, emissive: 0x0b0d11 }));
+    tFloor.position.set((cabRX - 0.08 + (-L / 2 + 0.12)) / 2, wellY - 0.02, 0);
+    g.add(tFloor);
+    // trunk rear bulkhead just inside the tail
+    const tRear = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.55, W * 0.84), bodyMat);
+    tRear.position.set(-L / 2 + 0.22, wellY + 0.22, 0);
+    g.add(tRear);
+  }
+  // WHEEL-WELL FILL: extrude cuts full-width arches through the hull, so
+  // looking past a tire used to show daylight (or the opposite tire).
+  // Inner liners + center belly close that tunnel; shelves cap the top.
+  // Sedan FRONT arches live only in the side fenders — liner those only,
+  // leave the open engine bay middle alone.
+  {
+    const fillWell = (ax, full) => {
+      if (full) {
+        const belly = new THREE.Mesh(new THREE.BoxGeometry(arR * 2.15, 0.42, W * 0.55), bodyMat);
+        belly.position.set(ax, 0.52, 0);
+        g.add(belly);
+        const shelf = new THREE.Mesh(new THREE.BoxGeometry(arR * 2.1, 0.1, W * 0.78), bodyMat);
+        shelf.position.set(ax, 0.48 + arR + 0.1, 0);
+        g.add(shelf);
+      }
+      for (const ws of [-1, 1]) {
+        const lin = new THREE.Mesh(new THREE.BoxGeometry(arR * 2.05, arR * 1.25, 0.12), bodyMat);
+        lin.position.set(ax, 0.52 + arR * 0.35, ws * (full ? W * 0.34 : W * 0.42));
+        g.add(lin);
+      }
+    };
+    fillWell(-axR, true);                              // rear: always full-width tunnel
+    fillWell(axR, !frontArchInClip);                   // truck cab arch full; sedan fenders only
   }
   // interior: BUCKET seats (base + side bolsters + backrest) that read
   // through the glass at night, a raked wheel, and a SEATED driver whose
@@ -8578,13 +8905,35 @@ function buildCarMesh(c) {
   g.add(radio);
   g.userData.radio = radio;
   const fig = new THREE.Group();
-  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.66, 0.72), new THREE.MeshLambertMaterial({ color: 0x35404d, emissive: 0x10131a }));
+  // REAL crews (Tank order): police vehicles are driven by uniformed
+  // OFFICERS (blues + the black cap), military rigs by SOLDIERS (fatigues
+  // + helmet) — civilians keep the plain slate look
+  const copCrew9 = c.kind === 'cop';
+  const milCrew9 = c.kind === 'humvee' || c.kind === 'tank';
+  g.userData.figDress = copCrew9 ? 'cop' : milCrew9 ? 'mil' : 'civ';
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.66, 0.72),
+    new THREE.MeshLambertMaterial({ color: copCrew9 ? 0x20306a : milCrew9 ? 0x3d4a2e : 0x35404d, emissive: 0x10131a }));
   torso.position.y = 0.33;                   // butt ON the cushion
   fig.add(torso);
   const head = new THREE.Mesh(new THREE.SphereGeometry(0.24, 8, 6), new THREE.MeshLambertMaterial({ color: 0xd9b08c, emissive: 0x201812 }));
   head.position.y = 0.92;                    // head top 2.44 — clears the 2.475 roofline
   fig.add(head);
-  const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.22, 0.6), new THREE.MeshLambertMaterial({ color: 0x2a3340, emissive: 0x0c0f14 }));
+  if (copCrew9) {
+    const capM9 = new THREE.MeshLambertMaterial({ color: 0x0b0c10, emissive: 0x050506 });
+    const cap9 = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.26, 0.13, 9), capM9);
+    cap9.position.y = 1.09;
+    fig.add(cap9);
+    const visor9 = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.035, 0.3), capM9);
+    visor9.position.set(0.24, 1.05, 0);
+    fig.add(visor9);
+  } else if (milCrew9) {
+    const helm9 = new THREE.Mesh(new THREE.SphereGeometry(0.27, 8, 6), new THREE.MeshLambertMaterial({ color: 0x39432c, emissive: 0x0e110a }));
+    helm9.scale.y = 0.72;
+    helm9.position.y = 1.0;
+    fig.add(helm9);
+  }
+  const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.22, 0.6),
+    new THREE.MeshLambertMaterial({ color: copCrew9 ? 0x1a2450 : milCrew9 ? 0x333d26 : 0x2a3340, emissive: 0x0c0f14 }));
   thigh.position.set(0.45, 0.11, 0);         // seated legs reaching the pedals
   fig.add(thigh);
   fig.position.set(cabX + cabL * 0.12, 1.28, -W * 0.22);   // sitting IN the driver's bucket
@@ -10071,6 +10420,12 @@ function scare(x, y, r) {
       if ((p.voxT || 0) <= 0 && Math.random() < 0.4) say(p, pick(CHATTER.pedScare), 2.4);
     }
   }
+  // drivers hear it too (Tank order): civilian traffic near the bang
+  // freaks out — floors it, runs the reds, forgets about pulling over
+  for (const c of cars) {
+    if (c.dead || c.driver !== 'ai' || c.outlaw) continue;
+    if (dist(c.x, c.y, x, y) < r * 1.25) { c.panicT = Math.max(c.panicT || 0, rndf(6, 10)); c.pullover = false; }
+  }
 }
 // ---- gibs: an explosion doesn't leave a body, it leaves PIECES ----
 const gibs = [];
@@ -10596,6 +10951,7 @@ function updTraffic(c, dt) {
       else bailDriver(c, c.reaction === 'gunman');
     }
   }
+  if (c.panicT > 0) { c.panicT -= dt; c.pullover = false; }   // a spooked driver stops for nobody
   if (c.pullover) {
     // the good citizen: brakes in lane, hands on the wheel, takes the collar
     c.speed = Math.max(0, c.speed - 240 * dt);
@@ -10604,7 +10960,7 @@ function updTraffic(c, dt) {
     c.y += dv9[1] * c.speed * dt;
     return;
   }
-  const kmax = c.outlaw ? 150 : (c.kind === 'truck' ? 72 : 100);
+  const kmax = c.outlaw ? 150 : c.panicT > 0 ? 135 : (c.kind === 'truck' ? 72 : 100);
   const ax = c.x + Math.cos(c.angle) * (c.len / 2 + 30);
   const ay = c.y + Math.sin(c.angle) * (c.len / 2 + 30);
   let blocked = solidAtPx(ax, ay);                   // bridge barrier etc.
@@ -10614,7 +10970,7 @@ function updTraffic(c, dt) {
   // RED LIGHT: the look-ahead probe reaching a signalized crossing on a
   // non-green axis is a stop line — unless the car is ALREADY inside the
   // box (clear it, never park across the crossing). Outlaws run the red.
-  if (!blocked && !c.outlaw) {
+  if (!blocked && !c.outlaw && !(c.panicT > 0)) {   // panic runs the red
     const cbx = colBase(Math.floor(ax / TILE)), cby = rowBase(Math.floor(ay / TILE));
     if (cbx >= 0 && cby >= 0 && tlAt(cbx + ',' + cby, c.dir) !== 'g') {
       if (!(colBase(Math.floor(c.x / TILE)) === cbx && rowBase(Math.floor(c.y / TILE)) === cby)) blocked = true;
@@ -12752,11 +13108,13 @@ function fireWeapon() {
   const eyeH = aimPivotY();
   const aimAng = ct9 ? Math.atan2(ct9.y - player.y, ct9.x - player.x) : mouseYaw;
   // the shot leaves the WEAPON'S NOZZLE (eye-line fallback pre-dress) and
-  // still converges onto mark M — origin moved, impact identical
-  const mz9 = W.melee ? null : muzzleWorld(player.weapon);
-  const bx0 = mz9 ? mz9.x : player.x + Math.cos(aimAng) * 16;
-  const by0 = mz9 ? mz9.y : player.y + Math.sin(aimAng) * 16;
-  const muzH = mz9 ? mz9.h : eyeH;
+  // still converges onto mark M — origin moved, impact identical.
+  // ON GLASS (Tank order): the muzzle sits UNDER THE RETICLE — first
+  // person fires from the eye line, never from the third-person side gun
+  const mz9 = W.melee || ADS.on ? null : muzzleWorld(player.weapon);
+  const bx0 = mz9 ? mz9.x : player.x + Math.cos(aimAng) * (ADS.on ? 4 : 16);
+  const by0 = mz9 ? mz9.y : player.y + Math.sin(aimAng) * (ADS.on ? 4 : 16);
+  const muzH = mz9 ? mz9.h : ADS.on ? eyeH - 0.22 : eyeH;
   const ctD = ct9 ? Math.max(8, dist(bx0, by0, ct9.x, ct9.y)) : 0;
   if (W.melee) {
     player.fireT = W.rate;
@@ -12824,14 +13182,15 @@ function fireWeapon() {
   else rumble(W.pellets ? 0.6 : player.weapon === 'uzi' ? 0.12 : 0.3, W.pellets ? 0.3 : 0.1, W.pellets ? 140 : 70);
   // recoil: camera kicks + brief aim punch so guns have weight
   const kick = player.weapon === 'barrett' ? 0.09 : W.pellets ? 0.055 : player.weapon === 'uzi' ? 0.012 : player.weapon === 'm4' ? 0.02 : 0.028;
-  player.recoil = Math.min(0.14, (player.recoil || 0) + kick);
+  const adsK9 = ADS.on ? 0.35 : 1;             // braced on the sights: the jerk softens (Tank order)
+  player.recoil = Math.min(0.14, (player.recoil || 0) + kick * adsK9);
   // DEFER the aim kick to the START of the next frame. If we moved mousePitch
   // right here, syncScene (which frames the camera AFTER update() this frame)
   // would read the recoiled pitch and lift the crosshair off the shot we just
   // fired — the bullet would land below the triangle by the kick every time.
   // Queuing it means the camera frames THIS shot at the pitch it left the
   // barrel; the kick lands next frame, so recoil still climbs, in lockstep.
-  player.recoilPending = (player.recoilPending || 0) + kick * 0.85;
+  player.recoilPending = (player.recoilPending || 0) + kick * 0.85 * adsK9;
   const n = W.pellets || 1;
   // Barrel starts at eye height on the look ray; vertical speed hits mark M at range ctD.
   // Camera lookAt(M) uses the same M — reticle and impact are the same point.
@@ -14350,8 +14709,8 @@ function update(dt) {
     pressed.clear();
     return;
   }
-  if (pressed.has('KeyM')) { muted = !muted; if (muted) sirenOff(); msg(muted ? 'Sound OFF' : 'Sound ON'); }
-  if (pressed.has('KeyR')) { radioOn = !radioOn; msg(radioOn ? 'Radio ON' : 'Radio OFF'); }
+  if (!ADS.on && pressed.has('KeyM')) { muted = !muted; if (muted) sirenOff(); msg(muted ? 'Sound OFF' : 'Sound ON'); }
+  if (!ADS.on && pressed.has('KeyR')) { radioOn = !radioOn; msg(radioOn ? 'Radio ON' : 'Radio OFF'); }
   if (state === 'over') {
     overT -= dt;
     if (overT <= 0) respawn();
@@ -14493,10 +14852,11 @@ function update(dt) {
     pressed.clear();
     if (cutscene) updCutscene(dt);   // advancing the last line ends the scene
   }
-  // E fires the NEAREST action in reach — in a car it always steps out
-  if (pressed.has('KeyE') && !player.rag && !swim) {
+  // E fires the NEAREST action in reach — in a car it always steps out.
+  // ON GLASS (ADS) the world's buttons don't exist: move, aim, fire only.
+  if (!ADS.on && pressed.has('KeyE') && !player.rag && !swim) {
     if (!tryEnterExit()) nearestAction();
-  } else if (pressed.has('KeyE') && swim && !player.car) {
+  } else if (!ADS.on && pressed.has('KeyE') && swim && !player.car) {
     // from the water: haul up into the nearest boat within reach
     let best = null, bd = 26;
     for (const c of cars) {
@@ -14506,13 +14866,17 @@ function update(dt) {
     }
     if (best) enterCar(best);
   }
-  // Space: an honest hop (on foot only — in a car it's the handbrake)
-  if (pressed.has('Space') && !player.car && !swim && !player.rag && !player.dead && !player.jumpH) {
+  // Space: an honest hop (on foot only — in a car it's the handbrake;
+  // on glass your feet stay planted for the shot)
+  if (!ADS.on && pressed.has('Space') && !player.car && !swim && !player.rag && !player.dead && !player.jumpH) {
     player.jumpH = 0.001;
     player.jumpV = 6.5;
   }
-  const digits = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9'];
-  for (let i = 0; i < digits.length; i++) if (pressed.has(digits[i])) player.weapon = WORDER[i];
+  // number keys pick weapons ON FOOT only — never mid-drive, never on glass
+  if (!ADS.on && !player.car) {
+    const digits = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9'];
+    for (let i = 0; i < digits.length; i++) if (pressed.has(digits[i])) player.weapon = WORDER[i];
+  }
   pressed.clear();
 
   player.fireT -= dt;
@@ -14598,7 +14962,7 @@ function update(dt) {
     // camera-relative movement, mouse-look aiming (feet planted during cutscenes)
     const fwd = cutscene ? 0 : (key('KeyW') || key('ArrowUp') ? 1 : 0) - (key('KeyS') || key('ArrowDown') ? 1 : 0);
     const strafe = cutscene ? 0 : (key('KeyD') || key('ArrowRight') ? 1 : 0) - (key('KeyA') || key('ArrowLeft') ? 1 : 0);
-    player.aimHold = (mdown || padAim || padFire) ? 0.6 : player.aimHold - dt;
+    player.aimHold = (mdown || padAim || padFire || ADS.on) ? 0.6 : player.aimHold - dt;
     let dvx = 0, dvy = 0;
     // stick magnitude walks or jogs; keyboard is always full stride
     let mvx = 0, mvy = 0, mag = 0;
@@ -14834,6 +15198,7 @@ function update(dt) {
   for (const b of bullets) {
     b.life -= dt;
     if (b.life <= 0) continue;
+    const bpx9 = b.x, bpy9 = b.y, bph9 = b.h;   // the flight segment starts here
     b.x += b.vx * dt; b.y += b.vy * dt;
     b.h += b.vh * dt;
     if (b.mesh) b.mesh.position.set(b.x * RS, b.h, b.y * RS);
@@ -14856,7 +15221,10 @@ function update(dt) {
     }
     for (const p of peds) {
       if (p.dead) continue;
-      if (b.h <= 4.5 && dist(p.x, p.y, b.x, b.y) < 11) {
+      // MESH-TRUE (Tank order): the circle is only the broad phase — the
+      // bullet lands ONLY if its flight segment touches the actual rig
+      if (b.h <= 5.5 && dist(p.x, p.y, b.x, b.y) < 16 && p.mesh
+        && meshHit9(p.mesh, bpx9, bpy9, bph9, b.x, b.y, b.h)) {
         p.hp -= b.dmg;
         bloodFx(p.x, p.y);
         b.life = 0;
@@ -14874,8 +15242,12 @@ function update(dt) {
     if (b.life <= 0) continue;
     for (const c of cars) {
       if (c.dead || (b.from === 'p' && c === player.car)) continue;
-      if (b.h <= 6 && dist(c.x, c.y, b.x, b.y) < c.len / 2) {
+      // broad circle, then the REAL BODY: a shot over the roof or through
+      // a window gap flies clean past now
+      if (b.h <= 8 && dist(c.x, c.y, b.x, b.y) < c.len / 2 + 8 && c.mesh
+        && meshHit9(c.mesh, bpx9, bpy9, bph9, b.x, b.y, b.h)) {
         if (c.kind !== 'tank') carDamage(c, b.cdmg || 5, b.from === 'p' ? 'p' : null);
+        if (c.driver === 'ai' && !c.outlaw) c.panicT = Math.max(c.panicT || 0, rndf(7, 11));   // shot AT: the driver bolts
         sparks(b.x, b.y);
         b.life = 0;
         if (b.from === 'p') STATS.shotsHit++;
@@ -14884,10 +15256,28 @@ function update(dt) {
       }
     }
     if (b.life <= 0) continue;
+    // the King's hide: bullets CONNECT with the mesh (and bounce off)
+    if (GOJI.grp && (GOJI.state === 'roam' || GOJI.state === 'rise')
+      && b.h < 30 && dist(GOJI.x, GOJI.y, b.x, b.y) < 60
+      && meshHit9(GOJI.grp, bpx9, bpy9, bph9, b.x, b.y, b.h)) {
+      sparks(b.x, b.y);
+      b.life = 0;
+      continue;
+    }
     if (b.from === 'c') {
       // deep water stops small arms — a submerged swimmer has real cover
-      if (!player.car && b.h <= 4.5 && dist(player.x, player.y, b.x, b.y) < 11 && !(swim && swim.z > 1.2)) { hurtPlayer(b.dmg); bloodFx(player.x, player.y); b.life = 0; }
-      else if (player.car && b.h <= 6 && dist(player.car.x, player.car.y, b.x, b.y) < player.car.len / 2) { if (player.car.kind !== 'tank') carDamage(player.car, 3); b.life = 0; }
+      if (!player.car && b.h <= 5.5 && dist(player.x, player.y, b.x, b.y) < 16 && !(swim && swim.z > 1.2)) {
+        // mesh-true against the rig; the ADS-hidden body falls back to the
+        // old circle so first person never makes the ghost bulletproof
+        const hit9 = player.mesh && player.mesh.visible
+          ? meshHit9(player.mesh, bpx9, bpy9, bph9, b.x, b.y, b.h)
+          : (b.h <= 4.5 && dist(player.x, player.y, b.x, b.y) < 11);
+        if (hit9) { hurtPlayer(b.dmg); bloodFx(player.x, player.y); b.life = 0; }
+      } else if (player.car && b.h <= 8 && dist(player.car.x, player.car.y, b.x, b.y) < player.car.len / 2 + 8 && player.car.mesh
+        && meshHit9(player.car.mesh, bpx9, bpy9, bph9, b.x, b.y, b.h)) {
+        if (player.car.kind !== 'tank') carDamage(player.car, 3);
+        b.life = 0;
+      }
     }
   }
 
@@ -15993,8 +16383,133 @@ function drawHUD(t) {
       hctx.strokeRect(gx - 1.5, gy - 1.5, gw + 3, gh + 3);
     }
   }
-  // crosshair (on foot or in the tank)
-  if (!player.car || player.car.kind === 'tank') {
+  // crosshair (on foot or in the tank) — unless the eye is on GLASS
+  if (ADS.on) {
+    const cx = VW / 2, cy = VH / 2, mn9 = Math.min(VW, VH);
+    ADS.drawn = ADS.optic;
+    if (ADS.optic === 'scope') {
+      // sniper glass: hard vignette, heavy ring, hairline cross, mil dots
+      const r9 = mn9 * 0.37;
+      hctx.fillStyle = '#000';
+      hctx.beginPath();
+      hctx.rect(0, 0, VW, VH);
+      hctx.arc(cx, cy, r9, 0, TAU, true);
+      hctx.fill('evenodd');
+      hctx.strokeStyle = '#000'; hctx.lineWidth = 10;
+      hctx.beginPath(); hctx.arc(cx, cy, r9 - 4, 0, TAU); hctx.stroke();
+      hctx.strokeStyle = 'rgba(0,0,0,0.9)'; hctx.lineWidth = 1.2;
+      hctx.beginPath();
+      hctx.moveTo(cx - r9, cy); hctx.lineTo(cx + r9, cy);
+      hctx.moveTo(cx, cy - r9); hctx.lineTo(cx, cy + r9);
+      hctx.stroke();
+      hctx.fillStyle = 'rgba(0,0,0,0.9)';
+      for (let d9 = 1; d9 <= 4; d9++) {
+        const o9 = d9 * r9 * 0.18;
+        for (const [mx9, my9] of [[o9, 0], [-o9, 0], [0, o9], [0, -o9]]) {
+          hctx.beginPath(); hctx.arc(cx + mx9, cy + my9, 2.1, 0, TAU); hctx.fill();
+        }
+      }
+      hctx.fillStyle = '#cfe0c0';
+      hctx.font = 'bold 13px monospace';
+      hctx.textAlign = 'center';
+      const peg9 = ADS.mag >= 13.99 ? '  MAX' : ADS.mag <= 4.01 ? '  MIN' : '';
+      hctx.fillText(ADS.mag.toFixed(1) + 'x' + peg9 + '  —  wheel or +/- adjusts', cx, cy + r9 - 16);
+      if (ADS.magPulse > 0) {
+        // the ring just moved: say it LOUD so a dead wheel is obvious
+        hctx.font = 'bold 30px monospace';
+        hctx.fillStyle = 'rgba(207,224,192,' + clamp(ADS.magPulse / 0.8, 0, 1).toFixed(2) + ')';
+        hctx.fillText(ADS.mag.toFixed(1) + 'x' + peg9, cx, cy + r9 * 0.55);
+        hctx.font = 'bold 13px monospace';
+      }
+      hctx.textAlign = 'left';
+    } else if (ADS.optic === 'acog') {
+      // ACOG: fixed 4x tube, amber chevron over BDC ladder
+      const r9 = mn9 * 0.33;
+      hctx.fillStyle = 'rgba(0,0,0,0.82)';
+      hctx.beginPath();
+      hctx.rect(0, 0, VW, VH);
+      hctx.arc(cx, cy, r9, 0, TAU, true);
+      hctx.fill('evenodd');
+      hctx.strokeStyle = '#000'; hctx.lineWidth = 8;
+      hctx.beginPath(); hctx.arc(cx, cy, r9 - 3, 0, TAU); hctx.stroke();
+      hctx.strokeStyle = '#ffb020'; hctx.lineWidth = 2.4;
+      hctx.beginPath();
+      hctx.moveTo(cx - 11, cy + 8); hctx.lineTo(cx, cy - 6); hctx.lineTo(cx + 11, cy + 8);
+      hctx.stroke();
+      hctx.beginPath();
+      for (let d9 = 1; d9 <= 3; d9++) {
+        hctx.moveTo(cx - (9 - d9 * 2), cy + 8 + d9 * 14);
+        hctx.lineTo(cx + (9 - d9 * 2), cy + 8 + d9 * 14);
+      }
+      hctx.stroke();
+      hctx.fillStyle = '#ffb020';
+      hctx.font = 'bold 11px monospace';
+      hctx.textAlign = 'center';
+      hctx.fillText('4x32', cx, cy + r9 - 12);
+      hctx.textAlign = 'left';
+      hctx.fillStyle = 'rgba(12,12,15,0.96)';                // the M4's handguard under the tube
+      hctx.fillRect(cx - VW * 0.018, cy + r9 * 1.02, VW * 0.036, VH);
+    } else if (ADS.optic === 'reddot') {
+      // red dot: open housing ring, clear glass, one bright dot — the
+      // UZI's stubby body sits under the glass (Tank: show the weapon)
+      const r9 = mn9 * 0.24;
+      hctx.fillStyle = 'rgba(12,12,15,0.96)';
+      hctx.fillRect(cx - VW * 0.016, cy + r9 * 0.6, VW * 0.032, VH);   // stub barrel
+      hctx.beginPath();
+      hctx.moveTo(cx - VW * 0.055, cy + r9 * 1.05);                    // boxy receiver
+      hctx.lineTo(cx + VW * 0.055, cy + r9 * 1.05);
+      hctx.lineTo(cx + VW * 0.16, VH);
+      hctx.lineTo(cx - VW * 0.16, VH);
+      hctx.closePath();
+      hctx.fill();
+      hctx.strokeStyle = 'rgba(10,10,12,0.95)'; hctx.lineWidth = 9;
+      hctx.beginPath(); hctx.arc(cx, cy, r9, 0, TAU); hctx.stroke();
+      hctx.fillStyle = 'rgba(255,40,40,0.12)';
+      hctx.beginPath(); hctx.arc(cx, cy, 7, 0, TAU); hctx.fill();
+      hctx.fillStyle = '#ff2828';
+      hctx.beginPath(); hctx.arc(cx, cy, 2.6, 0, TAU); hctx.fill();
+    } else {
+      // iron sights: notch + post on top, and BELOW them the body of THE
+      // weapon in hand (Tank: the drawn weapon must represent itself)
+      const slideY9 = cy + VH * 0.11;
+      hctx.fillStyle = 'rgba(12,12,15,0.96)';
+      if (player.weapon === 'shotgun') {
+        // long tube: barrel column, pump forearm, receiver shoulder
+        hctx.fillRect(cx - VW * 0.02, slideY9, VW * 0.04, VH);
+        hctx.fillRect(cx - VW * 0.045, cy + VH * 0.2, VW * 0.09, VH * 0.09);   // the pump
+        hctx.beginPath();
+        hctx.moveTo(cx - VW * 0.05, VH * 0.78);
+        hctx.lineTo(cx + VW * 0.05, VH * 0.78);
+        hctx.lineTo(cx + VW * 0.2, VH);
+        hctx.lineTo(cx - VW * 0.2, VH);
+        hctx.closePath();
+        hctx.fill();
+      } else if (player.weapon === 'rpg') {
+        // the launcher is a REAL 3D viewmodel on the camera — the canvas
+        // draws only the sights (2D art kept lying about the perspective)
+      } else {
+        // pistol: the slide mass
+        hctx.beginPath();
+        hctx.moveTo(cx - VW * 0.11, slideY9);
+        hctx.lineTo(cx + VW * 0.11, slideY9);
+        hctx.lineTo(cx + VW * 0.26, VH);
+        hctx.lineTo(cx - VW * 0.26, VH);
+        hctx.closePath();
+        hctx.fill();
+        hctx.fillStyle = 'rgba(34,34,40,0.9)';                         // slide top catches the moon
+        hctx.fillRect(cx - VW * 0.11, slideY9, VW * 0.22, 3);
+        hctx.fillStyle = 'rgba(12,12,15,0.96)';
+      }
+      if (player.weapon !== 'rpg') {                         // the RPG's sights are ON the 3D tube
+        hctx.fillRect(cx - 5, cy + 2, 10, slideY9 - cy);     // front post tip
+        hctx.fillRect(cx - 60, cy + 26, 34, slideY9 - cy - 22);   // rear notch, left wall
+        hctx.fillRect(cx + 26, cy + 26, 34, slideY9 - cy - 22);   // rear notch, right wall
+        hctx.fillStyle = 'rgba(80,255,120,0.9)';
+        hctx.fillRect(cx - 1.5, cy + 4, 3, 5);               // tritium bead
+      }
+    }
+  } else if (!player.car || player.car.kind === 'tank') {
+    ADS.drawn = '';
     const cx = VW / 2, cy = VH / 2;
     hctx.strokeStyle = aimTarget ? '#ff4040' : 'rgba(255,255,255,0.85)';
     hctx.lineWidth = 1.6;
@@ -16438,6 +16953,7 @@ function frame(now) {
   update(dt);
   updRadio();
   syncScene(dt, gtime);
+  adsCamera(dt);                        // sights override the eye LAST
   if (!window._noRender) renderGPU();   // audio receipts starve without this skip (headless swiftshader)
   drawHUD(gtime);
   requestAnimationFrame(frame);
@@ -17314,6 +17830,27 @@ if (location.hash === '#trafficlaw') {
   ck('laneArrowsPainted', laneArrowCount > 400);
   ck('laneLawSane', laneDirAt((K[0] - 5 + 0.5) * TILE, K[1] * TILE + 24) === 2
     && laneDirAt((K[0] - 5 + 0.5) * TILE, (K[1] + 1) * TILE + 24) === 0);
+  // SPOOKED TRAFFIC (Tank order): shots at or near a car panic the driver;
+  // the law keeps its cool; a hit driver forgets the pullover and bolts
+  const pc9 = mkCar(player.x + 300, player.y + 300, 0, 'sedan', 'ai');
+  attachCarMesh(pc9); cars.push(pc9);
+  const pcop9 = mkCar(player.x + 340, player.y + 340, 0, 'cop', 'cop');
+  attachCarMesh(pcop9); cars.push(pcop9);
+  scare(pc9.x + 20, pc9.y, 100);
+  ck('shotNearbySpooksDrivers', (pc9.panicT || 0) > 0);
+  ck('copsKeepTheirCool', !pcop9.panicT);
+  pc9.panicT = 0; pc9.pullover = true;
+  spawnBullet(pc9.x - 20, pc9.y, 900, 0, 0.5, 10, 8, 'p', 2, 0);
+  for (let i9 = 0; i9 < 15; i9++) update(1 / 60);
+  ck('directHitDriverBolts', (pc9.panicT || 0) > 0 && pc9.pullover === false);
+  // REAL crews: officers drive cruisers, soldiers drive military iron
+  ck('cruisersCrewedByPolice', pcop9.mesh.userData.figDress === 'cop');
+  ck('civiliansStayCivilian', pc9.mesh.userData.figDress === 'civ');
+  const hm9 = mkCar(player.x + 400, player.y + 400, 0, 'humvee', null);
+  attachCarMesh(hm9); cars.push(hm9);
+  ck('militaryCrewedBySoldiers', hm9.mesh.userData.figDress === 'mil');
+  hm9.dead = true;
+  pc9.dead = true; pcop9.dead = true;
   console.log('TLAWDBG ' + R.join(' ') + ' fails=' + R.filter(s9 => s9.slice(-6) === '=false').length);
 }
 if (location.hash === '#copnav') {
@@ -18411,6 +18948,136 @@ if (location.hash === '#touch') {
     console.log('TOUCHDBG ' + RU.join(' ') + ' fails=' + uFails);
   }, 400);
 }
+if (location.hash === '#ads') {
+  // AIM-DOWN-SIGHTS receipt (Tank order): right mouse = first person over
+  // the weapon; each gun carries its true glass; the wheel is the sniper
+  // scope's magnification ring ONLY; weapons never swap while aiming;
+  // release hands the eye back.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let aFails = 0;
+    const RA = [], ckA = (n9, v9) => { RA.push(n9 + '=' + v9); if (!v9) aFails++; };
+    const opticFor9 = (w9) => {
+      player.weapon = w9; rdown = true; adsCamera(0.016);
+      const o9 = ADS.optic;
+      rdown = false; adsCamera(0.016);
+      return o9;
+    };
+    ckA('barrettScopes', opticFor9('barrett') === 'scope');
+    ckA('m4Acogs', opticFor9('m4') === 'acog');
+    ckA('uziRedDots', opticFor9('uzi') === 'reddot');
+    ckA('pistolIrons', opticFor9('pistol') === 'iron');
+    ckA('shotgunIrons', opticFor9('shotgun') === 'iron');
+    ckA('fistsHaveNoGlass', opticFor9('fist') === null);
+    player.weapon = 'barrett'; ADS.mag = 8; rdown = true;
+    for (let i9 = 0; i9 < 90; i9++) adsCamera(1 / 60);
+    ckA('scopeZooms', ADS.on === true && camera.fov < 12);
+    ckA('firstPersonHidesTheBody', player.mesh.visible === false);
+    const w09 = player.weapon;
+    window.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 }));
+    ckA('wheelTurnsTheRing', ADS.mag > 8 && player.weapon === w09);
+    for (let i9 = 0; i9 < 40; i9++) window.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 }));
+    ckA('ringStopsAt14', ADS.mag <= 14.001);
+    // line-mode mice and the keyboard ring both turn it
+    ADS.mag = 8;
+    window.dispatchEvent(new WheelEvent('wheel', { deltaY: -3, deltaMode: 1 }));
+    ckA('lineModeWheelsWork', ADS.mag > 8);
+    ADS.mag = 8;
+    keys['Equal'] = true;
+    for (let i9 = 0; i9 < 30; i9++) adsCamera(1 / 60);
+    keys['Equal'] = false;
+    ckA('keyboardRingWorks', ADS.mag > 8);
+    player.weapon = 'm4'; adsCamera(0.016);
+    const magM9 = ADS.mag;
+    window.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 }));
+    ckA('acogIsFixedGlass', ADS.mag === magM9 && player.weapon === 'm4');
+    rdown = false;
+    for (let i9 = 0; i9 < 150; i9++) adsCamera(1 / 60);
+    ckA('releaseHandsTheEyeBack', ADS.on === false && Math.abs(camera.fov - 62) < 1 && player.mesh.visible === true);
+    player.weapon = 'barrett'; rdown = true; adsCamera(0.016);
+    drawHUD(gtime);
+    ckA('glassUIDrawn', ADS.drawn === 'scope');
+    rdown = false; adsCamera(0.016);
+    // INPUT MODES: on glass the world's buttons are dead; modes never bleed
+    player.weapon = 'barrett'; rdown = true; adsCamera(0.016);
+    ckA('modeReadsADS', inputMode() === 'ads');
+    pressed.add('Digit1');
+    update(1 / 60);
+    ckA('adsBlocksWeaponKeys', player.weapon === 'barrett');
+    pressed.add('Space');
+    update(1 / 60);
+    ckA('adsBlocksJump', !player.jumpH);
+    openWheel('key');
+    ckA('adsBlocksTheWheelMenu', wheelOpen === false);
+    const ec9 = mkCar(player.x + 8, player.y, 0, 'sedan', null);
+    attachCarMesh(ec9); cars.push(ec9);
+    pressed.add('KeyE');
+    update(1 / 60);
+    ckA('adsBlocksEnterCar', player.car === null);
+    rdown = false; adsCamera(0.016);
+    ckA('modeReadsFoot', inputMode() === 'foot');
+    pressed.add('KeyE');
+    update(1 / 60);
+    ckA('footEnterWorksAgain', player.car === ec9);
+    ckA('modeReadsDrive', inputMode() === 'drive');
+    player.weapon = 'barrett';
+    pressed.add('Digit1');
+    update(1 / 60);
+    ckA('driveBlocksWeaponKeys', player.weapon === 'barrett');
+    // ON GLASS the shot leaves the eye line, dead under the reticle
+    pressed.add('KeyE'); update(1 / 60); player.car = null;   // step out first
+    player.weapon = 'pistol'; player.ammo.pistol = 10; player.fireT = 0;
+    rdown = true; adsCamera(0.016);
+    const nb9 = bullets.length;
+    fireWeapon();
+    const bb9 = bullets[bullets.length - 1];
+    let adsOrigin9 = false;
+    if (bullets.length > nb9 && bb9) {
+      const lat9 = Math.abs(-Math.sin(mouseYaw) * (bb9.x - player.x) + Math.cos(mouseYaw) * (bb9.y - player.y));
+      adsOrigin9 = lat9 < 2.5 && dist(bb9.x, bb9.y, player.x, player.y) < 9;
+    }
+    ckA('glassFiresUnderTheReticle', adsOrigin9);
+    rdown = false; adsCamera(0.016);
+    // the ring is LIVE before the glass even draws: raw rdown + weapon,
+    // stale ADS snapshot deliberately (the first-frame race)
+    player.weapon = 'barrett'; ADS.mag = 8;
+    ADS.on = false; ADS.optic = null;
+    rdown = true;
+    window.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 }));
+    ckA('ringLiveBeforeTheGlass', ADS.mag > 8);
+    player.weapon = 'pistol';
+    window.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 }));
+    ckA('aimHeldNeverSwapsWeapons', player.weapon === 'pistol');
+    // braced on the sights: the same trigger pull kicks far less
+    player.ammo.pistol = 10;
+    adsCamera(0.016);
+    player.fireT = 0; player.recoilPending = 0;
+    fireWeapon();
+    const kickAds9 = player.recoilPending;
+    rdown = false; adsCamera(0.016);
+    player.fireT = 0; player.recoilPending = 0;
+    fireWeapon();
+    ckA('adsSoftensTheJerk', kickAds9 > 0 && kickAds9 < player.recoilPending * 0.5);
+    // the RPG viewmodel: on the camera while sighted, warhead seated only
+    // when loaded — gone after launch, back on reload, never a bore view
+    player.weapon = 'rpg'; player.ammo.rpg = 5; player.fireT = 0;
+    rdown = true; adsCamera(0.016);
+    const loaded19 = rpgVM9.visible && rpgVM9.userData.warhead.visible && ADS.rpgLoaded;
+    player.fireT = 2;                              // mid-reload
+    adsCamera(0.016);
+    const loaded29 = rpgVM9.visible && !rpgVM9.userData.warhead.visible && !ADS.rpgLoaded;
+    player.fireT = 0;                              // fresh rocket seated
+    adsCamera(0.016);
+    ckA('warheadLaunchesAndReloads', loaded19 && loaded29 && rpgVM9.userData.warhead.visible === true);
+    rdown = false; adsCamera(0.016);
+    ckA('launcherLowersOffSights', rpgVM9.visible === false);
+    pressed.add('KeyE');
+    update(1 / 60);
+    player.car = null; ec9.dead = true;
+    console.log('ADSDBG ' + RA.join(' ') + ' fails=' + aFails);
+  }, 400);
+}
 if (location.hash === '#peds') {
   // BYSTANDER WARDROBE receipt (Tank order): the street rolls real variety
   // — sexes, skins, hair, hats, glasses, beards, skirts — uniforms stay
@@ -18446,6 +19113,58 @@ if (location.hash === '#peds') {
     cop9.dead = true;
     console.log('PEDDBG ' + RP.join(' ') + ' fails=' + pFails);
   }, 500);
+}
+if (location.hash === '#meshhit') {
+  // MESH-TRUE BALLISTICS receipt (Tank order): a bullet lands ONLY if the
+  // flight segment touches the rig/body mesh — a near miss inside the OLD
+  // hit circle flies past, a shot over a roof clears it, the King plinks.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let mFails9 = 0;
+    const RM9 = [], ckM9 = (n9, v9) => { RM9.push(n9 + '=' + v9); if (!v9) mFails9++; };
+    for (const c9 of cars) c9.dead = true;
+    for (const p9 of peds) p9.dead = true;
+    const tp9 = mkPed(player.x + 300, player.y + 300, { spd: 0 });
+    attachPedMesh(tp9); peds.push(tp9);
+    tp9.mesh.position.set(tp9.x * RS, 0, tp9.y * RS);
+    tp9.mesh.rotation.y = -tp9.angle;
+    scene.updateMatrixWorld(true);
+    const hp09 = tp9.hp;
+    spawnBullet(tp9.x - 12, tp9.y, 900, 0, 0.2, 25, 5, 'p', 2, 0);
+    update(1 / 60);
+    ckM9('bulletLandsOnTheRig', tp9.hp < hp09);
+    const hp19 = tp9.hp;
+    spawnBullet(tp9.x - 12, tp9.y + 8, 900, 0, 0.2, 25, 5, 'p', 2, 0);   // inside the OLD 11px circle
+    update(1 / 60);
+    ckM9('nearMissFliesPast', tp9.hp === hp19);
+    tp9.dead = true;
+    const tc9 = mkCar(player.x + 340, player.y + 340, 0, 'sedan', null);
+    attachCarMesh(tc9); cars.push(tc9);
+    tc9.mesh.position.set(tc9.x * RS, 0, tc9.y * RS);
+    tc9.mesh.rotation.y = -tc9.angle;
+    scene.updateMatrixWorld(true);
+    const chp09 = tc9.hp;
+    spawnBullet(tc9.x - 30, tc9.y, 900, 0, 0.3, 10, 8, 'p', 4.6, 0);     // clean over the roof
+    for (let i9 = 0; i9 < 2; i9++) update(1 / 60);
+    ckM9('roofShotFliesOver', tc9.hp === chp09);
+    spawnBullet(tc9.x - 30, tc9.y, 900, 0, 0.3, 10, 8, 'p', 1.2, 0);     // into the body
+    for (let i9 = 0; i9 < 2; i9++) update(1 / 60);
+    ckM9('bodyShotConnects', tc9.hp < chp09);
+    tc9.dead = true;
+    runConsole("it's gojillia!");
+    GOJI.state = 'roam'; GOJI.x = player.x + 400; GOJI.y = player.y + 400; GOJI.retgtT = 99; GOJI.breathCool = 99;
+    updGoji(0.016);
+    GOJI.grp.updateMatrixWorld(true);
+    // torso height — a leg-height center shot passes BETWEEN his legs
+    // (mesh-true at its finest; the first test draft proved it by failing)
+    spawnBullet(GOJI.x - 30, GOJI.y, 900, 0, 0.4, 10, 8, 'p', 13, 0);
+    const gb9 = bullets[bullets.length - 1];
+    for (let i9 = 0; i9 < 4; i9++) update(1 / 60);
+    ckM9('kingTakesThePlink', gb9.life <= 0);
+    runConsole("it's gojillia!");
+    console.log('MSHDBG ' + RM9.join(' ') + ' fails=' + mFails9);
+  }, 400);
 }
 if (location.hash === '#goji') {
   // GOJILLIA receipt (Tank cheat): the King rises and brands the run,
@@ -18536,7 +19255,7 @@ if (location.hash === '#weather') {
   setTimeout(() => {
     let wFails = 0;
     const RW = [], ckW = (n9, v9) => { RW.push(n9 + '=' + v9); if (!v9) wFails++; };
-    ckW('strikeOddsAreTanks', WEATHER.STRIKE_P === 0.00001);
+    ckW('strikeOddsAreTanks', WEATHER.STRIKE_P === 0.000001);
     ckW('snowSheetSkipsWater', landRuns9.length > 50 && landRuns9.length < GRID_H * GRID_W / 4);
     // RAIN: force the spell, run a wet minute
     WEATHER.mode = 'rain'; WEATHER.t = 600; WEATHER.inten = 0; WEATHER.wet = 0;
@@ -18560,6 +19279,35 @@ if (location.hash === '#weather') {
     lightningStrike(player.x, player.y, player);
     ckW('boltHurtsTheGhost', player.hp < php9);
     godMode = true;
+    // the ARC itself: random snake channel + branches, restrike crawl,
+    // light radiating from the strike, and true terminations
+    ckW('arcSnakes', boltSegs9.filter(s9 => s9.visible).length >= 10);
+    const seg09 = boltSegs9[2].position.x;
+    WEATHER.boltCtx.re = 0;
+    updWeather(0.03);
+    ckW('arcRestrikes', boltSegs9[2].position.x !== seg09);
+    updWeather(0.02);
+    ckW('arcRadiatesLight', boltLightA9.intensity > 0 && boltLightB9.intensity > 0);
+    let roofX9 = -1, roofY9 = -1;
+    for (let iy9 = 0; iy9 < GRID_H && roofX9 < 0; iy9++)
+      for (let ix9 = 0; ix9 < GRID_W; ix9++)
+        if (heightMap[idx(ix9, iy9)] > 4) { roofX9 = (ix9 + 0.5) * TILE; roofY9 = (iy9 + 0.5) * TILE; break; }
+    lightningStrike(roofX9, roofY9, null);
+    ckW('arcFindsTheRoof', WEATHER.boltCtx.endY > 2);
+    let wtx9 = -1, wty9 = -1;
+    for (let iy9 = 0; iy9 < GRID_H && wtx9 < 0; iy9++)
+      for (let ix9 = 0; ix9 < GRID_W; ix9++)
+        if (tiles[iy9 * GRID_W + ix9] === T_WATER) { wtx9 = (ix9 + 0.5) * TILE; wty9 = (iy9 + 0.5) * TILE; break; }
+    lightningStrike(wtx9, wty9, null);
+    ckW('arcLandsOnWater', WEATHER.boltCtx.endY === 0.3);
+    // the arc STANDS a full second, then dies fast
+    for (let i9 = 0; i9 < 50; i9++) updWeather(0.01);        // t = 0.5s
+    ckW('arcStandsASecond', boltGrp.visible === true && boltMat9.opacity > 0.95);
+    for (let i9 = 0; i9 < 60; i9++) updWeather(0.01);        // t = 1.1s: fading
+    ckW('arcFadesFast', boltMat9.opacity < 0.6);
+    for (let i9 = 0; i9 < 20; i9++) updWeather(0.01);        // t = 1.3s: gone
+    ckW('arcGoneAfter', boltGrp.visible === false);
+    WEATHER.boltT = 0; updWeather(0.02);
     // SNOW: switch spells, let it lay
     WEATHER.mode = 'snow'; WEATHER.t = 600; WEATHER.snow = 0;
     for (let i9 = 0; i9 < 400; i9++) updWeather(0.1);
@@ -18587,7 +19335,13 @@ if (location.hash === '#weather') {
     WEATHER.snow = 0; WEATHER.wet = 1;
     for (let i9 = 0; i9 < 20; i9++) { player.x += 6; updMarks(0.05); }
     ckW('wetPrintsInRain', marks9.some(m9 => m9 && m9.kind === 'wet'));
-    ckW('rainPrintsFleeting', marks9.filter(m9 => m9 && m9.kind === 'wet' && m9.foot).every(m9 => m9.life <= 0.2));
+    ckW('rainPrintsFleeting', marks9.filter(m9 => m9 && m9.kind === 'wet' && m9.foot).every(m9 => m9.life <= 0.25));
+    tcar9.dead = false; tcar9.speed = 80;
+    tcar9._mkPX = undefined;
+    for (let i9 = 0; i9 < 12; i9++) { tcar9.x += 7; updMarks(0.03); }
+    ckW('rainTireTracksHalfSecond', marks9.some(m9 => m9 && m9.kind === 'wet' && !m9.foot) &&
+      marks9.filter(m9 => m9 && m9.kind === 'wet' && !m9.foot).every(m9 => m9.life <= 0.5));
+    tcar9.dead = true;
     // a paused game pauses the sky
     WEATHER.mode = 'rain'; WEATHER.t = 333; WEATHER.inten = 0.5;
     paused = true;
@@ -18708,6 +19462,35 @@ if (location.hash === '#weather') {
     WEATHER.mode = 'clear'; WEATHER.t = 0;
     updWeather(0.01);
     ckW('winterReturnsEvery30', WEATHER.mode === 'snow');
+    // the exact day boundaries: 6.9 snows, 7.05 rains, 29.9 rains, 30.05 snows
+    const dayPick9 = (d9) => {
+      WEATHER.seasonStart = Date.now() - d9 * 86400e3;
+      WEATHER.mode = 'clear'; WEATHER.t = 0;
+      updWeather(0.01);
+      return WEATHER.mode;
+    };
+    ckW('day6point9StillSnows', dayPick9(6.9) === 'snow');
+    ckW('day7point05Rains', dayPick9(7.05) === 'rain');
+    ckW('day29point9StillRains', dayPick9(29.9) === 'rain');
+    ckW('day30point05SnowsAgain', dayPick9(30.05) === 'snow');
+    // a clock stepped backward must not lock permanent winter — clamped
+    // age reads as day 0 (fresh save) and the cycle stays sane
+    ckW('backwardClockSurvives', dayPick9(-5) === 'snow');
+    // the SKY rides the save on device time (slot 10, snapshot-restored)
+    const bakW9 = localStorage.getItem('gta3_save_10');
+    WEATHER.mode = 'rain'; WEATHER.t = 90; WEATHER.inten = 1; WEATHER.wet = 0.8; WEATHER.snow = 0; WEATHER.deep = 0;
+    saveGame(10);
+    WEATHER.mode = 'clear'; WEATHER.wet = 0;
+    loadGame(10);
+    ckW('loadResumesTheStorm', WEATHER.mode === 'rain' && WEATHER.wet > 0.7);
+    // fake a 200-second absence: the spell has passed, the ground dried
+    const slot9 = JSON.parse(localStorage.getItem('gta3_save_10'));
+    slot9.wx.at -= 200e3;
+    localStorage.setItem('gta3_save_10', JSON.stringify(slot9));
+    loadGame(10);
+    ckW('absenceMovesTheSky', WEATHER.mode === 'clear' && WEATHER.wet < 0.2);
+    if (bakW9 === null) localStorage.removeItem('gta3_save_10'); else localStorage.setItem('gta3_save_10', bakW9);
+    WEATHER.seasonStart = Date.now();
     // thundersnow: lightning CAN fire during a snow spell
     WEATHER.mode = 'snow'; WEATHER.t = 600; WEATHER.inten = 1; WEATHER.flashT = 0;
     let sawFlash9 = false;
@@ -20353,7 +21136,10 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
 // never move. Compose them ONCE; dynamic subtrees (cars, peds, the player,
 // the flag, the save floppy, water) stay live.
 {
-  const dyn9 = new Set([player.mesh, ghostSeat, capitolFlagM, saveIcon, oceanWater, moonDisc].filter(Boolean));   // the moon rides the camera
+  // the moon rides the camera; the bolt segments repose EVERY strike (their
+  // own visible flags are true even inside the hidden group — the freeze
+  // must not lock them, or lightning renders at origin forever)
+  const dyn9 = new Set([player.mesh, ghostSeat, capitolFlagM, saveIcon, oceanWater, moonDisc, ...boltSegs9].filter(Boolean));
   for (const c9 of cars) if (c9.mesh) dyn9.add(c9.mesh);
   for (const p9 of peds) if (p9.mesh) dyn9.add(p9.mesh);
   let frozen9 = 0;

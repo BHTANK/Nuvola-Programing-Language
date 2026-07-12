@@ -705,7 +705,7 @@ function runConsole(raw) {
   // anything beyond save/load/stats is a cheat — and every save made from
   // that point on carries the mark
   // weather commands are a TEST TOOL (Tank order) — no advantage, no brand
-  if (!/^(save (10|[1-9])|load (10|[1-9])|stats|saves|weather (rain|snow|clear|lightning|blizzard))$/.test(cmd)) cheated = true;
+  if (!/^(save (10|[1-9])|load (10|[1-9])|stats|saves|weather (rain|snow|clear|lightning|blizzard)|rpgfit( -?\d*\.?\d+)?|roof)$/.test(cmd)) cheated = true;
   let out;
   if (cmd === 'fix car') {
     if (player.car) {
@@ -713,6 +713,8 @@ function runConsole(raw) {
       player.car.onFireT = 0;
       player.car.burnT = 0;
       undentCar(player.car);
+      const gfx9 = player.car.mesh && player.car.mesh.userData.gear9;
+      if (gfx9) { gfx9.hp = [360, 360]; gfx9.broken = [false, false]; gfx9.seeded = false; }   // fresh tracks too
       out = 'Vehicle repaired.';
     } else out = 'You are not in a vehicle.';
   } else if (cmd === 'shut up and take my money') {
@@ -774,6 +776,36 @@ function runConsole(raw) {
       out = w9 === 'clear' ? 'Skies clearing.'
         : w9 === 'rain' ? 'Storm rolling in.'
           : w9 === 'blizzard' ? 'WHITEOUT — waist-deep and rising.' : 'Snow rolling in.';
+    }
+  } else if (/^rpgfit( -?\d*\.?\d+)?$/.test(cmd)) {
+    // TEST TOOL (Tank order): dial the launcher viewmodel sideways LIVE —
+    // aim down the RPG and watch it move; no reloads, no re-renders,
+    // no burned credits. Minus slides the tube LEFT; fit9 re-cancels the
+    // sight blades so their tips never leave the bullet's line. Bare
+    // "rpgfit" just reads the current number back.
+    const fx9 = cmd.match(/-?\d*\.?\d+/);
+    if (fx9) rpgVM9.userData.fit9(Math.max(-0.4, Math.min(0.4, parseFloat(fx9[0]))));
+    out = 'Launcher x = ' + rpgVM9.position.x.toFixed(3)
+      + (fx9 ? ' — set. Hand this number to Claude when it sits right.' : ' (try: rpgfit -0.06 ... minus = left)');
+  } else if (cmd === 'roof') {
+    // TEST TOOL (Tank order, traversal slice 1): put the ghost on the
+    // nearest real rooftop until the stairs and ladders land — walk it,
+    // hop the parapet gaps, fall off it. On foot only.
+    if (player.car) out = 'Not from a driver\'s seat.';
+    else {
+      let bt9 = null, bd9 = 1e9;
+      for (let iy9 = 1; iy9 < GRID_H - 1; iy9++) for (let ix9 = 1; ix9 < GRID_W - 1; ix9++) {
+        if (solid[idx(ix9, iy9)] !== 1 || heightMap[idx(ix9, iy9)] < FLOOR_H) continue;
+        const tx9 = (ix9 + 0.5) * TILE, ty9 = (iy9 + 0.5) * TILE;
+        const dd9 = (tx9 - player.x) * (tx9 - player.x) + (ty9 - player.y) * (ty9 - player.y);
+        if (dd9 < bd9 && !solidAtPx(tx9, ty9, heightMap[idx(ix9, iy9)])) { bd9 = dd9; bt9 = { x: tx9, y: ty9, h: heightMap[idx(ix9, iy9)] }; }
+      }
+      if (bt9) {
+        player.x = bt9.x; player.y = bt9.y;
+        player.roofH = bt9.h; player.jumpH = 0; player.jumpV = 0;
+        player.gGar = null; player.gDeck = null; player.gPy = null;
+        out = 'On the roof — ' + (bt9.h / FLOOR_H).toFixed(0) + ' storeys up. Mind the parapet.';
+      } else out = 'No roof found near you.';
     }
   } else if (cmd === "it's raining meatballs") {
     METEOR.on = !METEOR.on;
@@ -1700,13 +1732,26 @@ function islandOfPx(x, y) { return islandAt(Math.floor(x / TILE), Math.floor((y 
 function idx(ix, iy) { return iy * GRID_W + ix; }
 function inGrid(ix, iy) { return ix >= 0 && iy >= 0 && ix < GRID_W && iy < GRID_H; }
 function tileAt(ix, iy) { return inGrid(ix, iy) ? tiles[idx(ix, iy)] : T_WATER; }
-function solidAtPx(x, y) {
+function solidAtPx(x, y, feetH) {
+  // feetH (render units) makes solidity STOREY-AWARE (Tank order 2026-07-12:
+  // every rooftop is a surface): to feet that can reach its roof, a
+  // building tile is a FLOOR, not a wall. Callers that pass nothing
+  // (peds, cars, camera) keep the classic street-level answer untouched.
   const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
   if (!inGrid(ix, iy)) return true;
-  if (solid[idx(ix, iy)] === 1) return true;
+  if (solid[idx(ix, iy)] === 1) {
+    if (feetH === undefined) return true;
+    const rh = heightMap[idx(ix, iy)];
+    if (!(rh > 0 && feetH + 1.3 >= rh)) return true;   // a wall to anyone below the parapet
+    // reachable roof: fall through to the rooftop-furniture blockers
+  }
+  const fh = feetH || 0;
   // only the props whose footprint touches THIS tile — never the whole city
   const arr = blockGrid.get(ix + ',' + iy);
   if (arr) for (const b of arr) {
+    // storey filter: street props stop street feet, roof furniture (hb =
+    // the roof height it stands on) stops roof feet — never each other's
+    if (b.hb !== undefined ? (fh < b.hb - 1 || fh >= b.hb + 7) : fh >= 4.5) continue;
     if (b.r !== undefined) {
       const dx = x - b.x, dy = y - b.y;
       if (dx * dx + dy * dy < b.r * b.r) return true;   // inside the circular footprint
@@ -1780,12 +1825,14 @@ function pWalkAt(x, y, deck, gar) {
 }
 function waterAt(x, y) { return tileAt(Math.floor(x / TILE), Math.floor(y / TILE)) === T_WATER; }
 // camera-only solidity: water blocks cars, not sightlines
-function solidCamAt(x, y) {
+function solidCamAt(x, y, rayH) {
   // inside a garage the camera floats through the structure with the player
   if ((player.gGar || (player.car && player.car.gGar)) && garAt(x, y)) return false;
   const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
   if (!inGrid(ix, iy)) return true;
-  return solid[idx(ix, iy)] === 1 && tiles[idx(ix, iy)] !== T_WATER;
+  if (!(solid[idx(ix, iy)] === 1 && tiles[idx(ix, iy)] !== T_WATER)) return false;
+  // a lens ABOVE the roofline (rooftop play) sails clean over the building
+  return !(rayH !== undefined && rayH > heightMap[idx(ix, iy)] + 0.4);
 }
 function depthAtPx(x, y) {
   const ix = Math.floor(x / TILE), iy = Math.floor(y / TILE);
@@ -1844,14 +1891,17 @@ function blockGridReg(b, x0, y0, x1, y1) {
       blockGrid.get(k).push(b);
     }
 }
-function addBlocker(x, y, r) {
-  const b = { x, y, r };
+function addBlocker(x, y, r, hb) {
+  // hb (render units) marks ROOFTOP furniture: it blocks only feet
+  // walking that roof (see the storey filter in solidAtPx)
+  const b = hb !== undefined ? { x, y, r, hb } : { x, y, r };
   blockers.push(b);
   blockGridReg(b, x - r, y - r, x + r, y + r);
 }
 // exact box footprint, given in RENDER units (center + size) like the meshes
-function addBlockRectRU(cx, cz, sx, sz) {
+function addBlockRectRU(cx, cz, sx, sz, hb) {
   const b = { x0: (cx - sx / 2) / RS, y0: (cz - sz / 2) / RS, x1: (cx + sx / 2) / RS, y1: (cz + sz / 2) / RS };
+  if (hb !== undefined) b.hb = hb;
   blockRects.push(b);
   blockGridReg(b, b.x0, b.y0, b.x1, b.y1);
 }
@@ -3063,20 +3113,33 @@ const rpgVM9 = (() => {
   // faces the eye, and the sight blades climb to the view axis
   const sightM9 = new THREE.MeshLambertMaterial({ color: 0x14170f });
   const fpost9 = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.24, 0.022), sightM9);
-  fpost9.position.set(0.026, 0.205, -1.95);
+  fpost9.position.set(0, 0.205, -1.95);
   g9.add(fpost9);
   const rearL9 = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.2, 0.02), sightM9);
-  rearL9.position.set(-0.019, 0.21, -0.85);
+  rearL9.position.set(-0.045, 0.21, -0.85);
   g9.add(rearL9);
   const rearR9 = rearL9.clone();
-  rearR9.position.x = 0.071;
+  rearR9.position.x = 0.045;
   g9.add(rearR9);
   const rearBar9 = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.02, 0.02), sightM9);
-  rearBar9.position.set(0.026, 0.155, -0.85);
+  rearBar9.position.set(0, 0.155, -0.85);
   g9.add(rearBar9);
-  // shoulder-true hold: tube low on the shoulder, a touch left (Tank-
-  // tuned) — the sight offsets cancel it so the aim line stays centered
-  g9.position.set(-0.026, -0.31, 0);
+  // THE PLACEMENT RULE (Tank, in plain words): the sights live ON the
+  // aim line — screen center — and the gun body sits DIRECTLY UNDER
+  // them. Same axis, same world x. Blades at 0 / ±0.045 around it, tube
+  // dropped -0.31 in y so the body hangs below the frame — no signed
+  // nudges, no sweep. fit9(<x>) (console "rpgfit", minus = left) can
+  // still slide the body for taste and re-cancels every blade so the
+  // tips never leave the bullet's line.
+  g9.userData.sights9 = [fpost9, rearL9, rearR9, rearBar9];
+  const SIGHTW9 = [0, -0.045, 0.045, 0];   // world-x each blade holds
+  g9.userData.fit9 = (gx9) => {
+    g9.position.x = gx9;
+    for (let i9 = 0; i9 < 4; i9++)
+      g9.userData.sights9[i9].position.x = SIGHTW9[i9] - gx9;
+  };
+  g9.position.set(0, -0.31, 0);
+  g9.userData.fit9(0);   // gun axis = sight line = screen center. UNDER.
   g9.visible = false;
   camera.add(g9);
   return g9;
@@ -3096,7 +3159,12 @@ function adsCamera(dt) {
     camera.fov += (tf9 - camera.fov) * Math.min(1, (dt || 0.016) * 14);
     camera.updateProjectionMatrix();
   }
-  if (player.mesh) player.mesh.visible = !ADS.on;
+  // ADS only ever HIDES the walking body (first person) — it must NEVER
+  // force-show it. Visibility is owned by syncScene (!car && !menu &&
+  // !dead); this line runs AFTER syncScene in frame(), and the old
+  // "visible = !ADS.on" re-showed the body every frame you sat in a car:
+  // a frozen statue of the ghost left standing at the curb (Tank bug).
+  if (player.mesh && ADS.on) player.mesh.visible = false;
   if (ADS.magPulse > 0) ADS.magPulse -= dt || 0.016;
   // the 3D launcher viewmodel: visible on the sights, warhead seated only
   // while a rocket is actually loaded — never a view down the bore
@@ -4061,6 +4129,59 @@ function poolPickup9(ent9, x9, y9) {
     }
   }
 }
+function updCrush9(dt) {
+  // the tank's WEIGHT on top of a car (Tank order): the NOSE is not the
+  // full weight — the flattening only starts once the BODY is over the
+  // hood, trunk or roof. Then downward force crushes it, dent by dent,
+  // until it explodes BELOW the hull — the flattened frame stays behind
+  // until it disappears.
+  for (const c9 of cars) {
+    if (!c9.crushT9 || c9.dead) continue;
+    const tk9 = c9.crushBy9;
+    if (!tk9 || tk9.dead) { c9.crushT9 = 0; continue; }
+    c9.crushT9 += dt;
+    const d9 = dist(tk9.x, tk9.y, c9.x, c9.y);
+    const mounted9 = d9 < tk9.len * 0.5;             // the BODY is on it now
+    if (mounted9) {
+      c9.crushW9 = (c9.crushW9 || 0) + dt;           // full weight, on the clock
+      c9.crushF9 = Math.min(1, c9.crushW9 / 0.55);
+      c9._crushSfx9 = (c9._crushSfx9 || 0) - dt;
+      if (c9._crushSfx9 <= 0) {
+        c9._crushSfx9 = 0.2;
+        dentCar(c9, c9.x + rndf(-10, 10), c9.y + rndf(-8, 8), 190);
+        sfx('punch', c9.x, c9.y, 18);
+      }
+    }
+    c9.speed *= Math.pow(0.02, dt);                  // pinned under the hull
+    tk9.speed *= Math.pow(0.78, dt);                 // climbing costs pace
+    const over9 = d9 < (tk9.len + c9.len) * 0.5 + 6;
+    // TRACKS RIDE THE VEHICLE (Tank order): over the hood the tank hangs
+    // in the air ON the car; one-track contact leans the hull toward the
+    // side still on the ground; it all settles as the car flattens
+    if (over9) {
+      const sinA9 = Math.sin(tk9.angle), cosA9 = Math.cos(tk9.angle);
+      const lzT9 = -(c9.x - tk9.x) * sinA9 + (c9.y - tk9.y) * cosA9;   // + = right
+      const lxT9 = (c9.x - tk9.x) * cosA9 + (c9.y - tk9.y) * sinA9;    // + = front
+      const carH9 = (1 - (c9.crushF9 || 0)) * 1.3 * (mounted9 ? 1 : 0.35);
+      if (!tk9.trkH9) tk9.trkH9 = [0, 0];
+      if (!tk9.endH9) tk9.endH9 = [0, 0];
+      const w189 = tk9.w * 0.18, l159 = tk9.len * 0.15;
+      // which TRACK is on it decides the lean; which END decides the pitch
+      if (lzT9 < w189) tk9.trkH9[0] = Math.max(tk9.trkH9[0], carH9);
+      if (lzT9 > -w189) tk9.trkH9[1] = Math.max(tk9.trkH9[1], carH9);
+      if (lxT9 < l159) tk9.endH9[0] = Math.max(tk9.endH9[0], carH9);   // rear up -> nose down
+      if (lxT9 > -l159) tk9.endH9[1] = Math.max(tk9.endH9[1], carH9);
+    }
+    if (c9.crushF9 >= 1) {
+      c9.crushT9 = 0;
+      c9.wreckT9 = 20;                               // the frame lingers, then goes
+      carDamage(c9, 9999, tk9.driver === 'player' ? 'p' : null);   // it goes off UNDER the tank
+    } else if (!over9 && c9.crushT9 > 0.5) {
+      c9.crushT9 = 0;                                // rolled off early: mangled, not lit
+      carDamage(c9, 60, tk9.driver === 'player' ? 'p' : null);
+    }
+  }
+}
 function updMarks(dt) {
   // fresh pools under the fallen — scan, never touch the death code
   for (const p9 of peds)
@@ -4071,6 +4192,7 @@ function updMarks(dt) {
   // feet: alternating prints every few steps of travel
   const foot9 = (ent9) => {
     if (ent9.gDeck != null) return;             // garage decks keep no snow
+    if ((ent9.roofH || 0) > 0) return;          // roof walks don't print the street below
     const px9 = ent9._mkPX === undefined ? ent9.x : ent9._mkPX;
     const py9 = ent9._mkPY === undefined ? ent9.y : ent9._mkPY;
     const d9 = dist(ent9.x, ent9.y, px9, py9);
@@ -4093,6 +4215,30 @@ function updMarks(dt) {
   for (const c9 of cars) {
     if (c9.dead || Math.abs(c9.speed) < 10 || (c9.alt || 0) > 0.5 || c9.kind === 'boat' || c9.kind === 'helo') continue;
     if (c9.gDeck != null) continue;
+    if (c9.kind === 'tank') {
+      // TRACK PADS PRINT THE WORLD (Tank order): each side lays its own
+      // ladder of pad rungs, spaced by ITS OWN travel — a turning tank
+      // prints denser on the fast track, and a broken side lays nothing
+      const G9 = c9.mesh && c9.mesh.userData.gear9;
+      if (!G9) continue;
+      poolPickup9(c9, c9.x, c9.y);
+      const k9 = trackKind9(c9);
+      const ca9 = Math.cos(c9.angle), sa9 = Math.sin(c9.angle);
+      for (let si9 = 0; si9 < 2; si9++) {
+        if (G9.broken[si9]) { G9.padD[si9] = 0; continue; }
+        G9.padD[si9] += Math.abs(G9.vSide[si9] || 0) * dt;
+        if (!k9) { G9.padD[si9] = Math.min(G9.padD[si9], 14); continue; }
+        const zo9 = G9.zc[si9] / RS;                   // the track line, in px
+        while (G9.padD[si9] >= 14) {
+          G9.padD[si9] -= 14;
+          stampMark(c9.x - ca9 * (c9.len * 0.28) - sa9 * zo9,
+            c9.y - sa9 * (c9.len * 0.28) + ca9 * zo9,
+            c9.angle, 2.2, 0.55, k9,
+            k9 === 'wet' ? 0.5 : k9 === 'snow' ? 45 : 25, 0.16);
+        }
+      }
+      continue;
+    }
     if (c9._mkPX === undefined) { c9._mkPX = c9.x; c9._mkPY = c9.y; c9._mkPA = c9.angle; continue; }
     const px9 = c9._mkPX, py9 = c9._mkPY, pA9 = c9._mkPA;
     const run9 = dist(c9.x, c9.y, px9, py9);
@@ -6158,6 +6304,8 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
       const cone = new THREE.Mesh(wtConeGeo, wtTankMat);
       cone.position.set(wx, H + 5.6, wz);
       scene.add(cone);
+      // the tower stands ON this roof — legs + tank stop roof walkers
+      addBlocker(wx / RS, wz / RS, 2.2 / RS, H);
     }
     if (b.crown) {
       // stepped top + lit crown + antenna beacon
@@ -6179,6 +6327,8 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
       const bea = new THREE.Mesh(new THREE.SphereGeometry(0.3, 6, 5), new THREE.MeshBasicMaterial({ color: 0xff3030 }));
       bea.position.set(cx, H + 12.5, cz);
       scene.add(bea);
+      // the stepped crown occupies the roof center — walkers keep the rim
+      addBlockRectRU(cx, cz, W * 0.75, D * 0.75, H);
     }
     if (b.bill) {
       // rooftop billboard
@@ -6191,6 +6341,11 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
       panel.position.set(cx, H + 2.6, cz + D * 0.2);
       panel.rotation.y = Math.random() < 0.5 ? 0.3 : -0.3;
       scene.add(panel);
+      // pole + panel stand ON this roof — circles trace the rotated slab
+      addBlocker(cx / RS, (cz + D * 0.2) / RS, 0.5 / RS, H);
+      for (const off9 of [-2.4, 0, 2.4])
+        addBlocker((cx + Math.cos(panel.rotation.y) * off9) / RS,
+          (cz + D * 0.2 - Math.sin(panel.rotation.y) * off9) / RS, 1.0 / RS, H);
     }
     if (b.roof) {
       // pitched roof: two sloped slabs meeting at a ridge along the depth,
@@ -6207,6 +6362,8 @@ function registerWalkStep(cx, topY, cz, sx, sz) {
       ridge.scale.set(W * 0.18, 0.32, D + 0.55);
       ridge.position.set(cx, H + W * 0.3, cz);
       scene.add(ridge);
+      // a PITCHED roof is slopes, not floor — feet stay off it entirely
+      addBlockRectRU(cx, cz, W + 0.2, D + 0.5, H);
       let gg = gableGeos[b.tw];
       if (!gg) {
         const tri = new THREE.Shape();
@@ -8408,80 +8565,155 @@ function buildCarMesh(c) {
     curveSegments: 14, steps: 1
   };
   if (c.kind === 'tank') {
-    // tracks: a real belt silhouette — flat on the ground, rising at both
-    // ends over the idler (front) and drive sprocket (rear), road wheels
-    // sitting INSIDE the band and poking through its sides
-    const beltShape = new THREE.Shape();
-    beltShape.moveTo(-5.3, 0.08);
-    beltShape.lineTo(5.3, 0.08);
-    beltShape.lineTo(7.8, 1.9);
-    beltShape.lineTo(-7.8, 1.9);
-    beltShape.closePath();
-    const beltGeo = new THREE.ExtrudeGeometry(beltShape, { depth: 1.9, bevelEnabled: false });
-    beltGeo.translate(0, 0, -0.95);
+    // ========== RUNNING GEAR v2 (Tank order 2026-07-12) ==========
+    // 7 sprung road wheels + raised front idler + the LARGE REAR DRIVE
+    // SPROCKET turning a DOUBLE chain (two link rails) wrapped around the
+    // whole wheel run; RUBBER PADS bridge the rails — they are the
+    // traction and the footprint. The side skirts are gone so the whole
+    // mechanism shows and works. Hull rides the springs (hullG below).
+    // Track HP lives in gear9.hp — a broken side stops flowing, throws a
+    // visible chain gap, gives no power and prints nothing.
+    const padMat9 = new THREE.MeshLambertMaterial({ color: 0x191b16 });
+    // chain path (side view, x/y): ground run front->rear, up and OVER
+    // the rear sprocket, top run forward, over and down the front idler,
+    // short slope back to the ground. Sampled arcs, closed loop.
+    // the end wheels sit SPACED OFF the road-wheel pack (Tank order): the
+    // chain rising to them makes a near-vertical pad face at each end —
+    // that face is what grabs and CLIMBS obstacles, nose or tail first
+    const IDL9 = { x: 6.85, y: 1.15, r: 1.0 };
+    const SPK9 = { x: -6.85, y: 1.35, r: 1.34 };
+    const gear9 = {
+      zc: [0, 0], off: [0, 0], spin: [0, 0], vSide: [0, 0], padD: [0, 0],
+      hp: [360, 360], broken: [false, false], seeded: false,
+      sprk: [null, null], idl: [null, null], arms: [[], []],
+      sprkR: SPK9.r, idlR: IDL9.r, spkX: SPK9.x, idlX: IDL9.x, n: 0
+    };
+    // the chain path is a FUNCTION of where the end wheels sit right now
+    // (Tank order: the body's rock carries the frame-locked idler and
+    // sprocket, and the track re-forms around them) — dI9/dS9 are the
+    // idler/sprocket vertical displacements of the moment
+    gear9.mkPath = (dI9, dS9) => {
+      const p9 = [[4.9, 0.16], [-6.4, 0.16]];
+      for (let i9 = 0; i9 <= 8; i9++) {                // rear wrap, through the back
+        const a9 = -1.21 - (3.5 * i9) / 8;
+        p9.push([SPK9.x + Math.cos(a9) * SPK9.r, SPK9.y + dS9 + Math.sin(a9) * SPK9.r]);
+      }
+      for (let i9 = 0; i9 <= 5; i9++) {                // front wrap, over and down
+        const a9 = Math.PI / 2 - (Math.PI / 2 + 0.75) * (i9 / 5);
+        p9.push([IDL9.x + Math.cos(a9) * IDL9.r, IDL9.y + dI9 + Math.sin(a9) * IDL9.r]);
+      }
+      const cu9 = [0];
+      for (let i9 = 1; i9 <= p9.length; i9++) {
+        const a9 = p9[i9 - 1], b9 = p9[i9 % p9.length];
+        cu9.push(cu9[i9 - 1] + Math.hypot(b9[0] - a9[0], b9[1] - a9[1]));
+      }
+      return { pth: p9, cum: cu9, perim: cu9[cu9.length - 1] };
+    };
+    const rest9 = gear9.mkPath(0, 0);
+    const nLnk9 = 2 * Math.round(rest9.perim / 0.42 / 2);   // even count: pads tile cleanly
+    gear9.n = nLnk9;
+    gear9.dyn = [gear9.mkPath(0, 0), gear9.mkPath(0, 0)];   // one live path per side
+    // hull group: everything that rides the SPRINGS (recoil rock lives
+    // here) — declared early so the fenders can bolt onto the BODY
+    const hullG = new THREE.Group();
+    g.add(hullG);
+    g.userData.hullG = hullG;
     for (const side of [-1, 1]) {
+      const si = side < 0 ? 0 : 1;                     // [0]=LEFT (-z), [1]=RIGHT (+z)
       const zc = side * (W / 2 - 0.95);
-      const belt = new THREE.Mesh(beltGeo, TANK_MATS.tread);
-      belt.position.set(0, 0, zc);
-      g.add(belt);
-      // 7 road wheels with hub discs, like the real running gear
+      gear9.zc[si] = zc;
+      // 7 road wheels, each on its own SPRING ARM (the group is the travel).
+      // Every wheel is CONNECTED to the body (Tank order): a visible shock
+      // strut + spring coil run from the hub up into the hull underside —
+      // they ride the arm, so wheel, shock and body always move together.
       for (let i = 0; i < 7; i++) {
-        const wx = -4.65 + i * 1.55;
+        const arm = new THREE.Group();
+        arm.position.set(-4.65 + i * 1.55, 0.66, zc);
         const wl = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 2.15, 12), TANK_MATS.wheel);
         wl.rotation.x = Math.PI / 2;
-        wl.position.set(wx, 0.66, zc);
-        g.add(wl);
+        arm.add(wl);
         const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 2.3, 8), TANK_MATS.hub);
         hub.rotation.x = Math.PI / 2;
-        hub.position.set(wx, 0.66, zc);
-        g.add(hub);
+        arm.add(hub);
+        const strut = new THREE.Mesh(new THREE.BoxGeometry(0.18, 1.9, 0.18), TANK_MATS.hub);
+        strut.position.set(0, 0.95, 0);            // top rides hidden inside the hull
+        arm.add(strut);
+        const coil = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.17, 0.34, 8), TANK_MATS.mg);
+        coil.position.set(0, 0.72, 0);
+        arm.add(coil);
+        g.add(arm);
+        gear9.arms[si].push(arm);
       }
-      // raised idler (front) + drive sprocket (rear) at the belt slopes
-      for (const ex of [-1, 1]) {
-        const iw = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.8, 2.05, 12), TANK_MATS.wheel);
-        iw.rotation.x = Math.PI / 2;
-        iw.position.set(ex * 6.35, 1.15, zc);
-        g.add(iw);
+      // raised FRONT IDLER — faceted low-poly cylinder reads as a wheel
+      const idl = new THREE.Group();
+      idl.position.set(IDL9.x, IDL9.y, zc);
+      const iw = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.8, 2.05, 9), TANK_MATS.wheel);
+      iw.rotation.x = Math.PI / 2;
+      idl.add(iw);
+      g.add(idl);
+      gear9.idl[si] = idl;
+      // the LARGE REAR DRIVE SPROCKET (Tank order): a drum plus TWO
+      // toothed rings — one riding in each chain rail — visibly the
+      // wheel that drives the whole track
+      const spk = new THREE.Group();
+      spk.position.set(SPK9.x, SPK9.y, zc);
+      const drum = new THREE.Mesh(new THREE.CylinderGeometry(0.72, 0.72, 2.05, 9), TANK_MATS.wheel);
+      drum.rotation.x = Math.PI / 2;
+      spk.add(drum);
+      for (const rz of [-0.72, 0.72]) {
+        const ring = new THREE.Mesh(new THREE.CylinderGeometry(1.16, 1.16, 0.26, 9), TANK_MATS.hub);
+        ring.rotation.x = Math.PI / 2;
+        ring.position.z = rz;
+        spk.add(ring);
       }
-      // fender plate just above the top run
-      const fd = new THREE.Mesh(new THREE.BoxGeometry(15.8, 0.12, 2.1), TANK_MATS.fender);
-      fd.position.set(0, 2.0, zc);
-      g.add(fd);
-      // armored side skirt over the upper track run (wheels show below it)
-      const skirt = new THREE.Mesh(new THREE.BoxGeometry(11.6, 1.15, 0.26), TANK_MATS.skirt);
-      skirt.position.set(-0.7, 1.74, zc + side * 0.95);
-      g.add(skirt);
-      const nose = new THREE.Mesh(new THREE.BoxGeometry(2.4, 1.15, 0.26), TANK_MATS.skirt);
-      nose.rotation.y = -side * 0.5;
-      nose.position.set(5.6, 1.74, zc + side * 0.62);
-      g.add(nose);
+      g.add(spk);
+      gear9.sprk[si] = spk;
+      // fender plate above the (taller) top run — the skirt is GONE, the
+      // machinery is the armor now. The panels are LOCKED ONTO THE BODY
+      // (Tank order): they rock with the hull, never touched by the tracks
+      const fd = new THREE.Mesh(new THREE.BoxGeometry(17.2, 0.12, 2.1), TANK_MATS.fender);
+      fd.position.set(0, 2.9, zc);
+      hullG.add(fd);
     }
-    // hull spans between the tracks (overlapping them — no gap)
+    // the DOUBLE chain: one instanced link box per rail slot (2 rails x 2
+    // sides) + one instanced rubber pad bridging the rails every 2nd slot
+    const lnkIM9 = new THREE.InstancedMesh(new THREE.BoxGeometry(0.34, 0.11, 0.16), TANK_MATS.tread, nLnk9 * 4);
+    lnkIM9.frustumCulled = false;
+    g.add(lnkIM9);
+    const padIM9 = new THREE.InstancedMesh(new THREE.BoxGeometry(0.54, 0.22, 1.86), padMat9, nLnk9);   // fat pads, tight gaps (Tank order)
+    padIM9.frustumCulled = false;
+    g.add(padIM9);
+    gear9.linkIM = lnkIM9;
+    gear9.padIM = padIM9;
+    g.userData.gear9 = gear9;
+    // (hullG created above, before the running gear — fenders bolt to it)
+    // hull spans between the tracks (overlapping them — no gap). ALL hull
+    // pieces parent to hullG: the body that ROCKS ON THE SPRINGS.
     const hull = new THREE.Mesh(new THREE.BoxGeometry(L * 0.9, 1.35, W - 2.6), bodyMat);
     hull.position.set(-0.4, 2.2, 0);
-    g.add(hull);
+    hullG.add(hull);
     // sloped front glacis plate
     const glacis = new THREE.Mesh(new THREE.BoxGeometry(3.0, 1.3, W - 2.8), TANK_MATS.dark);
     glacis.rotation.z = -0.45;
     glacis.position.set(L * 0.42, 1.75, 0);
-    g.add(glacis);
+    hullG.add(glacis);
     // headlights on the glacis
     for (const side of [-1, 1]) {
       const hl = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.25, 0.5), TANK_MATS.lamp);
       hl.position.set(6.15, 2.25, side * 1.6);
-      g.add(hl);
+      hullG.add(hl);
     }
     // rear deck, exhausts, tail lights
     const rear = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.8, W - 3.2), TANK_MATS.dark);
     rear.position.set(-L * 0.42, 1.9, 0);
-    g.add(rear);
+    hullG.add(rear);
     for (const side of [-1, 1]) {
       const ex = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.55, 0.8), TANK_MATS.hatch);
       ex.position.set(-L * 0.44, 2.45, side * (W / 2 - 2.2));
-      g.add(ex);
+      hullG.add(ex);
       const tl = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.26, 0.5), TANK_MATS.tail);
       tl.position.set(-L / 2 + 0.35, 2.2, side * 1.9);
-      g.add(tl);
+      hullG.add(tl);
     }
     // turret: low, wide, FACETED — slab body, angled cheek plates meeting in
     // a wedge at the front, full-width bustle with stowage rack, roof gear
@@ -8546,7 +8778,7 @@ function buildCarMesh(c) {
     sight.position.set(0.9, 1.27, -1.15);
     turret.add(sight);
     turret.position.set(-1.0, 2.9, 0);
-    g.add(turret);
+    hullG.add(turret);                       // the gun rocks WITH the hull
     g.userData.turret = turret;
     g.userData.bodyMat = bodyMat;
     return g;
@@ -9543,6 +9775,7 @@ function dropPanel(c, d) {
 // a repair pulls the panels straight again
 function undentCar(c) {
   if (!c.mesh) return;
+  c.crushF9 = 0; c.crushT9 = 0;                    // un-flattened on the jig
   if (c.kind === 'cop') {
     c.ramHp = 220; c.ramBend = 0; c.ramSide = 0;
     if (c.ramGone) { removeCarMesh(c); attachCarMesh(c); c.ramGone = false; }   // fresh bar bolted on
@@ -10601,6 +10834,9 @@ function carMaxHp(c) { return CAR_KINDS[c.kind].hp + 40 * (c.mods ? c.mods.arm :
 // full slip only on a solid cover. Deep powder adds its own drag.
 function weatherGrip(c) {
   if (c && c.gDeck != null) return 1;            // garage decks stay dry
+  // THE PADS ARE THE TRACTION (Tank order): rubber pads under track
+  // pressure bite through rain and snow that strands everyone else
+  if (c && c.kind === 'tank') return clamp(1 - WEATHER.wet * 0.05 - WEATHER.snow * 0.12 - WEATHER.deep * 0.06, 0.72, 1);
   return clamp(1 - WEATHER.wet * 0.22 - WEATHER.snow * 0.5 - WEATHER.deep * 0.18, 0.3, 1);
 }
 function tireGrip(c, dt, gripScale) {
@@ -10620,6 +10856,27 @@ function moveCar(c, dt) {
     c.drowned = true;                                // flooded: the engine locks up for good
     sfx('crash', c.x, c.y, 40);
     if (c === player.car) msg('Engine flooded. She is DONE.', 7);
+  }
+  // CURB EDGES (Tank order): the road/sidewalk lip is REAL to tires —
+  // crossing it pops the body up, scrubs a little pace, and kicks the
+  // tank's suspension springs. Grass and lots have no lip.
+  if (c.kind !== 'boat' && c.kind !== 'helo') {
+    const tb9 = tileAt(Math.floor(c.x / TILE), Math.floor(c.y / TILE));
+    const cls9 = tb9 === T_SIDE ? 1 : tb9 === T_ROAD ? 0 : -1;
+    if (cls9 >= 0 && c._curbC9 >= 0 && cls9 !== c._curbC9 && Math.abs(c.speed) > 15) {
+      c.curbT9 = 0.22;
+      c.speed *= 0.965;
+      if (c.kind === 'tank') { c.shockT = 0; c.shockRev = c.speed < 0; c.shockAmp = 0.1; c.rcPV = (c.rcPV || 0) + (cls9 ? 0.5 : -0.35); }
+      if (c === player.car) rumble(0.25, 0.35, 120);
+    }
+    if (cls9 >= 0) c._curbC9 = cls9;
+    if (c.curbT9 > 0) {
+      c.curbT9 -= dt;
+      if (!c.climbT9) {
+        c.curbY9 = Math.sin(Math.PI * Math.max(0, c.curbT9) / 0.22) * (c.kind === 'tank' ? 0.1 : 0.17);
+        if (c.curbT9 <= 0) c.curbY9 = 0;
+      }
+    }
   }
   if (carHitsSolid(c)) unstickCar(c);
   const rx = -Math.sin(c.angle), ry = Math.cos(c.angle);   // car-right axis
@@ -10884,7 +11141,33 @@ function stepPlayerCar(c, dt) {
     }
   } else c.fuelMsgT = 0;
   const steer = (right ? 1 : 0) - (left ? 1 : 0) || clamp(padLX * 1.25, -1, 1);
-  const dA = steer * 2.6 * (hand ? 1.5 : 1) * (c.kind === 'tank' ? 0.55 : 1) * clamp(c.speed / 140, -1, 1) * dt;
+  let dA;
+  if (c.kind === 'tank') {
+    // TWIN-TRACK DIFFERENTIAL (Tank order): both tracks ride the throttle,
+    // steering BLEEDS the inside track and the outside pushes the hull
+    // into the turn — yaw IS the track difference over the base. No
+    // motion means no turn; reverse steers like reversed tracks. A
+    // BROKEN track gives no power: the live side alone drags the hull
+    // into a forced circle; two broken tracks are an armored statue.
+    const G9 = c.mesh && c.mesh.userData.gear9;
+    const bL9 = !!(G9 && G9.broken[0]), bR9 = !!(G9 && G9.broken[1]);
+    if (bL9 && bR9) {
+      c.speed *= Math.pow(0.02, dt);
+      dA = 0;
+    } else if (bL9 || bR9) {
+      const cap9 = kmax * 0.35;
+      if (c.speed > cap9) c.speed = Math.max(cap9, c.speed * Math.pow(0.5, dt));
+      if (c.speed < -cap9) c.speed = Math.min(-cap9, c.speed * Math.pow(0.5, dt));
+      dA = (bL9 ? -1 : 1) * c.speed * 0.011 * dt;          // slew around the dead side
+      dA += steer * c.speed * 0.0045 * dt;                 // fight the pull, never beat it
+    } else {
+      const bleed9 = 0.30 * Math.abs(steer);
+      dA = steer * (c.speed * bleed9 / (c.w * 0.9)) * dt;
+      if (steer && Math.abs(c.speed) > 1) c.speed *= Math.pow(0.82, Math.abs(steer) * dt);   // the bled track drags the pace
+    }
+  } else {
+    dA = steer * 2.6 * (hand ? 1.5 : 1) * clamp(c.speed / 140, -1, 1) * dt;
+  }
   if (dA) steerCar(c, dA);
   // a bent frame PULLS: crooked alignment drags the car toward the soft side
   const pull9 = c.frame ? (c.frame.fr - c.frame.fl) * 0.22 : 0;
@@ -11143,6 +11426,20 @@ function fireShell(c, ang, elev) {
   shells.push(s);
   addPart(s.x, s.y, 3.5, 0, 0, 0, 0.07, 0xffe9a0, 2.4, true);
   sfx('cannon', s.x, s.y);
+  if (c.kind === 'tank') {
+    // THE GUN ANSWERS THROUGH THE HULL (Tank order): recoil rocks the
+    // springs along the barrel line — pitch when firing over the bow,
+    // roll when the turret is traversed — a shock pulse ripples the
+    // road wheels from the muzzle end, and the tracks bite the ground
+    // the instant it fires: instant resistance plus a recoil shove.
+    const rel9 = ang - c.angle;
+    c.rcPV = (c.rcPV || 0) + Math.cos(rel9) * 3.4;   // it SHAKES (Tank order)
+    c.rcRV = (c.rcRV || 0) + Math.sin(rel9) * 2.6;
+    c.shockT = 0;
+    c.shockRev = Math.cos(rel9) < 0;
+    c.shockAmp = 0.4;
+    c.speed = c.speed * 0.55 - Math.cos(rel9) * 20;
+  }
 }
 function fireRocket(x, y, ang, vh, h0) {
   const s = { x: x + Math.cos(ang) * 20, y: y + Math.sin(ang) * 20, vx: Math.cos(ang) * 430, vy: Math.sin(ang) * 430, life: 1.4, src: null, pby: true, done: false, h: h0 != null ? h0 : 1.6 + gHeightAt(player), vh: vh || 0, mesh: grabMesh(shellMeshes) };
@@ -11186,7 +11483,10 @@ function updShells(dt) {
       s.done = true;
       if (s.mesh) { s.mesh.visible = false; s.mesh = null; }
       const by = s.pby || (s.src && s.src.driver === 'player') ? 'p' : null;
-      if (hitCar) carDamage(hitCar, 120, by);
+      if (hitCar) {
+        carDamage(hitCar, 120, by);
+        trackHit9(hitCar, s.x, s.y, 120);   // low side hits eat the track
+      }
       const tankShell = s.src && s.src.kind === 'tank';
       explodeAt(s.x, s.y, by, tankShell ? 52 : 44, tankShell ? 260 : 220);
     }
@@ -11355,7 +11655,11 @@ function canSwimTo(x, y) {
   // exactly like peds and cars do — tile check alone let the player ghost
   // through every circle-blocker prop after the swim rework. Upright lamp
   // posts stop feet the same way (broken ones are stepped past).
-  return !solidAtPx(x, y) && !lampBlockAt(x, y, player.x, player.y);
+  // ROOFTOPS ARE SURFACES (Tank order 2026-07-12): the feet carry their
+  // height into the solidity question — a reachable roof is a floor, and
+  // a lamp head is nothing to someone five storeys above it.
+  const feet9 = (player.roofH || 0) + (player.jumpH || 0) + (player.gh || 0) + gHeightAt(player);
+  return !solidAtPx(x, y, feet9) && (feet9 >= 4.5 || !lampBlockAt(x, y, player.x, player.y));
 }
 function updSwim(dt) {
   const fwd = cutscene ? 0 : (key('KeyW') || key('ArrowUp') ? 1 : 0) - (key('KeyS') || key('ArrowDown') ? 1 : 0);
@@ -12117,12 +12421,48 @@ function carCollisions() {
       if (!hit9) continue;
       const nx = hit9.dx / hit9.d, ny = hit9.dy / hit9.d;
       const push = hit9.ov / 2;
-      if (!solidAtPx(a.x - nx * push, a.y - ny * push)) { a.x -= nx * push; a.y -= ny * push; }
-      if (!solidAtPx(b.x + nx * push, b.y + ny * push)) { b.x += nx * push; b.y += ny * push; }
+      // a tank RIDES OVER its crush victim (Tank order): the separation
+      // shove would bulldoze the car ahead of the hull forever — while
+      // the weight is coming down, the two bodies are ALLOWED to overlap
+      const crushPair9 = (a.crushBy9 === b && a.crushT9) || (b.crushBy9 === a && b.crushT9);
+      if (!crushPair9) {
+        if (!solidAtPx(a.x - nx * push, a.y - ny * push)) { a.x -= nx * push; a.y -= ny * push; }
+        if (!solidAtPx(b.x + nx * push, b.y + ny * push)) { b.x += nx * push; b.y += ny * push; }
+      }
       const at = a.kind === 'tank', bt = b.kind === 'tank';
       if (at !== bt) {
         const tank = at ? a : b, vict = at ? b : a;
-        if (Math.abs(tank.speed) > 40) carDamage(vict, 400, tank.driver === 'player' ? 'p' : null);
+        // THE WEIGHT DOES THE KILLING (Tank order): no billiard-ball
+        // detonation on touch. The pads grab at the raised end wheel's
+        // near-vertical face, the nose climbs over the center-wheel
+        // fulcrum, and the hull's weight crushes the car DOWN until it
+        // explodes UNDERNEATH — the frame stays behind.
+        if (vict.kind !== 'helo' && vict.kind !== 'boat' && vict.kind !== 'tank'
+          && !vict.crushT9 && Math.abs(tank.speed) > 24) {
+          const ct9 = Math.cos(tank.angle), st9 = Math.sin(tank.angle);
+          const lx9 = (vict.x - tank.x) * ct9 + (vict.y - tank.y) * st9;
+          // the climbing face must LEAD: contact ahead when rolling
+          // forward, behind in reverse — a side scrape stays a scrape
+          if (lx9 * Math.sign(tank.speed) > tank.len * 0.18) {
+            vict.crushT9 = 0.001;
+            vict.crushBy9 = tank;
+            tank.climbT9 = 0.001;
+            tank.rcPV = (tank.rcPV || 0) + 1.4;            // the nose rears up
+            tank.shockT = 0; tank.shockRev = tank.speed < 0; tank.shockAmp = 0.16;
+            sfx('crash', vict.x, vict.y, 26);
+            if (vict.driver === 'ai' || vict.driver === 'cop') {
+              // whoever's inside scrambles out ahead of the treads
+              const esc9 = mkPed(vict.x + Math.cos(vict.angle + Math.PI / 2) * 22,
+                vict.y + Math.sin(vict.angle + Math.PI / 2) * 22,
+                vict.driver === 'cop' ? { cop: true, hp: 50, spd: 78, shirt: 0x20306a } : {});
+              esc9.state = 'flee'; esc9.fleeT = 6; esc9.angle = rndf(0, TAU);
+              attachPedMesh(esc9);
+              if (vict.driver === 'cop') esc9.mesh.userData.gun.visible = true;
+              peds.push(esc9);
+              vict.driver = null;
+            }
+          }
+        }
       }
       // impact carries MASS and closing speed along the contact normal:
       // the heavy party delivers, the light party receives (Tank order)
@@ -12165,8 +12505,12 @@ function carCollisions() {
         sparks((a.x + b.x) / 2, (a.y + b.y) / 2);
         if (by && (a.kind === 'cop' || b.kind === 'cop')) addHeat(0.3);
       }
-      a.speed *= 0.55; b.speed *= 0.55;
-      a.latV *= 0.55; b.latV *= 0.55;
+      // a crush pair stays OVERLAPPED by design — the mutual impact scrub
+      // would strangle the tank to a standstill on top of its victim
+      if (!crushPair9) {
+        a.speed *= 0.55; b.speed *= 0.55;
+        a.latV *= 0.55; b.latV *= 0.55;
+      }
     }
   }
 }
@@ -12920,7 +13264,7 @@ function computeAim() {
     const tx = aimTarget.x * RS, tz = aimTarget.y * RS;
     aimRing.position.x += (tx - aimRing.position.x) * 0.45;
     aimRing.position.z += (tz - aimRing.position.z) * 0.45;
-    aimRing.position.y = 0.08 + (player.gh || 0) * 0.15;
+    aimRing.position.y = 0.08 + (player.gh || 0) * 0.15 + (player.roofH || 0);
   } else aimRing.visible = false;
 }
 // gunfire near a cop, or inside any officer's sight line, is a crime
@@ -12996,10 +13340,11 @@ function updTrafficLaw(pc, dt) {
 //   3) bullet leaves the barrel aimed AT M (same M)            → impact ON M
 let lastPivotY = 3.2;
 function aimPivotY() {
-  // eye / barrel height (same base the camera pivot uses)
+  // eye / barrel height (same base the camera pivot uses) — rooftop and
+  // fall height ride along so the aim triangle never leaves the eyes
   return (player.car ? 4 : swim ? 0.9 : 3.2)
     + gHeightAt(player.car || player)
-    + (player.car ? 0 : (player.gh || 0))
+    + (player.car ? 0 : (player.gh || 0) + (player.roofH || 0) + Math.max(0, (player.jumpH || 0) - 1.3))
     + (player.car && player.car.alt ? player.car.alt : 0);
 }
 function crosshairPoint() {
@@ -14481,7 +14826,7 @@ function nearestAction() {
   }
   for (const c of cars) {
     if (c.dead) continue;
-    if (Math.abs(gHeightAt(c) - gHeightAt(player)) > 2.6) continue;   // different garage deck
+    if (Math.abs(gHeightAt(c) - (gHeightAt(player) + (player.roofH || 0))) > 2.6) continue;   // different garage deck / a roof above the street
     const d = carBodyDist(c, player.x, player.y);
     if (d < 14) acts.push({ d, go: () => enterCar(c) });
   }
@@ -14887,6 +15232,7 @@ function update(dt) {
   tankGraceT -= dt;
   chopperCdT -= dt;
   gunshipCdT -= dt;
+  updCrush9(dt);                             // the tank's weight settles its debts
   if (topSay) { topSay.t -= dt; if (topSay.t <= 0) topSay = null; }
   if (player.jumpH) {
     player.jumpH += player.jumpV * dt;
@@ -14894,10 +15240,13 @@ function update(dt) {
     if (player.jumpH <= 0) { player.jumpH = 0; player.jumpV = 0; }
   }
 
-  // stepping into water starts a swim; touching a walkable tile ends it
+  // stepping into water starts a swim; touching a walkable tile ends it —
+  // but only for feet AT water level: a body sailing off a rooftop above
+  // the water is FALLING, not swimming, until gravity says otherwise
   if (!player.car && !player.rag && !player.dead) {
     const wet = tileAt(Math.floor(player.x / TILE), Math.floor(player.y / TILE)) === T_WATER;
-    if (wet && !swim) enterSwim();
+    const aloft9 = (player.roofH || 0) > 0.5 || (player.jumpH || 0) > 0.6;
+    if (wet && !swim && !aloft9) enterSwim();
     else if (!wet && swim) exitSwim();
   }
 
@@ -14991,6 +15340,20 @@ function update(dt) {
       if (canSwimTo(player.x, player.y + player.wvy * dt)) player.y += player.wvy * dt;
     }
     updGarDeck(player);
+    // ROOFTOP SUPPORT (Tank order 2026-07-12: every roof is a surface).
+    // Each frame the tile under the feet either carries them (roof-to-roof
+    // run), plants them a reachable step up, or hands their height to the
+    // jump integrator — gravity owns everything past the parapet.
+    if (!garAt(player.x, player.y)) {
+      const rI9 = idx(Math.floor(player.x / TILE), Math.floor(player.y / TILE));
+      const rSup9 = solid[rI9] === 1 ? heightMap[rI9] : 0;
+      const rOld9 = player.roofH || 0;
+      if (rSup9 !== rOld9) {
+        player.jumpH = (player.jumpH || 0) + rOld9 - rSup9;   // feet keep their WORLD height
+        player.roofH = rSup9;
+        if (player.jumpH <= 0) { player.jumpH = 0; player.jumpV = 0; }   // stepped UP: plant
+      }
+    }
     if (player.aimHold > 0 && !cutscene) {
       // face the crosshair — eased so 180° snaps don't feel robotic
       player.angle += angDiff(player.angle, mouseYaw) * Math.min(1, dt * 14);
@@ -15502,7 +15865,13 @@ function update(dt) {
   }
   for (let i = cars.length - 1; i >= 0; i--) {
     const c = cars[i];
-    if (c.dead) { if (c !== player.car) { removeCarMesh(c); cars.splice(i, 1); } continue; }
+    if (c.dead) {
+      // a CRUSHED frame lingers where it died (Tank order) — flattened
+      // under the treads, it stays until its clock runs out
+      if ((c.wreckT9 || 0) > 0) { c.wreckT9 -= dt; continue; }
+      if (c !== player.car) { removeCarMesh(c); cars.splice(i, 1); }
+      continue;
+    }
     // the 2-minute rule: abandoned iron gets towed, keep-flag or not (even
     // the tank). Mission property and the hideout garage pad are exempt.
     if (c !== player.car && c.driver === null) {
@@ -15546,6 +15915,172 @@ function update(dt) {
 let camYaw = 0;
 const camPos = new THREE.Vector3(playerStart.x * RS, 10, playerStart.y * RS + 20);
 const camLook = new THREE.Vector3(playerStart.x * RS, 3, playerStart.y * RS);
+// ========== TANK RUNNING GEAR — per-frame life (Tank order) ==========
+// Twin-track speeds come from the hull's ACTUAL motion (yaw rate splits
+// the speed across the track base), the double chains flow at their own
+// side's pace, the rear sprockets spin the chain they drive, the recoil
+// springs rock the hull, and a cannon shock pulse ripples wheel by wheel
+// down the road-wheel line. A broken side is dead: no flow, no spin, a
+// thrown-chain gap at the sprocket.
+const _gm9 = new THREE.Matrix4();
+const _gs9 = { x: 0, y: 0, tx: 1, ty: 0 };
+function gearSample9(G9, s9, out9) {
+  const P9 = G9.pth, C9 = G9.cum, n9 = P9.length;
+  let lo9 = 0, hi9 = n9;
+  while (lo9 + 1 < hi9) { const m9 = (lo9 + hi9) >> 1; if (C9[m9] <= s9) lo9 = m9; else hi9 = m9; }
+  const a9 = P9[lo9], b9 = P9[(lo9 + 1) % n9];
+  const seg9 = C9[lo9 + 1] - C9[lo9] || 1;
+  const f9 = (s9 - C9[lo9]) / seg9;
+  out9.x = a9[0] + (b9[0] - a9[0]) * f9;
+  out9.y = a9[1] + (b9[1] - a9[1]) * f9;
+  out9.tx = (b9[0] - a9[0]) / seg9;
+  out9.ty = (b9[1] - a9[1]) / seg9;
+}
+function updTankGear9(c, dt, t9) {
+  const G9 = c.mesh && c.mesh.userData.gear9;
+  if (!G9) return;
+  // yaw rate from the frame-to-frame heading, works for player AND army AI
+  const dA9 = c._gpa9 === undefined ? 0 : angDiff(c._gpa9, c.angle);
+  c._gpa9 = c.angle;
+  const om9 = dt > 0 ? dA9 / dt : 0;
+  const base9 = c.w * 0.42;
+  let moving9 = !G9.seeded;
+  const hullR9 = c.mesh.userData.hullG;
+  if (!G9._ld9) G9._ld9 = [9, 9, 9, 9];
+  for (let si9 = 0; si9 < 2; si9++) {
+    const s9 = si9 === 0 ? -1 : 1;                 // [0]=LEFT(-z) [1]=RIGHT(+z)
+    // THE BODY CARRIES THE END WHEELS (Tank order): the rock displaces
+    // the hull-mounted idler and sprocket (one frame of spring lag is
+    // invisible), and this side's chain RE-FORMS around wherever its
+    // wheels are right now — nose rock lifts the front wheel and the
+    // track rises with it
+    const zcD9 = G9.zc[si9];
+    const dI9 = clamp(hullR9.rotation.z * G9.idlX - hullR9.rotation.x * zcD9, -0.5, 1.4);
+    const dS9 = clamp(hullR9.rotation.z * G9.spkX - hullR9.rotation.x * zcD9, -0.5, 1.4);
+    G9.idl[si9].position.y = 1.15 + dI9;
+    G9.sprk[si9].position.y = 1.35 + dS9;
+    if (Math.abs(dI9 - G9._ld9[si9 * 2]) > 0.008 || Math.abs(dS9 - G9._ld9[si9 * 2 + 1]) > 0.008) {
+      G9._ld9[si9 * 2] = dI9;
+      G9._ld9[si9 * 2 + 1] = dS9;
+      G9.dyn[si9] = G9.mkPath(dI9, dS9);
+      moving9 = true;
+    }
+    const v9 = G9.broken[si9] ? 0 : c.speed - s9 * om9 * base9;
+    G9.vSide[si9] = v9;
+    if (Math.abs(v9) > 0.4) moving9 = true;
+    const pr9 = G9.dyn[si9].perim;
+    G9.off[si9] = ((G9.off[si9] + v9 * RS * dt) % pr9 + pr9) % pr9;
+    G9.spin[si9] -= v9 * RS * dt;                  // ground run flows rearward
+    G9.sprk[si9].rotation.z = G9.spin[si9] / G9.sprkR;
+    G9.idl[si9].rotation.z = G9.spin[si9] / G9.idlR;
+  }
+  if (moving9) {
+    G9.seeded = true;
+    let li9 = 0, pi9 = 0;
+    for (let si9 = 0; si9 < 2; si9++) {
+      const zc9 = G9.zc[si9];
+      const D9 = G9.dyn[si9];
+      const pit9 = D9.perim / G9.n;
+      for (let k9 = 0; k9 < G9.n; k9++) {
+        const at9 = (k9 * pit9 + G9.off[si9]) % D9.perim;
+        gearSample9(D9, at9, _gs9);
+        const th9 = Math.atan2(_gs9.ty, _gs9.tx);
+        const gap9 = G9.broken[si9] && k9 < 7;     // the thrown chain
+        for (const rz9 of [-0.72, 0.72]) {         // DOUBLE chain: two rails
+          if (gap9) _gm9.makeScale(0, 0, 0); else _gm9.makeRotationZ(th9);
+          _gm9.setPosition(_gs9.x, _gs9.y, zc9 + rz9);
+          G9.linkIM.setMatrixAt(li9++, _gm9);
+        }
+        if (k9 % 2 === 0) {                        // rubber pads bridge the rails
+          if (gap9) _gm9.makeScale(0, 0, 0); else _gm9.makeRotationZ(th9);
+          _gm9.setPosition(_gs9.x - _gs9.ty * 0.16, _gs9.y + _gs9.tx * 0.16, zc9);
+          G9.padIM.setMatrixAt(pi9++, _gm9);
+        }
+      }
+    }
+    G9.linkIM.instanceMatrix.needsUpdate = true;
+    G9.padIM.instanceMatrix.needsUpdate = true;
+  }
+  // recoil springs: the hull rocks HARD on the suspension (Tank order:
+  // firing shakes the tank A LOT), rings a few swings, then settles
+  c.rcP = (c.rcP || 0) + (c.rcPV || 0) * dt;
+  c.rcPV = ((c.rcPV || 0) - (c.rcP || 0) * 46 * dt) * Math.pow(0.2, dt);
+  c.rcR = (c.rcR || 0) + (c.rcRV || 0) * dt;
+  c.rcRV = ((c.rcRV || 0) - (c.rcR || 0) * 46 * dt) * Math.pow(0.2, dt);
+  const hull9 = c.mesh.userData.hullG;
+  hull9.rotation.z = clamp(c.rcP, -0.13, 0.13);
+  hull9.rotation.x = clamp(c.rcR, -0.1, 0.1);
+  hull9.position.y = -Math.min(0.45, Math.abs(c.rcP) * 1.6 + Math.abs(c.rcR) * 1.2);
+  // the shock pulse: fires at the muzzle end of the wheel line and runs
+  // to the other, each road wheel bumping in turn
+  if (c.shockT !== undefined && c.shockT >= 0) {
+    c.shockT += dt;
+    if (c.shockT > 0.9) c.shockT = -1;
+  }
+  // MOUNTING AN OBSTACLE (Tank order): the pads grab at the climbing
+  // face and the whole BASE tilts about the center-wheel fulcrum — the
+  // front idler rises with the nose, the rear sprocket dips, everything
+  // stays locked to the frame (the end wheels only TURN). Over the top,
+  // the nose drops and the springs take the landing.
+  if (c.climbT9) {
+    c.climbT9 += dt;
+    const tc9 = Math.min(c.climbT9 / 1.1, 1);
+    c.curbY9 = Math.sin(Math.PI * tc9) * 0.85;
+    c.climbPitch9 = Math.sin(Math.PI * Math.min(tc9 * 1.35, 1)) * 0.14;
+    if (!c._climbTip9 && tc9 > 0.5) { c._climbTip9 = true; c.rcPV = (c.rcPV || 0) - 1.5; }   // over the top: the nose drops
+    if (tc9 >= 1) { c.climbT9 = 0; c._climbTip9 = false; c.curbY9 = 0; c.climbPitch9 = 0; }
+  }
+  // NATURAL ATTITUDE (Tank order): each track rides ITS OWN elevation
+  // and each END rides its own — the hull height is the average, the
+  // LEAN falls out of the side difference over the track base, and the
+  // PITCH falls out of the end difference (rear rises -> nose tilts
+  // down). Nothing scripted, nothing forced.
+  if (!c.trkH9) c.trkH9 = [0, 0];
+  if (!c.endH9) c.endH9 = [0, 0];
+  c._rideY9 = (c._rideY9 || 0) + ((c.trkH9[0] + c.trkH9[1]) / 2 - (c._rideY9 || 0)) * Math.min(1, dt * 8);
+  const rollT9 = -Math.atan((c.trkH9[1] - c.trkH9[0]) / 5.6);
+  c.climbRoll9 = (c.climbRoll9 || 0) + (rollT9 - (c.climbRoll9 || 0)) * Math.min(1, dt * 7);
+  const pitT9 = Math.atan((c.endH9[1] - c.endH9[0]) / 5.5);
+  c._pitchN9 = (c._pitchN9 || 0) + (pitT9 - (c._pitchN9 || 0)) * Math.min(1, dt * 7);
+  c.trkH9[0] = Math.max(0, c.trkH9[0] - dt * 3);
+  c.trkH9[1] = Math.max(0, c.trkH9[1] - dt * 3);
+  c.endH9[0] = Math.max(0, c.endH9[0] - dt * 3);
+  c.endH9[1] = Math.max(0, c.endH9[1] - dt * 3);
+  if (c._rideY9 > 0.02) c.curbY9 = Math.max(c.curbY9 || 0, c._rideY9);
+  const pat9 = Math.min(1, Math.abs(c.speed) / 110);
+  for (let si9 = 0; si9 < 2; si9++)
+    for (let w9 = 0; w9 < 7; w9++) {
+      let y9 = 0.66;
+      if (c.shockT >= 0) {
+        const ord9 = c.shockRev ? w9 : 6 - w9;
+        const tp9 = c.shockT - ord9 * 0.045;
+        if (tp9 > 0) y9 += Math.sin(Math.min(tp9 * 18, Math.PI)) * Math.exp(-tp9 * 5.5) * (c.shockAmp || 0.3);
+      }
+      if (pat9 > 0.02) y9 += Math.sin(t9 * 15 + w9 * 1.7 + si9 * 2.4) * 0.028 * pat9;
+      G9.arms[si9][w9].position.y = y9;
+    }
+}
+function trackHit9(c, hx, hy, dmg) {
+  // TRACK HP (Tank order): a hit landing on either track strip eats that
+  // side's chain — strong (three direct shells), but once broken the
+  // side gives NO power. The cannon never cares.
+  const G9 = c.kind === 'tank' && c.mesh && c.mesh.userData.gear9;
+  if (!G9) return;
+  const dx9 = hx - c.x, dy9 = hy - c.y;
+  const lz9 = -dx9 * Math.sin(c.angle) + dy9 * Math.cos(c.angle);   // + = right
+  if (Math.abs(lz9) < c.w * 0.22) return;            // center-hull hit spares the tracks
+  const si9 = lz9 < 0 ? 0 : 1;
+  if (G9.broken[si9]) return;
+  G9.hp[si9] -= dmg;
+  if (G9.hp[si9] <= 0) {
+    G9.hp[si9] = 0;
+    G9.broken[si9] = true;
+    G9.seeded = false;                               // rebuild with the thrown-chain gap
+    sfx('crash', c.x, c.y, 30);
+    sparks(hx, hy);
+    if (c === player.car) msg((si9 === 0 ? 'LEFT' : 'RIGHT') + ' TRACK DESTROYED — that side is dead weight. The gun still answers.', 8);
+  }
+}
 function syncScene(dt, t) {
   updWindWorld(dt, t);                     // trees, grass, cloth, all on the one wind
   updWeather(dt);                          // snow, rain, lightning — the sky's turn
@@ -15561,10 +16096,20 @@ function syncScene(dt, t) {
   // cars
   for (const c of cars) {
     if (!c.mesh) continue;
-    c.mesh.visible = !c.dead;
+    // a crushed frame LINGERS (Tank order): flattened under the weight,
+    // it stays where it died until it disappears (the update sweep owns
+    // the clock; here we only keep it painted)
+    c.mesh.visible = !c.dead || (c.wreckT9 || 0) > 0;
     if (c.dead) continue;
-    c.mesh.position.set(c.x * RS, gHeightAt(c) + (c.empl || 0) - (c.sink || 0), c.y * RS);
+    c.mesh.position.set(c.x * RS, gHeightAt(c) + (c.empl || 0) - (c.sink || 0) + (c.curbY9 || 0), c.y * RS);
+    c.mesh.scale.y = 1 - (c.crushF9 || 0) * 0.55;   // the weight above flattens it
     c.mesh.rotation.y = -c.angle;
+    if (c.kind === 'tank') {
+      // the whole BASE tilts: scripted climb pitch + NATURAL pitch from
+      // end elevations (rear rises -> nose down) + natural side lean
+      c.mesh.rotation.z = (c.climbPitch9 || 0) + (c._pitchN9 || 0);
+      c.mesh.rotation.x = c.climbRoll9 || 0;
+    }
     if (c.kind === 'boat') {
       // buoyancy: the waterline sits at the field height under the hull, and
       // the hull hangs a real DRAFT below it (partially submerged)
@@ -15617,6 +16162,7 @@ function syncScene(dt, t) {
       for (const wr of c.mesh.userData.wheelRolls) wr.rotation.z = -c.wheelRoll;
     }
     if (c.mesh.userData.turret) c.mesh.userData.turret.rotation.y = -(c.turret - c.angle);
+    if (c.kind === 'tank') updTankGear9(c, dt, t);   // chains, springs, shock
     if (c.mesh.userData.hmvTurret) {
       c.mesh.userData.hmvTurret.rotation.y = -((c.turret === undefined ? c.angle : c.turret) - c.angle);
       c.mesh.userData.hmvGun.rotation.z = c.tpitch || 0;
@@ -15712,7 +16258,7 @@ function syncScene(dt, t) {
       if (gh > (player.gh || 0)) player.gh = gh;
       else player.gh = (player.gh || 0) + (gh - (player.gh || 0)) * Math.min(1, dt * 12);
       // a shouldered rifle drops the hips (bent knees) and hunches forward
-      player.mesh.position.set(player.x * RS, bob * 0.12 + (player.jumpH || 0) + player.gh + gHeightAt(player) - (rifleStance ? 0.16 : 0), player.y * RS);
+      player.mesh.position.set(player.x * RS, bob * 0.12 + (player.jumpH || 0) + player.gh + gHeightAt(player) + (player.roofH || 0) - (rifleStance ? 0.16 : 0), player.y * RS);
       // face + lean into the run; a shouldered rifle pitches the upper body
       // FORWARD (Tank order) — NEGATIVE z is head-forward (see swim above)
       const lean = (player.mesh.userData.lean || 0) + (rifleStance ? -0.14 : 0);
@@ -15908,22 +16454,27 @@ function syncScene(dt, t) {
   const dirX = Math.cos(camYaw) * cvp, dirY = -svp, dirZ = Math.sin(camYaw) * cvp;
   const fx = f.x * RS, fz = f.y * RS;
   const gH = gHeightAt(player.car || player) + (player.car && player.car.alt ? player.car.alt : 0)
-    + (player.car || swim ? 0 : (player.gh || 0));           // doorstep / stoop height
+    // doorstep / stoop / ROOF height — the lens rides big drops with the
+    // body (the max() keeps the little street hop from bobbing the camera)
+    + (player.car || swim ? 0 : (player.gh || 0) + (player.roofH || 0) + Math.max(0, (player.jumpH || 0) - 1.3));
   const pivotY = (player.car ? 4 : swim ? 0.9 : 3.2) + gH;   // the lens rides the waterline with a swimmer — and garage decks
   lastPivotY = pivotY;                                        // the aim triangle starts here (the character's eyes)
-  // camera collision: pull in so we never sit inside a building
-  let tMax = 1;
-  const hDist = cd * cvp;
-  for (let i = 1; i <= 8; i++) {
-    const tt = i / 8;
-    if (solidCamAt(f.x - Math.cos(camYaw) * (hDist / RS) * tt, f.y - Math.sin(camYaw) * (hDist / RS) * tt)) { tMax = (i - 1) / 8; break; }
-  }
-  let cdEff = cd * Math.max(0.2, tMax);
   // THE TRIANGLE: the camera perches ABOVE the eye line and looks AT the aim
   // mark, so the screen-center reticle sits ON the weapon's impact point and
   // the sight line passes clean over the character (or the bird), never
   // through them. Weapons still fire from the eyes to the same mark.
   const camRise = player.car ? (player.car.kind === 'helo' ? 4.5 : 3) : swim ? 1.6 : 2.4;
+  // camera collision: pull in so we never sit inside a building — tested
+  // at the LENS height, so a camera above the roofline orbits freely on
+  // a rooftop instead of slamming into the parapet under it
+  let tMax = 1;
+  const hDist = cd * cvp;
+  for (let i = 1; i <= 8; i++) {
+    const tt = i / 8;
+    if (solidCamAt(f.x - Math.cos(camYaw) * (hDist / RS) * tt, f.y - Math.sin(camYaw) * (hDist / RS) * tt,
+      pivotY + camRise - dirY * cd * tt)) { tMax = (i - 1) / 8; break; }
+  }
+  let cdEff = cd * Math.max(0.2, tMax);
   const perchY = pivotY + camRise;
   // floor the camera by DOLLYING IN along the ray, never by lifting it off
   if (perchY - dirY * cdEff < 0.5 + gH && dirY > 0.01) cdEff = Math.max(1.2, (perchY - (0.5 + gH)) / dirY);
@@ -17840,8 +18391,12 @@ if (location.hash === '#trafficlaw') {
   ck('shotNearbySpooksDrivers', (pc9.panicT || 0) > 0);
   ck('copsKeepTheirCool', !pcop9.panicT);
   pc9.panicT = 0; pc9.pullover = true;
+  // mesh-true hits raycast the REAL mesh — sync it and bake matrixWorld
+  // first (renderless-receipt law: matrices only move during a render)
+  syncScene(1 / 60);
+  pc9.mesh.updateMatrixWorld(true);
   spawnBullet(pc9.x - 20, pc9.y, 900, 0, 0.5, 10, 8, 'p', 2, 0);
-  for (let i9 = 0; i9 < 15; i9++) update(1 / 60);
+  for (let i9 = 0; i9 < 15; i9++) { update(1 / 60); syncScene(1 / 60); pc9.mesh.updateMatrixWorld(true); }
   ck('directHitDriverBolts', (pc9.panicT || 0) > 0 && pc9.pullover === false);
   // REAL crews: officers drive cruisers, soldiers drive military iron
   ck('cruisersCrewedByPolice', pcop9.mesh.userData.figDress === 'cop');
@@ -18006,6 +18561,12 @@ if (location.hash === '#ghostseat') {
   ck('ghostShows', ghostSeat.visible === true);
   ck('standInBanned', pcar.mesh.userData.driverFig.visible === false);
   ck('walkMeshHidden', player.mesh.visible === false);
+  // the FULL frame path (Tank's curb-statue bug): frame() runs adsCamera
+  // AFTER syncScene — with a hand off the aim it must never re-show the
+  // walking body while the ghost sits in a car
+  rdown = false;
+  adsCamera(1 / 60);
+  ck('aimPathLeavesBodyHidden', player.mesh.visible === false);
   const fig9 = pcar.mesh.userData.driverFig.position;
   const cs9 = Math.cos(pcar.angle), sn9 = Math.sin(pcar.angle);
   const ex9 = pcar.x * RS + cs9 * fig9.x - sn9 * fig9.z;
@@ -18994,6 +19555,9 @@ if (location.hash === '#ads') {
     ckA('acogIsFixedGlass', ADS.mag === magM9 && player.weapon === 'm4');
     rdown = false;
     for (let i9 = 0; i9 < 150; i9++) adsCamera(1 / 60);
+    // frame() order: syncScene OWNS visibility (adsCamera only ever hides
+    // — the curb-statue fix); one sync = the next real frame's restore
+    syncScene(1 / 60);
     ckA('releaseHandsTheEyeBack', ADS.on === false && Math.abs(camera.fov - 62) < 1 && player.mesh.visible === true);
     player.weapon = 'barrett'; rdown = true; adsCamera(0.016);
     drawHUD(gtime);
@@ -19072,6 +19636,21 @@ if (location.hash === '#ads') {
     ckA('warheadLaunchesAndReloads', loaded19 && loaded29 && rpgVM9.userData.warhead.visible === true);
     rdown = false; adsCamera(0.016);
     ckA('launcherLowersOffSights', rpgVM9.visible === false);
+    // the rpgfit dial: one console number slides the tube, every sight
+    // blade re-cancels back onto the aim line — proven by MATH, not eye
+    runConsole('rpgfit -0.06');
+    const sB9 = rpgVM9.userData.sights9;
+    const wxB9 = (m9) => rpgVM9.position.x + m9.position.x;
+    ckA('fitDialMovesTheTube', rpgVM9.position.x === -0.06);
+    ckA('sightsStayOnTheAimLine', Math.abs(wxB9(sB9[0])) < 1e-9 && Math.abs(wxB9(sB9[3])) < 1e-9);
+    ckA('rearNotchStaysSymmetric',
+      Math.abs(wxB9(sB9[1]) + 0.045) < 1e-9 && Math.abs(wxB9(sB9[2]) - 0.045) < 1e-9);
+    const preCheat9 = cheated;
+    runConsole('rpgfit 0');
+    // THE RULE: gun axis = sight line = screen center — x is exactly 0,
+    // the front post exactly on it, the notch exactly symmetric around it
+    ckA('gunSitsUnderTheSights', rpgVM9.position.x === 0 && sB9[0].position.x === 0
+      && sB9[1].position.x === -0.045 && sB9[2].position.x === 0.045 && cheated === preCheat9);
     pressed.add('KeyE');
     update(1 / 60);
     player.car = null; ec9.dead = true;
@@ -20314,6 +20893,220 @@ if (location.hash === '#jump') {
   }
   console.log('JMPDBG airborne=' + airborne + ' apex=' + maxH.toFixed(2) + ' ok=' + (maxH > 0.9) + ' meshRose=' + (maxMeshY > 0.8) + ' landed=' + (player.jumpH === 0));
 }
+if (location.hash === '#vert') {
+  // VERTICAL LAYER receipt (Tank order 2026-07-12: every rooftop is a
+  // surface): walls stay walls to street feet, roofs carry roof feet,
+  // parapets hand the height to gravity, gravity lands the drop, water
+  // waits for the feet to actually arrive, furniture blocks its storey.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let vFails = 0;
+    const RV = [], ckV = (n9, v9) => { RV.push(n9 + '=' + v9); if (!v9) vFails++; };
+    // a tall building with a same-height neighbor tile, clear of furniture
+    let bIx = -1, bIy = -1, bH = 0;
+    for (let iy9 = 2; iy9 < GRID_H - 2 && !bH; iy9++) for (let ix9 = 2; ix9 < GRID_W - 2; ix9++) {
+      const h9 = solid[idx(ix9, iy9)] === 1 ? heightMap[idx(ix9, iy9)] : 0;
+      if (h9 >= 10 && solid[idx(ix9 + 1, iy9)] === 1 && heightMap[idx(ix9 + 1, iy9)] === h9
+        && !solidAtPx((ix9 + 0.5) * TILE, (iy9 + 0.5) * TILE, h9) && !solidAtPx((ix9 + 1.5) * TILE, (iy9 + 0.5) * TILE, h9)) {
+        bIx = ix9; bIy = iy9; bH = h9; break;
+      }
+    }
+    ckV('roofQueryable', bH >= 10);
+    const bx9 = (bIx + 0.5) * TILE, by9 = (bIy + 0.5) * TILE;
+    player.x = bx9 - TILE * 2.5; player.y = by9;
+    player.roofH = 0; player.jumpH = 0; player.jumpV = 0; player.gh = 0;
+    ckV('wallStopsStreetFeet', !canSwimTo(bx9, by9));
+    player.x = bx9; player.roofH = bH;
+    ckV('roofCarriesRoofFeet', canSwimTo(bx9, by9) && canSwimTo(bx9 + TILE, by9));
+    syncScene(1 / 60);
+    ckV('meshRidesTheRoof', player.mesh.position.y > bH - 0.5);
+    ckV('eyesRideTheRoof', aimPivotY() > bH + 2.5);
+    // off the parapet: support hands the height to the jump integrator...
+    player.x = bx9 - TILE * 2.5;
+    update(1 / 60);
+    ckV('parapetHandsToGravity', (player.roofH || 0) === 0 && player.jumpH > bH - 1.5);
+    // ...and gravity lands the drop on the street
+    let g9 = 0;
+    while (player.jumpH > 0 && g9++ < 900) update(1 / 60);
+    ckV('gravityLandsTheDrop', player.jumpH === 0 && g9 < 900);
+    // water waits for the feet: aloft over a canal = falling, not swimming
+    let wIx = -1, wIy = -1;
+    for (let iy9 = 2; iy9 < GRID_H - 2 && wIx < 0; iy9++) for (let ix9 = 2; ix9 < GRID_W - 2; ix9++)
+      if (tiles[idx(ix9, iy9)] === T_WATER) { wIx = ix9; wIy = iy9; break; }
+    player.x = (wIx + 0.5) * TILE; player.y = (wIy + 0.5) * TILE;
+    player.roofH = 0; player.jumpH = 3; player.jumpV = 0;
+    update(1 / 60);
+    const aloftDry9 = !swim;
+    player.jumpH = 0; player.jumpV = 0;
+    update(1 / 60);
+    ckV('waterWaitsForTheFeet', aloftDry9 && !!swim);
+    player.x = bx9 - TILE * 2.5; player.y = by9; exitSwim();
+    // storey filter: the ATM stops street feet, means nothing at roof height
+    ckV('streetPropsSkipRoofFeet', atmSpot && solidAtPx(atmSpot.x, atmSpot.y - 4) && !solidAtPx(atmSpot.x, atmSpot.y - 4, 12));
+    // roof furniture (hb-tagged) blocks its own roof, not the street query
+    const fb9 = blockers.find(b9 => b9.hb !== undefined);
+    ckV('furnitureBlocksItsRoof', !fb9 || (solidAtPx(fb9.x, fb9.y, fb9.hb) && heightMap[idx(Math.floor(fb9.x / TILE), Math.floor(fb9.y / TILE))] >= fb9.hb));
+    // the roof console tool lands the ghost on a standable tile
+    runConsole('roof');
+    ckV('roofToolStandsUp', (player.roofH || 0) >= FLOOR_H && canSwimTo(player.x, player.y));
+    console.log('VERTDBG ' + RV.join(' ') + ' fails=' + vFails);
+  }, 400);
+}
+if (location.hash === '#tankphys') {
+  // TANK DRIVETRAIN receipt (Tank order 2026-07-12): the big REAR
+  // sprockets drive a DOUBLE chain per side, twin-track differential
+  // under normal car controls, cannon recoil through the springs plus
+  // instant track bite, track HP with dead sides, and rubber pads as
+  // both the traction and the footprint.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let tFails = 0;
+    const RT = [], ckT = (n9, v9) => { RT.push(n9 + '=' + v9); if (!v9) tFails++; };
+    const tk9 = mkCar(player.x + 300, player.y, 0, 'tank', null);
+    attachCarMesh(tk9); cars.push(tk9);
+    const G9 = tk9.mesh.userData.gear9;
+    ckT('rearSprocketDrives', !!G9 && G9.sprkR > G9.idlR);
+    ckT('doubleChainBothSides', !!G9 && G9.linkIM.count === G9.n * 4 && G9.padIM.count === G9.n && G9.n > 60);
+    // straight run: both chains flow together, forward
+    tk9.speed = 100;
+    updTankGear9(tk9, 1 / 60, 1);
+    const o09 = [G9.off[0], G9.off[1]];
+    updTankGear9(tk9, 1 / 60, 1.02);
+    ckT('chainsFlowTogether', G9.off[0] > o09[0]
+      && Math.abs((G9.off[0] - o09[0]) - (G9.off[1] - o09[1])) < 1e-9);
+    // a LEFT yaw splits them: the left track is the slow one
+    tk9.angle -= 0.05;
+    updTankGear9(tk9, 1 / 60, 1.04);
+    ckT('turnSplitsTheTracks', G9.vSide[0] < G9.vSide[1]);
+    tk9._gpa9 = tk9.angle;
+    // the real controls: steering yaws AND bleeds pace; no motion, no turn
+    player.car = tk9; tk9.driver = 'player';
+    keys['KeyA'] = true;
+    tk9.speed = 120;
+    const a09 = tk9.angle;
+    stepPlayerCar(tk9, 1 / 60);
+    const turned9 = tk9.angle < a09 && tk9.speed < 120;
+    ckT('steerBleedsAndTurns', turned9);
+    tk9.speed = 0;
+    const a19 = tk9.angle;
+    stepPlayerCar(tk9, 1 / 60);
+    ckT('noMotionNoTurn', tk9.angle === a19);
+    keys['KeyA'] = false;
+    // the cannon answers through the hull
+    tk9.speed = 120; tk9.rcPV = 0; tk9.rcRV = 0; tk9.shockT = -1;
+    fireShell(tk9, tk9.angle, 0);
+    ckT('cannonRocksTheSprings', tk9.rcPV > 0.5 && tk9.shockT === 0);
+    ckT('cannonBitesTheTracks', tk9.speed <= 70 && tk9.speed > 0);
+    // the rock CARRIES the frame-locked end wheels: nose up = front
+    // idler up (track rising with it), rear sprocket dipping. Two ticks:
+    // the springs apply on the first, the wheels follow on the second.
+    updTankGear9(tk9, 1 / 60, 1.06);
+    updTankGear9(tk9, 1 / 60, 1.08);
+    ckT('rockCarriesTheEndWheels', G9.idl[0].position.y > 1.2 && G9.sprk[0].position.y < 1.34);
+    tk9.rcPV = 0; tk9.rcRV = 0;
+    fireShell(tk9, tk9.angle + Math.PI / 2, 0);
+    ckT('traverseShotRolls', Math.abs(tk9.rcRV) > 0.5);
+    // spike the test rounds — a live shell would land on the crush victim
+    for (const s9 of shells) { s9.done = true; if (s9.mesh) { s9.mesh.visible = false; s9.mesh = null; } }
+    // TRACK HP: a low LEFT-side hit breaks that chain — no power, a
+    // forced slew around the dead side
+    G9.hp[0] = 100;
+    trackHit9(tk9, tk9.x + Math.cos(tk9.angle - Math.PI / 2) * 12,
+      tk9.y + Math.sin(tk9.angle - Math.PI / 2) * 12, 120);
+    ckT('leftTrackBreaks', G9.broken[0] === true && G9.broken[1] === false);
+    tk9.speed = 80; tk9._gpa9 = tk9.angle;
+    updTankGear9(tk9, 1 / 60, 1.1);
+    ckT('deadSideGivesNoPower', G9.vSide[0] === 0 && G9.vSide[1] > 0);
+    const a29 = tk9.angle;
+    stepPlayerCar(tk9, 1 / 60);
+    ckT('cripplePullsIntoTheDeadSide', tk9.angle < a29);
+    // pads: traction defies the snow, prints ladder the ground, and the
+    // dead side prints NOTHING
+    WEATHER.snow = 1;
+    ckT('padsGripTheSnow', weatherGrip(tk9) > 0.8 && weatherGrip({ kind: 'sedan' }) < 0.6);
+    tk9.speed = 80; G9.padD[0] = 0; G9.padD[1] = 0;
+    updTankGear9(tk9, 1 / 60, 1.2);
+    updMarks(0.5);
+    ckT('padsPrintTheSnow', marks9.filter(m9 => m9 && m9.sx === 2.2).length >= 2);
+    ckT('deadSidePrintsNothing', G9.padD[0] === 0);
+    WEATHER.snow = 0;
+    // the wrench undoes it all
+    runConsole('fix car');
+    ckT('fixCarRestoresTracks', G9.hp[0] === 360 && G9.broken[0] === false);
+    // elevation under ONE track leans the tank NATURALLY; elevation
+    // under the REAR alone pitches the nose DOWN — both derived, not
+    // scripted
+    for (let i9 = 0; i9 < 30; i9++) {
+      tk9.trkH9 = tk9.trkH9 || [0, 0]; tk9.endH9 = tk9.endH9 || [0, 0];
+      tk9.trkH9[1] = 1.0; tk9.endH9[0] = 1.0;
+      updTankGear9(tk9, 1 / 60, 1.1 + i9 * 0.02);
+    }
+    ckT('rightRiseLeansItNaturally', tk9.climbRoll9 < -0.05 && tk9._rideY9 > 0.15);
+    ckT('rearRiseTipsTheNoseDown', tk9._pitchN9 < -0.05);
+    tk9.trkH9 = [0, 0]; tk9.endH9 = [0, 0];
+    // v2 gear: fat pads with tight gaps, end wheels spaced for the climb
+    ckT('padsThickAndWide', G9.padIM.geometry.parameters.width === 0.54 && G9.padIM.geometry.parameters.height === 0.22);
+    ckT('climbFaceSpaced', G9.idlX - 4.65 > 2 && -4.65 - G9.spkX > 2);
+    // the tank MOUNTS a car instead of detonating it: pads grab, the
+    // nose climbs the center-wheel fulcrum, the weight flattens it...
+    // (first: a KNOWN clear road strip — the tank has been driving blind
+    // through the city for the whole board and may be nosed into a wall)
+    let rx9 = -1, ry9 = -1;
+    outerR9: for (let iy9 = 40; iy9 < GRID_H - 4; iy9++) for (let ix9 = 10; ix9 < GRID_W - 16; ix9++) {
+      let ok9 = true;
+      for (let k9 = 0; k9 < 6; k9++) if (tileAt(ix9 + k9, iy9) !== T_ROAD || isBridge(ix9 + k9, iy9)) { ok9 = false; break; }
+      if (ok9) { rx9 = ix9; ry9 = iy9; break outerR9; }
+    }
+    tk9.x = (rx9 + 0.5) * TILE; tk9.y = (ry9 + 0.5) * TILE;
+    tk9._curbC9 = undefined; tk9.curbT9 = 0; tk9.latV = 0;
+    tk9.drowned = false;                    // the blind drive may have found the harbor
+    player.x = tk9.x; player.y = tk9.y;
+    for (const oc9 of cars) if (oc9 !== tk9 && !oc9.dead && dist(oc9.x, oc9.y, tk9.x, tk9.y) < 500) oc9.dead = true;
+    const vc9 = mkCar(tk9.x + 55, tk9.y, 0, 'sedan', null);
+    attachCarMesh(vc9); cars.push(vc9);
+    tk9.angle = 0; tk9._gpa9 = 0; tk9.turret = 0; vc9.angle = 0; tk9.speed = 60;
+    update(1 / 60);
+    ckT('tankMountsNotDetonates', vc9.crushT9 > 0 && !vc9.dead && tk9.climbT9 > 0);
+    let cg9 = 0;
+    while (!vc9.dead && cg9++ < 12) update(1 / 60);
+    // the NOSE is not the full weight — no flattening before the body
+    ckT('noseIsNotTheFullWeight', !vc9.dead && (vc9.crushF9 || 0) === 0);
+    while (!vc9.dead && (vc9.crushF9 || 0) < 0.5 && cg9++ < 160) update(1 / 60);
+    syncScene(1 / 60, 2);
+    const flat9 = !vc9.dead && !!vc9.mesh && vc9.mesh.scale.y < 0.8 && (vc9.crushF9 || 0) >= 0.5;
+    const ride9 = !!tk9.trkH9 && Math.max(tk9.trkH9[0], tk9.trkH9[1]) > 0.25;   // the tracks hold the hull IN THE AIR on the car
+    while (!vc9.dead && cg9++ < 300) update(1 / 60);
+    syncScene(1 / 60, 3);
+    // ...body on the hood = full weight = flattened, then it EXPLODES
+    // under the hull and the frame lingers where it died
+    ckT('bodyWeightFlattensIt', flat9);
+    ckT('tracksRideTheVehicle', ride9);
+    ckT('weightBlowsItUnderTheHull', vc9.dead && cg9 < 300);
+    ckT('frameLingersFlattened', !!vc9.mesh && vc9.mesh.visible === true && vc9.wreckT9 > 15 && vc9.mesh.scale.y < 0.8);
+    // curb edges: lips exist citywide, bump tires, kick the tank springs
+    ckT('curbLipsBuilt', curbLipN9 > 200);
+    let cbx9 = -1, cby9 = -1;
+    outerC9: for (let iy9 = 2; iy9 < GRID_H - 2; iy9++) for (let ix9 = 2; ix9 < GRID_W - 2; ix9++)
+      if (tileAt(ix9, iy9) === T_ROAD && tileAt(ix9 + 1, iy9) === T_SIDE) { cbx9 = ix9; cby9 = iy9; break outerC9; }
+    const cc9 = mkCar((cbx9 + 0.5) * TILE, (cby9 + 0.5) * TILE, 0, 'sedan', null);
+    attachCarMesh(cc9); cars.push(cc9);
+    cc9.speed = 60; cc9.angle = 0;
+    let mg9 = 0;
+    while (!(cc9.curbT9 > 0) && mg9++ < 120) moveCar(cc9, 1 / 60);
+    ckT('curbLipBumpsTheTires', cbx9 > 0 && cc9.curbT9 > 0 && mg9 < 120);
+    const tt9 = mkCar((cbx9 + 0.5) * TILE, (cby9 + 0.5) * TILE, 0, 'tank', null);
+    attachCarMesh(tt9); cars.push(tt9);
+    tt9.speed = 60; tt9.angle = 0; tt9.shockT = -1;
+    let mh9 = 0;
+    while (!(tt9.curbT9 > 0) && mh9++ < 120) moveCar(tt9, 1 / 60);
+    ckT('curbKicksTheTankSprings', tt9.curbT9 > 0 && tt9.shockT >= 0 && tt9.shockAmp === 0.1);
+    cc9.dead = true; tt9.dead = true;
+    player.car = null; tk9.driver = null; tk9.dead = true;
+    console.log('TNKDBG ' + RT.join(' ') + ' fails=' + tFails);
+  }, 400);
+}
 if (location.hash === '#aim') {
   // shots converge on the sight ray: at the ray's ground point the bullet
   // is AT the ground, not a body-length under it (the old parallel error)
@@ -21117,6 +21910,35 @@ if (location.hash === '#cheat') {
   setWanted(3);                              // so the HUD countdown is visible in this view
   paused = true;
   syncConsole();
+}
+// CURB EDGES (Tank order): a visible lip wherever sidewalk meets road —
+// one static instanced strip per boundary edge, ONE draw call citywide.
+// It freezes with the static world below and never moves again.
+let curbLipN9 = 0;
+{
+  const lips9 = [];
+  for (let iy9 = 0; iy9 < GRID_H; iy9++)
+    for (let ix9 = 0; ix9 < GRID_W; ix9++) {
+      if (tileAt(ix9, iy9) !== T_SIDE) continue;
+      if (tileAt(ix9 + 1, iy9) === T_ROAD) lips9.push([ix9 + 1, iy9 + 0.5, 0]);
+      if (tileAt(ix9 - 1, iy9) === T_ROAD) lips9.push([ix9, iy9 + 0.5, 0]);
+      if (tileAt(ix9, iy9 + 1) === T_ROAD) lips9.push([ix9 + 0.5, iy9 + 1, 1]);
+      if (tileAt(ix9, iy9 - 1) === T_ROAD) lips9.push([ix9 + 0.5, iy9, 1]);
+    }
+  curbLipN9 = lips9.length;
+  if (curbLipN9) {
+    const lipIM9 = new THREE.InstancedMesh(new THREE.BoxGeometry(0.5, 0.16, TILE * RS + 0.02),
+      new THREE.MeshLambertMaterial({ color: 0x9aa0a8 }), curbLipN9);
+    lipIM9.frustumCulled = false;
+    const lm9 = new THREE.Matrix4();
+    for (let i9 = 0; i9 < curbLipN9; i9++) {
+      const L9 = lips9[i9];
+      if (L9[2]) lm9.makeRotationY(Math.PI / 2); else lm9.identity();
+      lm9.setPosition(L9[0] * TILE * RS, 0.08, L9[1] * TILE * RS);
+      lipIM9.setMatrixAt(i9, lm9);
+    }
+    scene.add(lipIM9);
+  }
 }
 (function () {
   const styles = {};

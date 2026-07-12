@@ -3840,7 +3840,7 @@ function updMarks(dt) {
     const pa9 = ent9.angle + Math.PI / 2;
     // a real boot print: toes to the travel direction, left/right mirrored
     stampMark(ent9.x + Math.cos(pa9) * ent9._mkSide * 1.6, ent9.y + Math.sin(pa9) * ent9._mkSide * 1.6,
-      ent9.angle, 0.34 * ent9._mkSide, 0.62, k9, k9 === 'wet' ? 7 : k9 === 'snow' ? 45 : 25, 0.18, true);
+      ent9.angle, 0.34 * ent9._mkSide, 0.62, k9, k9 === 'wet' ? 0.16 : k9 === 'snow' ? 45 : 25, 0.18, true);   // rain prints flash and are gone (Tank: ~0.15s)
   };
   if (!player.car && !player.dead && !player.rag) foot9(player);
   for (const p9 of peds) if (!p9.dead && !p9.rag && !p9.riding) foot9(p9);
@@ -3919,6 +3919,12 @@ const MENU_WX9 = ['rain', 'clear', 'snow', 'clear', 'snow', 'rain', 'clear'];   
 let menuWxI9 = 0;
 function updWeather(dt) {
   const W9 = WEATHER;
+  // a paused game pauses the SKY too (Tank order) — spells, particles,
+  // marks, meteors, the King, all of it — and the rain holds its breath
+  if (paused) {
+    if (W9.rainGain) W9.rainGain.gain.value = 0;
+    return;
+  }
   // the spell clock — on the MENU the sky runs Tank's showcase reel at a
   // brisk pace; in play, clear skies trade with rain or snow at random
   W9.t -= dt;
@@ -6477,11 +6483,31 @@ function updWindWorld(dt, t) {
 // dies, and 60 seconds later the city replaces it
 let lampPoles = null, lampHeads = null;
 const lampGrid = new Map();                      // tile key -> lamp indices
+// Real light: a fixed pool of wide SpotLights reassigned each frame to the
+// nearest live posts (same idea as HEADLIGHT_PAIRS). Aimed DOWN from the
+// globe so pavement, sidewalks, people, and cars under / next to / passing
+// the post pick up a warm sodium wash (PointLight alone bleeds half into sky).
+const STREETLIGHT_POOL = [];
+const STREETLIGHT_N = 18;
+function mkStreetLight() {
+  // warm sodium cone: distance covers a corner + curb, wide angle, soft edge
+  // intensity 0 until assigned; angle ~72° half so ground disc ≈ tile+sidewalk
+  const s = new THREE.SpotLight(0xffd4a0, 0, 38, 1.22, 0.55, 1.3);
+  scene.add(s);
+  scene.add(s.target);
+  return s;
+}
+for (let i = 0; i < STREETLIGHT_N; i++) STREETLIGHT_POOL.push(mkStreetLight());
 {
   const n = lamps.length;
   if (n) {
     lampPoles = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.09, 0.12, 5, 5), new THREE.MeshLambertMaterial({ color: 0x30343c }), n);
-    lampHeads = new THREE.InstancedMesh(new THREE.SphereGeometry(0.32, 6, 6), new THREE.MeshBasicMaterial({ color: 0xffd9a0 }), n);
+    // Emissive globe so the head itself glows (spotlight does the scene)
+    lampHeads = new THREE.InstancedMesh(
+      new THREE.SphereGeometry(0.32, 8, 7),
+      new THREE.MeshStandardMaterial({ color: 0xffe8c0, emissive: 0xffd9a0, emissiveIntensity: 1.15, metalness: 0.05, roughness: 0.35 }),
+      n
+    );
     const m = new THREE.Matrix4();
     for (let i = 0; i < n; i++) {
       const L = lamps[i], x = L.x * RS, z = L.y * RS;
@@ -6692,9 +6718,12 @@ function breakLamp(i, dirAngRender, byCar) {
     byCar.speed *= full ? 0.86 : 0.93;           // the post scrubs momentum
     if (byCar === player.car) rumble(full ? 0.5 : 0.3, 0.35, 200);
   }
-  if (full && lampHeads.setColorAt) {
-    lampHeads.setColorAt(i, new THREE.Color(0x333333));   // the light dies
-    lampHeads.instanceColor.needsUpdate = true;
+  if (full) {
+    L.lightDead = true;                        // point light off until respawn
+    if (lampHeads.setColorAt) {
+      lampHeads.setColorAt(i, new THREE.Color(0x333333));   // the globe dies
+      lampHeads.instanceColor.needsUpdate = true;
+    }
   }
 }
 const brokenLamps = [];
@@ -6713,6 +6742,7 @@ function updLamps(dt) {
     if (L.respawnT <= 0) {
       // the city sends a truck: post restored, light back on
       L.broken = false;
+      L.lightDead = false;
       setLampPose(i, 0);
       if (lampHeads.setColorAt) {
         lampHeads.setColorAt(i, new THREE.Color(0xffffff));
@@ -6720,6 +6750,46 @@ function updLamps(dt) {
       }
       brokenLamps.splice(bi, 1);
     }
+  }
+}
+// Place street SpotLights on the nearest live lamp heads (visual only).
+// Cone aims at the ground under the globe so Lambert ground + cars + peds
+// next to / below / driving past the post all pick up the warm pool.
+function updStreetLights() {
+  if (!STREETLIGHT_POOL.length || !lamps.length) return;
+  const f2 = focus();
+  const cand = [];
+  for (let i = 0; i < lamps.length; i++) {
+    const L = lamps[i];
+    if (L.lightDead) continue;                 // snapped lamp = no light
+    const d = dist(L.x, L.y, f2.x, f2.y);
+    if (d > 1200) continue;                    // beyond a few blocks: skip
+    cand.push({ L, d });
+  }
+  cand.sort((a, b) => a.d - b.d);
+  for (let i = 0; i < STREETLIGHT_POOL.length; i++) {
+    const pl = STREETLIGHT_POOL[i];
+    const c = cand[i];
+    if (!c) { pl.intensity = 0; continue; }
+    const L = c.L;
+    // Head sits at y≈5.1 world; bent posts tip the globe (matches setLampPose:
+    // rotate (0,h,0) about axis (-sin fd, 0, cos fd) → offset (-h cos fd sin a, …))
+    let hx = L.x * RS, hz = L.y * RS, hy = 5.1;
+    if (L.broken && L.maxAng > 0) {
+      const a = (L.fallT != null ? Math.min(1, L.fallT) : 1) * L.maxAng;
+      const sa = Math.sin(a), ca = Math.cos(a);
+      const fd = L.fallDir || 0;
+      hx += -5.1 * Math.cos(fd) * sa;
+      hz += -5.1 * Math.sin(fd) * sa;
+      hy = Math.max(0.55, 5.1 * ca);
+    }
+    pl.position.set(hx, hy, hz);
+    // Aim just under the pavement so incidence is steep (same headlight trick)
+    pl.target.position.set(hx, -0.8, hz);
+    // bent but not dead: still glow, a bit dimmer as it leans
+    const lean = L.broken ? clamp(1 - (L.maxAng || 0) / 1.6, 0.28, 1) : 1;
+    pl.intensity = 3.55 * lean;
+    pl.distance = 36;
   }
 }
 // SOLIDS ARE SOLID: an upright lamp post stops FEET (player + peds). Cars
@@ -8051,7 +8121,23 @@ const TANK_MATS = {
 function buildCarMesh(c) {
   const g = new THREE.Group();
   const L = c.len * RS, W = c.w * RS;
-  const bodyMat = new THREE.MeshLambertMaterial({ color: c.color });
+  // Visual-only: painted metal, not flat Lambert plastic
+  const bodyMat = new THREE.MeshStandardMaterial({
+    color: c.color, metalness: 0.58, roughness: 0.38, envMapIntensity: 0.9
+  });
+  const chromeMat = new THREE.MeshStandardMaterial({
+    color: 0xc8cdd4, metalness: 0.92, roughness: 0.22, envMapIntensity: 1.1
+  });
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: 0x7a9bb0, metalness: 0.35, roughness: 0.12, transparent: true, opacity: 0.38, envMapIntensity: 0.7
+  });
+  const rubberMat = new THREE.MeshStandardMaterial({ color: 0x141418, metalness: 0.05, roughness: 0.88 });
+  const hubMatStd = new THREE.MeshStandardMaterial({ color: 0xa8adb6, metalness: 0.75, roughness: 0.32 });
+  // Soft extrude = curved body edges (still same L/W footprint Claude uses)
+  const EXTRUDE_SOFT = {
+    bevelEnabled: true, bevelThickness: 0.07, bevelSize: 0.09, bevelSegments: 2,
+    curveSegments: 14, steps: 1
+  };
   if (c.kind === 'tank') {
     // tracks: a real belt silhouette — flat on the ground, rising at both
     // ends over the idler (front) and drive sprocket (rear), road wheels
@@ -8237,7 +8323,7 @@ function buildCarMesh(c) {
   }
   stepTo(firewallX, 0.48, 3);
   prof.lineTo(firewallX, beltY);                     // the FIREWALL face
-  const hullGeo = new THREE.ExtrudeGeometry(prof, { depth: W * 0.94, bevelEnabled: false, curveSegments: 8, steps: 4 });
+  const hullGeo = new THREE.ExtrudeGeometry(prof, Object.assign({ depth: W * 0.94 }, EXTRUDE_SOFT));
   hullGeo.translate(0, 0, -W * 0.94 / 2);
   const body = new THREE.Mesh(hullGeo, bodyMat);
   g.add(body);
@@ -8251,7 +8337,7 @@ function buildCarMesh(c) {
   clipP.lineTo(L / 2 - 0.3, wellY);
   clipP.lineTo(L / 2 - 0.3, 0.48);
   cStep(L / 2, 0.48, 2);
-  const clipGeo = new THREE.ExtrudeGeometry(clipP, { depth: W * 0.94, bevelEnabled: false, curveSegments: 8, steps: 4 });
+  const clipGeo = new THREE.ExtrudeGeometry(clipP, Object.assign({ depth: W * 0.94 }, EXTRUDE_SOFT));
   clipGeo.translate(0, 0, -W * 0.94 / 2);
   const frontClip = new THREE.Mesh(clipGeo, bodyMat);
   g.add(frontClip);
@@ -8268,7 +8354,7 @@ function buildCarMesh(c) {
     fenP.lineTo(axR + arR, 0.48);
     fenP.absarc(axR, 0.48, arR, 0, Math.PI, false);  // the wheel tunnel
     fenP.lineTo(axR - 0.9, 0.48);
-    const fenGeo = new THREE.ExtrudeGeometry(fenP, { depth: 0.55, bevelEnabled: false, curveSegments: 8, steps: 2 });
+    const fenGeo = new THREE.ExtrudeGeometry(fenP, Object.assign({ depth: 0.55 }, EXTRUDE_SOFT, { bevelSize: 0.05, bevelThickness: 0.04 }));
     fenGeo.translate(0, 0, -0.275);
     for (const fs of [-1, 1]) {
       const fen = new THREE.Mesh(fs < 0 ? fenGeo : fenGeo.clone(), bodyMat);
@@ -8425,22 +8511,25 @@ function buildCarMesh(c) {
     g.add(bf);
     g.userData.bedWalls.push(bf);
   }
-  // CLEAR glass from the beltline to the roof
-  const cabMat = new THREE.MeshLambertMaterial({ color: 0x9fb6c9, transparent: true, opacity: 0.32 });
-  const cab = new THREE.Mesh(new THREE.BoxGeometry(cabL, 1.2, W * 0.84, 4, 2, 3), cabMat);
-  cab.position.set(cabX, 1.9, 0);
+  // Greenhouse: slightly raked glass + soft roof (less shoebox cab)
+  const cabMat = glassMat;
+  const cab = new THREE.Mesh(new THREE.BoxGeometry(cabL * 0.96, 1.15, W * 0.8, 4, 2, 4), cabMat);
+  cab.position.set(cabX - 0.04, 1.92, 0);
+  cab.rotation.z = -0.08;                              // windshield rake
   g.add(cab);
-  const roofMat = new THREE.MeshLambertMaterial({ color: 0x10151c });
-  const roof = new THREE.Mesh(new THREE.BoxGeometry(cabL, 0.09, W * 0.84), roofMat);
-  roof.position.set(cabX, 2.52, 0);
+  const roofMat = new THREE.MeshStandardMaterial({ color: 0x12161e, metalness: 0.4, roughness: 0.55 });
+  const roof = new THREE.Mesh(new THREE.BoxGeometry(cabL * 0.88, 0.1, W * 0.78, 3, 1, 3), roofMat);
+  roof.position.set(cabX - 0.06, 2.5, 0);
   g.add(roof);
-  // pillars: the greenhouse is BOLTED to the body, not floating over it
-  for (const px of [cabX + cabL / 2 - 0.1, cabX - cabL / 2 + 0.1]) {
-    for (const pz of [W * 0.42 - 0.02, -(W * 0.42 - 0.02)]) {
-      const pil = new THREE.Mesh(new THREE.BoxGeometry(0.13, 1.2, 0.13), roofMat);
-      pil.position.set(px, 1.9, pz);
-      g.add(pil);
-    }
+  // A-pillars raked with the glass
+  for (const pz of [W * 0.38, -W * 0.38]) {
+    const pilF = new THREE.Mesh(new THREE.BoxGeometry(0.12, 1.15, 0.12), roofMat);
+    pilF.position.set(cabX + cabL / 2 - 0.18, 1.92, pz);
+    pilF.rotation.z = -0.12;
+    g.add(pilF);
+    const pilR = new THREE.Mesh(new THREE.BoxGeometry(0.12, 1.1, 0.12), roofMat);
+    pilR.position.set(cabX - cabL / 2 + 0.14, 1.9, pz);
+    g.add(pilR);
   }
   // interior: BUCKET seats (base + side bolsters + backrest) that read
   // through the glass at night, a raked wheel, and a SEATED driver whose
@@ -8508,13 +8597,13 @@ function buildCarMesh(c) {
   g.add(fig2);
   g.userData.passFig = fig2;
 
-  // real wheels: tire + hub cap on a rolling axle; the FRONT pair sits in a
-  // steering pivot that follows the wheel (see syncScene)
-  // full-size rubber: tall tires with a fat contact patch, chrome hubs
-  const tireMat = new THREE.MeshLambertMaterial({ color: 0x111114 });
-  const hubMat = new THREE.MeshLambertMaterial({ color: 0x8a8f98 });
-  const tireGeo = new THREE.CylinderGeometry(0.62, 0.62, 0.55, 14);
-  const hubGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.58, 8);
+  // Wheels: high-seg rubber tire + rim + hub (reads as a real wheel at distance)
+  const tireMat = rubberMat;
+  const hubMat = hubMatStd;
+  const tireGeo = new THREE.CylinderGeometry(0.64, 0.64, 0.42, 20);
+  const sidewallGeo = new THREE.CylinderGeometry(0.58, 0.64, 0.12, 20);
+  const rimGeo = new THREE.CylinderGeometry(0.38, 0.38, 0.44, 16);
+  const hubGeo = new THREE.CylinderGeometry(0.16, 0.16, 0.48, 12);
   g.userData.wheelsF = [];
   g.userData.wheelRolls = [];
   for (const [dx, dz] of [[L * 0.32, W * 0.5], [L * 0.32, -W * 0.5], [-L * 0.32, W * 0.5], [-L * 0.32, -W * 0.5]]) {
@@ -8524,7 +8613,16 @@ function buildCarMesh(c) {
     const tire = new THREE.Mesh(tireGeo, tireMat);
     tire.rotation.x = Math.PI / 2;
     rollG.add(tire);
-    const hub = new THREE.Mesh(hubGeo, hubMat);
+    for (const side of [-1, 1]) {
+      const sw = new THREE.Mesh(sidewallGeo, tireMat);
+      sw.rotation.x = Math.PI / 2;
+      sw.position.z = side * 0.18;
+      rollG.add(sw);
+    }
+    const rim = new THREE.Mesh(rimGeo, hubMat);
+    rim.rotation.x = Math.PI / 2;
+    rollG.add(rim);
+    const hub = new THREE.Mesh(hubGeo, chromeMat);
     hub.rotation.x = Math.PI / 2;
     rollG.add(hub);
     steerG.add(rollG);
@@ -8532,34 +8630,34 @@ function buildCarMesh(c) {
     if (dx > 0) g.userData.wheelsF.push(steerG);
     g.userData.wheelRolls.push(rollG);
   }
-  // headlights + taillights (emissive dots)
-  const hlMat = new THREE.MeshBasicMaterial({ color: 0xffeeb0 });
-  const tlMat = new THREE.MeshBasicMaterial({ color: 0xff2020 });
+  // headlights + taillights (soft round lamps)
+  const hlMat = new THREE.MeshStandardMaterial({ color: 0xfff2c8, emissive: 0xffeeb0, emissiveIntensity: 0.55, metalness: 0.2, roughness: 0.25 });
+  const tlMat = new THREE.MeshStandardMaterial({ color: 0xff2020, emissive: 0xaa1010, emissiveIntensity: 0.4, metalness: 0.15, roughness: 0.35 });
   g.userData.trim = [];                      // bolted lamps ride the crumple field
   for (const dz of [W * 0.32, -W * 0.32]) {
-    const hl = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.22, 0.32), hlMat);
-    hl.position.set(L / 2 + 0.02, 1.05, dz);
+    const hl = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 8), hlMat);
+    hl.scale.set(0.55, 0.75, 1.1);
+    hl.position.set(L / 2 + 0.04, 1.05, dz);
     g.add(hl);
-    const tl = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.18, 0.3), tlMat);
-    tl.position.set(-L / 2 - 0.02, 1.05, dz);
+    const tl = new THREE.Mesh(new THREE.SphereGeometry(0.13, 8, 6), tlMat);
+    tl.scale.set(0.45, 0.7, 1.0);
+    tl.position.set(-L / 2 - 0.03, 1.05, dz);
     g.add(tl);
     const hlT = { m: hl, bx: L / 2 + 0.02, by: 1.05, bz: dz, ox: 0, oy: 0, oz: 0 };
     const tlT = { m: tl, bx: -L / 2 - 0.02, by: 1.05, bz: dz, ox: 0, oy: 0, oz: 0 };
     g.userData.trim.push(hlT, tlT);
     g.userData[dz > 0 ? 'lampR' : 'lampL'] = hlT;
   }
-  // grille + chrome bumpers, front and rear — segmented so they CREASE in
-  // the crumple field like everything else, and tracked as real bars that
-  // skew off their mounts and tear away at wreck violence (Tank order)
-  const chrome = new THREE.MeshLambertMaterial({ color: 0x9aa0a8 });
-  const grille = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.3, W * 0.4, 1, 2, 5), new THREE.MeshLambertMaterial({ color: 0x1c2026 }));
+  // grille + chrome bumpers — shiny metal, still crumple-tracked
+  const chrome = chromeMat;
+  const grille = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.3, W * 0.4, 1, 2, 6), new THREE.MeshStandardMaterial({ color: 0x1c2026, metalness: 0.5, roughness: 0.45 }));
   grille.position.set(L / 2 + 0.03, 1.02, 0);
   g.add(grille);
   g.userData.trim.push({ m: grille, bx: L / 2 + 0.03, by: 1.02, bz: 0, ox: 0, oy: 0, oz: 0, capX: 0.45, capZ: 0.4 });
   g.userData.crush.push(grille);
   g.userData.bumpers = [];
   for (const bs of [1, -1]) {
-    const bmp = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.26, W * 0.95, 2, 1, 9), chrome);
+    const bmp = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.24, W * 0.95, 2, 1, 10), chrome);
     bmp.position.set(bs * (L / 2 + 0.12), 0.55, 0);
     g.add(bmp);
     g.userData.trim.push({ m: bmp, bx: bs * (L / 2 + 0.12), by: 0.55, bz: 0, ox: 0, oy: 0, oz: 0, capX: 0.5, capZ: 0.45 });
@@ -8582,10 +8680,10 @@ function buildCarMesh(c) {
   for (const side of [-1, 1]) {
     const dg = new THREE.Group();
     dg.position.set(doorHingeX, 0.8625, side * (W / 2 + 0.03));
-    const panel = new THREE.Mesh(new THREE.BoxGeometry(doorLen, 0.875, 0.12), bodyMat);
+    const panel = new THREE.Mesh(new THREE.BoxGeometry(doorLen, 0.875, 0.11, 3, 2, 1), bodyMat);
     panel.position.set(-doorLen / 2, 0, 0);
     dg.add(panel);
-    const dwin = new THREE.Mesh(new THREE.BoxGeometry(doorLen * 0.78, 0.7, 0.1), cabMat);
+    const dwin = new THREE.Mesh(new THREE.BoxGeometry(doorLen * 0.78, 0.7, 0.08), cabMat);
     dwin.position.set(-doorLen / 2, 0.79, 0);
     dg.add(dwin);
     g.add(dg);
@@ -9257,21 +9355,21 @@ function buildWeaponMesh(kind) {
 // Weapons parent to hand socket past the elbow, not the shoulder root
 // =====================================================================
 // Hip → thigh → KNEECAP joint → shin. Returns hip; knee on hip.userData.knee.
+// Visual: tapered cylinders + sphere joints (same pivots Claude's gait uses).
 function makeLeg(w, totalLen, mat, py, pz, root) {
   const thighLen = totalLen * 0.52, shinLen = totalLen * 0.48;
   const hip = new THREE.Group();
   hip.position.set(0, py, pz);
-  const thigh = new THREE.Mesh(new THREE.BoxGeometry(w, thighLen, w * 1.15), mat);
+  const thigh = new THREE.Mesh(new THREE.CylinderGeometry(w * 0.52, w * 0.62, thighLen, 8), mat);
   thigh.position.y = -thighLen / 2;
   hip.add(thigh);
   const knee = new THREE.Group();
   knee.position.y = -thighLen;
   hip.add(knee);
-  // kneecap nub — reads as a joint, not a stick
-  const cap = new THREE.Mesh(new THREE.BoxGeometry(w * 1.12, w * 0.42, w * 1.25), mat);
+  const cap = new THREE.Mesh(new THREE.SphereGeometry(w * 0.48, 8, 6), mat);
   cap.position.y = 0.02;
   knee.add(cap);
-  const shin = new THREE.Mesh(new THREE.BoxGeometry(w * 0.92, shinLen, w * 1.08), mat);
+  const shin = new THREE.Mesh(new THREE.CylinderGeometry(w * 0.42, w * 0.52, shinLen, 8), mat);
   shin.position.y = -shinLen / 2;
   knee.add(shin);
   hip.userData.knee = knee;
@@ -9286,17 +9384,16 @@ function makeArm(w, totalLen, mat, py, pz, root) {
   const upperLen = totalLen * 0.48, foreLen = totalLen * 0.52;
   const shoulder = new THREE.Group();
   shoulder.position.set(0, py, pz);
-  const upper = new THREE.Mesh(new THREE.BoxGeometry(w, upperLen, w * 1.15), mat);
+  const upper = new THREE.Mesh(new THREE.CylinderGeometry(w * 0.55, w * 0.48, upperLen, 8), mat);
   upper.position.y = -upperLen / 2;
   shoulder.add(upper);
   const elbow = new THREE.Group();
   elbow.position.y = -upperLen;
   shoulder.add(elbow);
-  // elbow nub
-  const joint = new THREE.Mesh(new THREE.BoxGeometry(w * 1.15, w * 0.4, w * 1.2), mat);
+  const joint = new THREE.Mesh(new THREE.SphereGeometry(w * 0.5, 8, 6), mat);
   joint.position.y = 0.02;
   elbow.add(joint);
-  const fore = new THREE.Mesh(new THREE.BoxGeometry(w * 0.92, foreLen, w * 1.08), mat);
+  const fore = new THREE.Mesh(new THREE.CylinderGeometry(w * 0.4, w * 0.48, foreLen, 8), mat);
   fore.position.y = -foreLen / 2;
   elbow.add(fore);
   // hand socket at the wrist — weapons and palms parent here
@@ -9313,13 +9410,16 @@ function makeArm(w, totalLen, mat, py, pz, root) {
 function buildPedMesh(shirt, headCol) {
   const g = new THREE.Group();
   g.rotation.order = 'YZX';                  // yaw first, then tumble about the side axis
-  const shirtMat = new THREE.MeshLambertMaterial({ color: shirt });
-  const pantMat = new THREE.MeshLambertMaterial({ color: 0x1c1e26 });
+  const shirtMat = new THREE.MeshStandardMaterial({ color: shirt, metalness: 0.05, roughness: 0.78 });
+  const pantMat = new THREE.MeshStandardMaterial({ color: 0x1c1e26, metalness: 0.08, roughness: 0.82 });
   // torso carries half the body's weight — everything hangs off it
-  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 1.3, 1.0), shirtMat);
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 1.3, 1.0, 2, 3, 2), shirtMat);
   torso.position.y = 2.1;
   g.add(torso);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.42, 8, 7), new THREE.MeshLambertMaterial({ color: headCol }));
+  const head = new THREE.Mesh(
+    new THREE.SphereGeometry(0.42, 12, 10),
+    new THREE.MeshStandardMaterial({ color: headCol, metalness: 0.02, roughness: 0.55 })
+  );
   head.position.y = 3.12;
   g.add(head);
   const legL = makeLeg(0.26, 1.45, pantMat, 1.45, -0.25, g);
@@ -9402,15 +9502,16 @@ function decoratePed(p9) {
 function buildPlayerMesh() {
   const g = new THREE.Group();
   g.rotation.order = 'YZX';
-  const fur = new THREE.MeshLambertMaterial({ color: 0xd45a28 });
-  const cream = new THREE.MeshLambertMaterial({ color: 0xf0d8b8 });
-  const suit = new THREE.MeshLambertMaterial({ color: 0x0e1016 });
-  const lapel = new THREE.MeshLambertMaterial({ color: 0xc01828 });
-  const shirt = new THREE.MeshLambertMaterial({ color: 0xeceef2 });
-  const dark = new THREE.MeshLambertMaterial({ color: 0x12141a });
-  const glass = new THREE.MeshLambertMaterial({ color: 0x0a0a0c });
+  // Soft PBR-ish materials — still the Ghost identity (fur, cream, suit, red lapels)
+  const fur = new THREE.MeshStandardMaterial({ color: 0xd45a28, metalness: 0.05, roughness: 0.72 });
+  const cream = new THREE.MeshStandardMaterial({ color: 0xf0d8b8, metalness: 0.02, roughness: 0.55 });
+  const suit = new THREE.MeshStandardMaterial({ color: 0x0e1016, metalness: 0.12, roughness: 0.68 });
+  const lapel = new THREE.MeshStandardMaterial({ color: 0xc01828, metalness: 0.25, roughness: 0.35 });
+  const shirt = new THREE.MeshStandardMaterial({ color: 0xeceef2, metalness: 0.02, roughness: 0.7 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x12141a, metalness: 0.3, roughness: 0.45 });
+  const glass = new THREE.MeshStandardMaterial({ color: 0x0a0a0c, metalness: 0.6, roughness: 0.15 });
   function add(mat, sx, sy, sz, x, y, z, parent) {
-    const m = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), mat);
+    const m = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz, 2, 2, 2), mat);
     m.position.set(x, y, z);
     (parent || g).add(m);
     return m;
@@ -9429,37 +9530,49 @@ function buildPlayerMesh() {
   lapR.rotation.y = 0.4; lapR.rotation.x = -0.08;
   // shoulder block
   add(suit, 0.75, 0.28, 0.95, 0, 2.72, 0);
-  // head group — faceted red panda, face on +X
+  // head — softer red-panda (higher-seg spheres), face on +X
   const headG = new THREE.Group();
   headG.position.y = 3.12;
   g.add(headG);
-  const skull = new THREE.Mesh(new THREE.SphereGeometry(0.4, 7, 6), fur);
+  const skull = new THREE.Mesh(new THREE.SphereGeometry(0.42, 14, 12), fur);
+  skull.scale.set(1.0, 0.95, 0.92);
   skull.position.y = 0.08;
   headG.add(skull);
-  add(fur, 0.62, 0.48, 0.72, 0.04, 0.02, 0, headG);
-  // cream face mask + cheeks
-  add(cream, 0.3, 0.36, 0.48, 0.32, -0.02, 0, headG);
-  const cheekL = new THREE.Mesh(new THREE.SphereGeometry(0.16, 6, 5), cream);
-  cheekL.position.set(0.34, 0.0, -0.16); headG.add(cheekL);
-  const cheekR = new THREE.Mesh(new THREE.SphereGeometry(0.16, 6, 5), cream);
-  cheekR.position.set(0.34, 0.0, 0.16); headG.add(cheekR);
+  // cream face mask + soft cheeks
+  const face = new THREE.Mesh(new THREE.SphereGeometry(0.28, 12, 10), cream);
+  face.scale.set(0.85, 0.95, 1.05);
+  face.position.set(0.28, -0.02, 0);
+  headG.add(face);
+  const cheekL = new THREE.Mesh(new THREE.SphereGeometry(0.15, 10, 8), cream);
+  cheekL.position.set(0.32, 0.0, -0.16); headG.add(cheekL);
+  const cheekR = new THREE.Mesh(new THREE.SphereGeometry(0.15, 10, 8), cream);
+  cheekR.position.set(0.32, 0.0, 0.16); headG.add(cheekR);
   // snout + nose
-  add(cream, 0.24, 0.18, 0.24, 0.44, -0.12, 0, headG);
-  const nose = new THREE.Mesh(new THREE.SphereGeometry(0.07, 5, 4), dark);
-  nose.position.set(0.56, -0.1, 0); headG.add(nose);
-  // ears — left (−Z) / right (+Z)
-  const earL = add(fur, 0.12, 0.28, 0.22, -0.04, 0.38, -0.28, headG);
-  earL.rotation.x = 0.35;
-  const earR = add(fur, 0.12, 0.28, 0.22, -0.04, 0.38, 0.28, headG);
-  earR.rotation.x = -0.35;
-  add(cream, 0.06, 0.12, 0.1, 0.02, 0.38, -0.28, headG);
-  add(cream, 0.06, 0.12, 0.1, 0.02, 0.38, 0.28, headG);
-  // sunglasses across the face (+X)
-  add(glass, 0.08, 0.16, 0.62, 0.46, 0.1, 0, headG);
-  add(dark, 0.05, 0.05, 0.06, 0.5, 0.1, 0, headG);
-  const armL_temple = add(dark, 0.18, 0.05, 0.05, 0.32, 0.08, -0.32, headG);
+  const snout = new THREE.Mesh(new THREE.SphereGeometry(0.12, 10, 8), cream);
+  snout.scale.set(1.35, 0.85, 1.0);
+  snout.position.set(0.46, -0.1, 0);
+  headG.add(snout);
+  const nose = new THREE.Mesh(new THREE.SphereGeometry(0.065, 8, 6), dark);
+  nose.position.set(0.58, -0.1, 0); headG.add(nose);
+  // ears — curved shells (sphere slices via scaled spheres)
+  for (const s of [-1, 1]) {
+    const ear = new THREE.Mesh(new THREE.SphereGeometry(0.14, 10, 8), fur);
+    ear.scale.set(0.55, 1.15, 0.75);
+    ear.position.set(-0.02, 0.4, s * 0.28);
+    ear.rotation.x = s * -0.25;
+    ear.rotation.z = s * 0.15;
+    headG.add(ear);
+    const earIn = new THREE.Mesh(new THREE.SphereGeometry(0.07, 8, 6), cream);
+    earIn.scale.set(0.5, 0.9, 0.6);
+    earIn.position.set(0.02, 0.38, s * 0.28);
+    headG.add(earIn);
+  }
+  // sunglasses
+  add(glass, 0.08, 0.16, 0.62, 0.48, 0.1, 0, headG);
+  add(dark, 0.05, 0.05, 0.06, 0.52, 0.1, 0, headG);
+  const armL_temple = add(dark, 0.18, 0.05, 0.05, 0.34, 0.08, -0.32, headG);
   armL_temple.rotation.y = -0.3;
-  const armR_temple = add(dark, 0.18, 0.05, 0.05, 0.32, 0.08, 0.32, headG);
+  const armR_temple = add(dark, 0.18, 0.05, 0.05, 0.34, 0.08, 0.32, headG);
   armR_temple.rotation.y = 0.3;
   // limbs — same hip/knee layout as civilians so animateRig / ragPose work
   const legL = makeLeg(0.26, 1.45, suit, 1.45, -0.25, g);
@@ -9727,8 +9840,13 @@ const ghostSeat = (() => {
 // the car's actual lamp position on the bumper corner, just ahead of the
 // bumper plane, so a car never lights its own hood. Fixed pool = constant
 // shader light count = no recompile hitches.
+//
+// Angle is wide and the aim point is close + BELOW the ground plane so the
+// cone hits asphalt at a steep incidence (Lambert cos is usable). A near-
+// horizontal aim lights cars/buildings but leaves the road black.
 function mkHeadlight() {
-  const s = new THREE.SpotLight(0xfff0c0, 0, 50, 0.42, 0.5, 1);
+  // intensity, distance, angle(rad), penumbra, decay
+  const s = new THREE.SpotLight(0xfff0c0, 0, 38, 0.62, 0.55, 1.35);
   scene.add(s);
   scene.add(s.target);
   return s;
@@ -15298,12 +15416,14 @@ function syncScene(dt, t) {
       const c = lit[i];
       if (!c) { pair[0].intensity = 0; pair[1].intensity = 0; continue; }
       const cs2 = Math.cos(c.angle), sn2 = Math.sin(c.angle);
-      const fwd = c.len * RS / 2 + 0.3;                            // just past the bumper
+      const fwd = c.len * RS / 2 + 0.35;                           // just past the bumper
       const lampY = c.kind === 'tank' ? 2.3 : 1.05;
       const lampW = c.kind === 'tank' ? 1.6 : c.w * RS * 0.32;     // matches the lamp boxes
+      // player car a bit brighter; AI still paints the street
+      const baseI = c === player.car ? 2.6 : 1.7;
       for (const side of [-1, 1]) {
         const s = pair[side < 0 ? 0 : 1];
-        s.intensity = 1.15;
+        s.intensity = baseI;
         // a crumpled lamp keeps its beam: anchor at the DEFORMED position
         // and tilt the aim by how far the metal bent it
         const tr = c.mesh.userData[side < 0 ? 'lampL' : 'lampR'];
@@ -15314,10 +15434,19 @@ function syncScene(dt, t) {
         s.position.set(lx, lampY + oy, lz);
         const tilt = Math.atan2(lat, fwd + ox) - Math.atan2(side * lampW, fwd);
         const aimA = Math.atan2(sn2, cs2) + tilt;
-        s.target.position.set(lx + Math.cos(aimA) * 30, 0, lz + Math.sin(aimA) * 30);
+        // Aim CLOSE and slightly UNDER the road so the cone hits pavement
+        // hard (steep N·L). Old aim was 30u out at y=0 → almost horizontal.
+        const aimDist = 12;
+        s.target.position.set(
+          lx + Math.cos(aimA) * aimDist,
+          -1.2,
+          lz + Math.sin(aimA) * aimDist
+        );
       }
     }
   }
+  // street lamp SpotLights → ground, sidewalks, people, cars under the posts
+  updStreetLights();
   updTrafficLights();
   // barrier blink
   for (const grp of barrierGroups) {
@@ -18458,6 +18587,15 @@ if (location.hash === '#weather') {
     WEATHER.snow = 0; WEATHER.wet = 1;
     for (let i9 = 0; i9 < 20; i9++) { player.x += 6; updMarks(0.05); }
     ckW('wetPrintsInRain', marks9.some(m9 => m9 && m9.kind === 'wet'));
+    ckW('rainPrintsFleeting', marks9.filter(m9 => m9 && m9.kind === 'wet' && m9.foot).every(m9 => m9.life <= 0.2));
+    // a paused game pauses the sky
+    WEATHER.mode = 'rain'; WEATHER.t = 333; WEATHER.inten = 0.5;
+    paused = true;
+    for (let i9 = 0; i9 < 50; i9++) updWeather(0.1);
+    ckW('pauseFreezesTheSky', WEATHER.t === 333 && WEATHER.inten === 0.5);
+    paused = false;
+    updWeather(0.1);
+    ckW('unpauseResumes', WEATHER.t < 333);
     // a fallen ped pools blood; walking through it tracks red away — even dry
     WEATHER.wet = 0;
     const bp9 = mkPed(player.x + 30, player.y, {});

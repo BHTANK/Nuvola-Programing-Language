@@ -1120,6 +1120,10 @@ function out() { return sfxDest || master || AC.destination; }
 // to the listener pose. rolloffFactor 0 = no distance attenuation here,
 // every caller already mixes its own volume. Logic px scale to audio meters.
 function panAt(x, y, keep) {
+  // a non-finite coordinate assigned to an AudioParam THROWS — and one
+  // uncaught throw inside update() kills the rAF chain: the game freezes
+  // on its last frame forever. Corrupt positions play at the player instead.
+  if (!isFinite(x) || !isFinite(y)) { x = player.x; y = player.y; }
   const p = AC.createPanner();
   p.panningModel = 'equalpower';
   p.distanceModel = 'inverse';
@@ -1460,8 +1464,49 @@ function sirenOff() {
 // the engine under you: pitch follows speed, tank idles deeper. One
 // persistent voice, faded rather than restarted.
 let engOsc = null, engOsc2 = null, engGain = null, engLp = null;
-function updEngine() {
+// TANK DIESEL RIG (Tank order: deep diesel, low-tuned turbo that screams at
+// full throttle, blow-by on lift-off from full throttle or high load).
+// Same discipline as the engine voice: persistent nodes built once, gain-
+// faded, never restarted. The knock = brown-noise band chopped at the
+// firing rate; the turbo = two partials + induction hiss riding _tbSpool,
+// a charge state that builds under throttle (faster under load) and
+// unwinds off it; the blow-by one-shot lives in dieselBlow().
+let dslG = null, dslClatG = null, dslBp = null, dslLfo = null, dslLfoG = null;
+let tbOsc = null, tbOsc2 = null, tbG = null, tbHiss = null, tbHissG = null;
+let _tbSpool = 0, _tbPrevThr = 0, _tbBlowCd = 0, _tbBlowN = 0, _tbLastTank = null;
+function dieselBlow(sp9) {
+  // WASTEGATE FLUTTER: a charged turbo dumped against a closed throttle —
+  // a filtered air burst chopped by a decaying stutter, pitch falling as
+  // the compressor spins down. Louder the harder it was spooled.
+  if (!AC || muted) return;
+  _tbBlowN++;
+  const t = AC.currentTime, dur = 0.42 + sp9 * 0.25;
+  const n9 = (AC.sampleRate * dur) | 0;
+  const b9 = AC.createBuffer(1, n9, AC.sampleRate);
+  const d9 = b9.getChannelData(0);
+  for (let i9 = 0; i9 < n9; i9++) d9[i9] = Math.random() * 2 - 1;
+  const s9 = AC.createBufferSource(); s9.buffer = b9;
+  const bp9 = AC.createBiquadFilter(); bp9.type = 'bandpass'; bp9.Q.value = 2.2;
+  bp9.frequency.setValueAtTime(2400 + 900 * sp9, t);
+  bp9.frequency.exponentialRampToValueAtTime(620, t + dur);
+  const fl9 = AC.createOscillator(); fl9.type = 'square';        // the stutter
+  fl9.frequency.setValueAtTime(34, t);
+  fl9.frequency.linearRampToValueAtTime(12, t + dur);
+  const flG9 = AC.createGain(); flG9.gain.value = 0.5;           // chop depth
+  const ch9 = AC.createGain(); ch9.gain.value = 0.55;            // base ±0.5 chop
+  fl9.connect(flG9); flG9.connect(ch9.gain);
+  const g9 = AC.createGain();
+  g9.gain.setValueAtTime(0.001, t);
+  g9.gain.exponentialRampToValueAtTime(0.11 + 0.1 * sp9, t + 0.03);
+  g9.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  s9.connect(bp9); bp9.connect(ch9); ch9.connect(g9); g9.connect(out());
+  s9.start(t); fl9.start(t);
+  fl9.stop(t + dur + 0.05);
+}
+function updEngine(dt) {
   if (!AC) return;
+  dt = dt || 1 / 60;
+  if (_tbBlowCd > 0) _tbBlowCd -= dt;              // the vent cooldown runs on foot too
   // skid voices released a beat after their car stops sliding
   for (const v of [...skidVs]) if (AC.currentTime > v.until) skidStop(v);
   // the ears ride the player and face where the CAMERA faces — the 360
@@ -1485,16 +1530,87 @@ function updEngine() {
     engOsc.connect(engLp); engOsc2.connect(engLp); engLp.connect(engGain); engGain.connect(out());
     engOsc.start(); engOsc2.start();
   }
+  if (want && player.car.kind === 'tank' && !dslG && brownBuf) {
+    dslG = AC.createGain(); dslG.gain.value = 0.0001; dslG.connect(out());
+    // combustion knock: a low brown-noise band, its gain chopped square at
+    // the firing rate — the chug you hear standing next to a big diesel
+    const cs9 = AC.createBufferSource(); cs9.buffer = brownBuf; cs9.loop = true;
+    dslBp = AC.createBiquadFilter(); dslBp.type = 'bandpass'; dslBp.frequency.value = 115; dslBp.Q.value = 1.3;
+    dslClatG = AC.createGain(); dslClatG.gain.value = 0.0;
+    dslLfo = AC.createOscillator(); dslLfo.type = 'square'; dslLfo.frequency.value = 12.5;
+    dslLfoG = AC.createGain(); dslLfoG.gain.value = 0.0;
+    dslLfo.connect(dslLfoG); dslLfoG.connect(dslClatG.gain);
+    cs9.connect(dslBp); dslBp.connect(dslClatG); dslClatG.connect(dslG);
+    // the turbo: two partials for the whine + pink induction hiss above it
+    tbOsc = AC.createOscillator(); tbOsc.type = 'triangle'; tbOsc.frequency.value = 420;
+    tbOsc2 = AC.createOscillator(); tbOsc2.type = 'sine'; tbOsc2.frequency.value = 846;
+    tbG = AC.createGain(); tbG.gain.value = 0.0001;
+    tbOsc.connect(tbG); tbOsc2.connect(tbG); tbG.connect(dslG);
+    const hs9 = AC.createBufferSource(); hs9.buffer = pinkBuf; hs9.loop = true;
+    tbHiss = AC.createBiquadFilter(); tbHiss.type = 'highpass'; tbHiss.frequency.value = 1400;
+    tbHissG = AC.createGain(); tbHissG.gain.value = 0.0001;
+    hs9.connect(tbHiss); tbHiss.connect(tbHissG); tbHissG.connect(dslG);
+    cs9.start(); hs9.start(); dslLfo.start(); tbOsc.start(); tbOsc2.start();
+  }
   if (!engOsc) return;
   if (want) {
-    const sp = Math.abs(player.car.speed);
-    const f = player.car.kind === 'helo' ? 15 + (player.car.rotor || 0) * 26 : player.car.kind === 'boat' ? 22 + sp * 0.16 : (player.car.kind === 'tank' ? 26 : 42) + sp * 0.34;
+    const pc9 = player.car, sp = Math.abs(pc9.speed);
+    const f = pc9.kind === 'helo' ? 15 + (pc9.rotor || 0) * 26 : pc9.kind === 'boat' ? 22 + sp * 0.16 : (pc9.kind === 'tank' ? 26 : 42) + sp * 0.34;
     engOsc.frequency.setTargetAtTime(f, AC.currentTime, 0.08);
     engOsc2.frequency.setTargetAtTime(f * 0.5, AC.currentTime, 0.08);
-    engLp.frequency.setTargetAtTime(280 + sp * 2.4, AC.currentTime, 0.1);
-    engGain.gain.setTargetAtTime(player.car.kind === 'tank' ? 0.035 : player.car.kind === 'helo' ? 0.02 + (player.car.rotor || 0) * 0.025 : 0.02, AC.currentTime, 0.15);
+    engLp.frequency.setTargetAtTime(pc9.kind === 'tank' ? 190 + sp * 1.5 : 280 + sp * 2.4, AC.currentTime, 0.1);
+    engGain.gain.setTargetAtTime(pc9.kind === 'tank' ? 0.042 : pc9.kind === 'helo' ? 0.02 + (pc9.rotor || 0) * 0.025 : 0.02, AC.currentTime, 0.15);
+    if (pc9.kind === 'tank' && dslG && !pc9.drowned) {   // flooded engine = DONE — the rig dies with it
+      _tbLastTank = pc9;
+      // demand: forward throttle, or working the reverse gear
+      const thr9 = Math.max(pc9._thr || 0, (pc9.speed < -2 && (key('KeyS') || key('ArrowDown') || padBrakeV > 0.1)) ? 1 : 0);
+      // load: pulling hard below the commanded pace (wall, victim, grade)
+      // or climbing onto a vehicle — the engine working, not cruising
+      const lag9 = thr9 > 0 ? clamp(1 - sp / (150 * Math.max(0.12, thr9)), 0, 1) : 0;
+      const load9 = Math.max(thr9 * lag9, (pc9.climbT9 && pc9.climbT9 > 0) ? 0.9 : 0);
+      // the turbo charges under demand — faster when loaded — and only
+      // reaches the scream at FULL throttle; lift-off unwinds it fast
+      const tgt9 = clamp(thr9 * 0.85 + load9 * 0.3, 0, 1);
+      const k9 = tgt9 > _tbSpool ? (1.1 + load9 * 1.2) : 2.6;
+      _tbSpool += (tgt9 - _tbSpool) * Math.min(1, k9 * dt);
+      if (_tbPrevThr > 0.5 && thr9 < 0.12 && _tbSpool > 0.45 && _tbBlowCd <= 0) {
+        dieselBlow(_tbSpool);                      // lift-off from a charged turbo
+        _tbSpool *= 0.3; _tbBlowCd = 0.9;
+      }
+      _tbPrevThr = thr9;
+      const tN9 = AC.currentTime;
+      // the knock: firing rate and band ride the speed, harder under load
+      dslLfo.frequency.setTargetAtTime(12.5 + sp * 0.16, tN9, 0.1);
+      dslBp.frequency.setTargetAtTime(115 + sp * 0.85, tN9, 0.1);
+      const cl9 = 0.05 + load9 * 0.05 + thr9 * 0.02;
+      dslClatG.gain.setTargetAtTime(cl9, tN9, 0.12);
+      dslLfoG.gain.setTargetAtTime(cl9 * 0.85, tN9, 0.12);
+      // the whine: LOW tune — a deep whistle off boost that climbs to a
+      // scream only as the spool tops out
+      const tf9 = 420 + 2600 * Math.pow(_tbSpool, 1.7);
+      tbOsc.frequency.setTargetAtTime(tf9, tN9, 0.06);
+      tbOsc2.frequency.setTargetAtTime(tf9 * 2.015, tN9, 0.06);
+      tbG.gain.setTargetAtTime(0.075 * Math.pow(_tbSpool, 2.4), tN9, 0.09);
+      tbHissG.gain.setTargetAtTime(0.05 * _tbSpool * _tbSpool * (0.3 + 0.7 * thr9), tN9, 0.12);
+      dslG.gain.setTargetAtTime(0.9, tN9, 0.1);
+    } else if (dslG) {
+      dslG.gain.setTargetAtTime(0.0001, AC.currentTime, 0.12);
+      _tbSpool = Math.max(0, _tbSpool - dt * 2); _tbPrevThr = 0;
+    }
   } else {
     engGain.gain.setTargetAtTime(0.0001, AC.currentTime, 0.08);
+    if (dslG) {
+      // stepping OUT with a charged turbo vents it too — but only a live
+      // walk-away from a LIVE tank (not pause, not death, not a wreck or
+      // a flooded hull: a dead engine has no boost to dump)
+      if (!player.car && state === 'play' && !paused && _tbLastTank && !_tbLastTank.dead && !_tbLastTank.drowned &&
+          _tbPrevThr > 0.5 && _tbSpool > 0.45 && _tbBlowCd <= 0) {
+        dieselBlow(_tbSpool); _tbSpool *= 0.3; _tbBlowCd = 0.9;
+      }
+      dslG.gain.setTargetAtTime(0.0001, AC.currentTime, 0.12);
+      // pause freezes the world — the spool freezes with it
+      if (!paused) { _tbSpool = Math.max(0, _tbSpool - dt * 2); _tbPrevThr = 0; }
+    }
   }
   // the wail rises as the cruiser closes in — and pans from where it drives
   if (sirenGainNode) {
@@ -2344,7 +2460,15 @@ function genCity() {
         corners[ox + ',' + oy] = { x: (lx + 0.5) * TILE, y: (ly + 0.5) * TILE };
       }
     }
-    for (const [a, b] of [['-1,-1', '2,-1'], ['-1,2', '2,2'], ['-1,-1', '-1,2'], ['2,-1', '2,2']]) {
+    // a crosswalk exists ONLY where a road arm actually runs between its
+    // two corners (Tank order): at a T junction's closed side or an
+    // elbow, the corner pair spans plain SIDEWALK — no zebra there, ever
+    const armN9 = tileAt(cx, cy - 1) === T_ROAD;
+    const armS9 = tileAt(cx, cy + 2) === T_ROAD;
+    const armW9 = tileAt(cx - 1, cy) === T_ROAD;
+    const armE9 = tileAt(cx + 2, cy) === T_ROAD;
+    for (const [a, b, ok9] of [['-1,-1', '2,-1', armN9], ['-1,2', '2,2', armS9], ['-1,-1', '-1,2', armW9], ['2,-1', '2,2', armE9]]) {
+      if (!ok9) continue;
       if (corners[a] && corners[b]) {
         const e1 = cwEntry(corners[a].x, corners[a].y);
         const e2 = cwEntry(corners[b].x, corners[b].y);
@@ -2933,6 +3057,9 @@ function mkCar(x, y, dir, kind, driver) {
     color: k.color !== null ? k.color : CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)],
     len: k.len, w: k.w, laneX: x, laneY: y, lastInter: '', keep: false,
     stuck: 0, revT: 0, smokeT: 0, burnT: 0, dead: false, dmgBy: null, deployT: 0,
+    // SEAT BELTS (Tank order): most buckle up; the ones who don't can
+    // meet the windshield. The law and the army always buckle.
+    belted9: driver === 'ai' ? Math.random() < 0.8 : true,
     turret: dirAng(dir), fireT: 0, onFireT: 0, fireBy: null, mesh: null, stolen: false,
     latV: 0, skidding: false, skidT: 0, mods: { eng: 0, grip: 0, arm: 0 }, rental: false,
     // fuel: street cars come part-filled — a jacked ride is a gamble
@@ -4193,6 +4320,7 @@ function updMarks(dt) {
   const foot9 = (ent9) => {
     if (ent9.gDeck != null) return;             // garage decks keep no snow
     if ((ent9.roofH || 0) > 0) return;          // roof walks don't print the street below
+    if (waterAt(ent9.x, ent9.y)) return;        // DEEP water holds no prints (Tank order)
     const px9 = ent9._mkPX === undefined ? ent9.x : ent9._mkPX;
     const py9 = ent9._mkPY === undefined ? ent9.y : ent9._mkPY;
     const d9 = dist(ent9.x, ent9.y, px9, py9);
@@ -4215,6 +4343,7 @@ function updMarks(dt) {
   for (const c9 of cars) {
     if (c9.dead || Math.abs(c9.speed) < 10 || (c9.alt || 0) > 0.5 || c9.kind === 'boat' || c9.kind === 'helo') continue;
     if (c9.gDeck != null) continue;
+    if (waterAt(c9.x, c9.y)) continue;          // DEEP water holds no tracks (Tank order)
     if (c9.kind === 'tank') {
       // TRACK PADS PRINT THE WORLD (Tank order): each side lays its own
       // ladder of pad rungs, spaced by ITS OWN travel — a turning tank
@@ -6819,10 +6948,14 @@ function _bladeMatrix(i) {
 }
 let _shadowDirty = true, _moonSX = 1e9, _moonSZ = 1e9;
 function updWindWorld(dt, t) {
-  // SHADOW STABILITY (Tank: blotchy, blinking): the box SNAPS to an 8-unit
-  // grid — between snaps the shadow camera is rock still, so the texel
-  // grid never crawls. The map still redraws every 2nd frame so moving
-  // cars carry their shadows; a static camera makes that redraw invisible.
+  // SHADOW STABILITY: the box SNAPS to an 8-unit grid — between snaps the
+  // shadow camera is rock still, so the texel grid never crawls. The map
+  // redraws EVERY frame — any every-Nth-frame cadence makes moving
+  // shadows visibly BLINK and is BANNED (Tank rejected it twice). Speed
+  // comes from the pass being cheap, not skipped: the boot merge bakes
+  // statics in district chunks, so the shadow frustum culls the city
+  // down to the few chunks inside the ±160 box instead of rasterizing
+  // the whole baked city every update.
   _shadowDirty = true;
   const fm9 = focus();
   const sx9 = Math.round(fm9.x * RS / 8) * 8, sz9 = Math.round(fm9.y * RS / 8) * 8;
@@ -8577,37 +8710,69 @@ function buildCarMesh(c) {
     // chain path (side view, x/y): ground run front->rear, up and OVER
     // the rear sprocket, top run forward, over and down the front idler,
     // short slope back to the ground. Sampled arcs, closed loop.
-    // the end wheels sit SPACED OFF the road-wheel pack (Tank order): the
-    // chain rising to them makes a near-vertical pad face at each end —
-    // that face is what grabs and CLIMBS obstacles, nose or tail first
-    const IDL9 = { x: 6.85, y: 1.15, r: 1.0 };
-    const SPK9 = { x: -6.85, y: 1.35, r: 1.34 };
+    // the end wheels sit SPACED OFF the road-wheel pack AND ELEVATED
+    // (Tank order): the CENTER casters are the only ground contact — the
+    // whole tank rides their suspension while the front idler and rear
+    // sprocket hang airborne, the chain climbing steeply to each. That
+    // rising face is what grabs and CLIMBS obstacles, nose or tail first.
+    // wrap radii HUG the wheels (Tank order: the track RIDES the front
+    // and rear, never loose): chain inner face = wheel rim exactly
+    // THE PROPER BASELINE (Tank's reference crop) with the ONE ordered
+    // change: the front idler lifted modestly — nothing else rebuilt
+    const IDL9 = { x: 6.85, y: 1.6, r: 0.98 };      // FIXED TO THE BODY at its raised height (Tank
+    const SPK9 = { x: -6.85, y: 1.35, r: 1.2 };     // order) — no suspension; low rear drive, tooth-tight
+    // YZX: yaw FIRST, then pitch and roll in the HULL'S OWN frame — the
+    // default XYZ rolled about the WORLD axis, so the one-sided lean
+    // read backwards at any heading but due east (Tank caught it live)
+    g.rotation.order = 'YZX';
     const gear9 = {
       zc: [0, 0], off: [0, 0], spin: [0, 0], vSide: [0, 0], padD: [0, 0],
       hp: [360, 360], broken: [false, false], seeded: false,
-      sprk: [null, null], idl: [null, null], arms: [[], []],
-      sprkR: SPK9.r, idlR: IDL9.r, spkX: SPK9.x, idlX: IDL9.x, n: 0
+      sprk: [null, null], idl: [null, null], arms: [[], []], rollers9: [[], []],
+      sprkR: SPK9.r, idlR: IDL9.r, spkX: SPK9.x, idlX: IDL9.x,
+      idlY: IDL9.y, spkY: SPK9.y, n: 0                 // ONE source of truth for wheel heights
     };
     // the chain path is a FUNCTION of where the end wheels sit right now
     // (Tank order: the body's rock carries the frame-locked idler and
     // sprocket, and the track re-forms around them) — dI9/dS9 are the
     // idler/sprocket vertical displacements of the moment
-    gear9.mkPath = (dI9, dS9) => {
-      const p9 = [[4.9, 0.16], [-6.4, 0.16]];
-      for (let i9 = 0; i9 <= 8; i9++) {                // rear wrap, through the back
+    // ALLOCATION-FREE path builder (Tank order: fast processing) — fills
+    // a reusable struct in place, zero garbage per frame while rocking.
+    // Ground run at 0.27: pad rubber bottoms at exactly 0.00; long run,
+    // low sprocket wrap, roller-held return, lifted-idler front wrap.
+    gear9.mkPath = (dI9, dS9, out9) => {
+      const o9 = out9 || { pth: [], cum: [], perim: 0 };
+      const P9 = o9.pth;
+      let k9 = 0;
+      const put9 = (x9, y9) => { const e9 = P9[k9] || (P9[k9] = [0, 0]); e9[0] = x9; e9[1] = y9; k9++; };
+      put9(5.5, 0.27); put9(-5.9, 0.27);
+      for (let i9 = 0; i9 <= 8; i9++) {                // rear wrap over the low drive sprocket
         const a9 = -1.21 - (3.5 * i9) / 8;
-        p9.push([SPK9.x + Math.cos(a9) * SPK9.r, SPK9.y + dS9 + Math.sin(a9) * SPK9.r]);
+        put9(SPK9.x + Math.cos(a9) * SPK9.r, SPK9.y + dS9 + Math.sin(a9) * SPK9.r);
       }
-      for (let i9 = 0; i9 <= 5; i9++) {                // front wrap, over and down
-        const a9 = Math.PI / 2 - (Math.PI / 2 + 0.75) * (i9 / 5);
-        p9.push([IDL9.x + Math.cos(a9) * IDL9.r, IDL9.y + dI9 + Math.sin(a9) * IDL9.r]);
+      const yA9 = SPK9.y + dS9 + SPK9.r;
+      const yB9 = IDL9.y + dI9 + IDL9.r;
+      const rT19 = 2.56 + (dS9 * 0.66 + dI9 * 0.34);
+      const rT29 = 2.57 + (dS9 * 0.34 + dI9 * 0.66);
+      put9(-4.55, (yA9 + rT19) / 2 - 0.05);
+      put9(-2.3, rT19);
+      put9(0, (rT19 + rT29) / 2 - 0.08);
+      put9(2.3, rT29);
+      put9(4.55, (rT29 + yB9) / 2 - 0.05);
+      for (let i9 = 0; i9 <= 5; i9++) {                // front wrap over the LIFTED idler
+        const a9 = Math.PI / 2 - (Math.PI / 2 + 1.05) * (i9 / 5);
+        put9(IDL9.x + Math.cos(a9) * IDL9.r, IDL9.y + dI9 + Math.sin(a9) * IDL9.r);
       }
-      const cu9 = [0];
-      for (let i9 = 1; i9 <= p9.length; i9++) {
-        const a9 = p9[i9 - 1], b9 = p9[i9 % p9.length];
-        cu9.push(cu9[i9 - 1] + Math.hypot(b9[0] - a9[0], b9[1] - a9[1]));
+      P9.length = k9;
+      const C9 = o9.cum;
+      C9[0] = 0;
+      for (let i9 = 1; i9 <= k9; i9++) {
+        const a9 = P9[i9 - 1], b9 = P9[i9 % k9];
+        C9[i9] = C9[i9 - 1] + Math.hypot(b9[0] - a9[0], b9[1] - a9[1]);
       }
-      return { pth: p9, cum: cu9, perim: cu9[cu9.length - 1] };
+      C9.length = k9 + 1;
+      o9.perim = C9[k9];
+      return o9;
     };
     const rest9 = gear9.mkPath(0, 0);
     const nLnk9 = 2 * Math.round(rest9.perim / 0.42 / 2);   // even count: pads tile cleanly
@@ -8628,7 +8793,9 @@ function buildCarMesh(c) {
       // they ride the arm, so wheel, shock and body always move together.
       for (let i = 0; i < 7; i++) {
         const arm = new THREE.Group();
-        arm.position.set(-4.65 + i * 1.55, 0.66, zc);
+        // wheel bottom at 0.325 = the chain's inner face on the ground
+        // run — the wheels ride ON the track, never through it
+        arm.position.set(-4.65 + i * 1.55, 0.925, zc);
         const wl = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 2.15, 12), TANK_MATS.wheel);
         wl.rotation.x = Math.PI / 2;
         arm.add(wl);
@@ -8657,7 +8824,7 @@ function buildCarMesh(c) {
       // wheel that drives the whole track
       const spk = new THREE.Group();
       spk.position.set(SPK9.x, SPK9.y, zc);
-      const drum = new THREE.Mesh(new THREE.CylinderGeometry(0.72, 0.72, 2.05, 9), TANK_MATS.wheel);
+      const drum = new THREE.Mesh(new THREE.CylinderGeometry(1.0, 1.0, 2.05, 9), TANK_MATS.wheel);   // full drum: the chain sits ON the wheel, not around a void
       drum.rotation.x = Math.PI / 2;
       spk.add(drum);
       for (const rz of [-0.72, 0.72]) {
@@ -8668,20 +8835,48 @@ function buildCarMesh(c) {
       }
       g.add(spk);
       gear9.sprk[si] = spk;
-      // fender plate above the (taller) top run — the skirt is GONE, the
-      // machinery is the armor now. The panels are LOCKED ONTO THE BODY
-      // (Tank order): they rock with the hull, never touched by the tracks
-      const fd = new THREE.Mesh(new THREE.BoxGeometry(17.2, 0.12, 2.1), TANK_MATS.fender);
-      fd.position.set(0, 2.9, zc);
+      // two FIXED top-side return rollers (Tank order): frame-mounted,
+      // they only TURN — the chain rides over them at proper level
+      for (const [rx9, ry9] of [[-2.3, 2.085], [2.3, 2.095]]) {
+        const rol = new THREE.Group();
+        rol.position.set(rx9, ry9, zc);
+        rol.userData.bx9 = rx9; rol.userData.by9 = ry9;
+        const rw = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.42, 1.9, 9), TANK_MATS.hub);
+        rw.rotation.x = Math.PI / 2;
+        rol.add(rw);
+        g.add(rol);
+        gear9.rollers9[si].push(rol);
+      }
+      // fenders (Tank order): SHORTENED up front, with a panel angled
+      // DOWN welded at the front edge over the idler, and another angled
+      // panel welded at the rear edge — per side, all LOCKED ONTO THE
+      // BODY: they rock with the hull, never touched by the tracks
+      const fd = new THREE.Mesh(new THREE.BoxGeometry(15.3, 0.12, 2.1), TANK_MATS.fender);
+      fd.position.set(-0.65, 2.9, zc);
       hullG.add(fd);
+      const fFront = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.12, 2.1), TANK_MATS.fender);
+      fFront.rotation.z = -0.6;
+      fFront.position.set(7.0 + Math.cos(0.6) * 0.9, 2.9 - Math.sin(0.6) * 0.9, zc);
+      hullG.add(fFront);
+      const fRear = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.12, 2.1), TANK_MATS.fender);
+      fRear.rotation.z = 0.6;
+      fRear.position.set(-8.3 - Math.cos(0.6) * 0.7, 2.9 - Math.sin(0.6) * 0.7, zc);
+      hullG.add(fRear);
     }
     // the DOUBLE chain: one instanced link box per rail slot (2 rails x 2
     // sides) + one instanced rubber pad bridging the rails every 2nd slot
-    const lnkIM9 = new THREE.InstancedMesh(new THREE.BoxGeometry(0.34, 0.11, 0.16), TANK_MATS.tread, nLnk9 * 4);
-    lnkIM9.frustumCulled = false;
+    // culling ON with a hand-set bounding sphere covering the whole loop:
+    // the GPU skips the chain entirely when the tank is off-screen
+    const lnkGeo9 = new THREE.BoxGeometry(0.34, 0.11, 0.16);
+    lnkGeo9.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 1.5, 0), 12);
+    const lnkIM9 = new THREE.InstancedMesh(lnkGeo9, TANK_MATS.tread, nLnk9 * 4);
     g.add(lnkIM9);
-    const padIM9 = new THREE.InstancedMesh(new THREE.BoxGeometry(0.54, 0.22, 1.86), padMat9, nLnk9);   // fat pads, tight gaps (Tank order)
-    padIM9.frustumCulled = false;
+    // fat pads on EVERY slot, overlapping into one CONTINUOUS rubber
+    // band (Tank order: no light under the tank — the ground line is
+    // solid rubber at exactly 0.00)
+    const padGeo9 = new THREE.BoxGeometry(0.54, 0.22, 1.86);
+    padGeo9.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 1.5, 0), 12);
+    const padIM9 = new THREE.InstancedMesh(padGeo9, padMat9, nLnk9 * 2);
     g.add(padIM9);
     gear9.linkIM = lnkIM9;
     gear9.padIM = padIM9;
@@ -9189,7 +9384,9 @@ function buildCarMesh(c) {
   g.userData.wheelRolls = [];
   for (const [dx, dz] of [[L * 0.32, W * 0.5], [L * 0.32, -W * 0.5], [-L * 0.32, W * 0.5], [-L * 0.32, -W * 0.5]]) {
     const steerG = new THREE.Group();
-    steerG.position.set(dx, 0.62, dz);
+    // tire radius 0.64: at rest the RUBBER bottoms out at exactly 0.00
+    // (Tank order — same law as the tank's pads)
+    steerG.position.set(dx, 0.64, dz);
     const rollG = new THREE.Group();
     const tire = new THREE.Mesh(tireGeo, tireMat);
     tire.rotation.x = Math.PI / 2;
@@ -9380,6 +9577,31 @@ function buildCarMesh(c) {
   g.userData.cabMat = cabMat;
   g.userData.bodyMesh = body;
   g.userData.cabMesh = cab;
+  // the tailpipe TIP, in logic px + render height — smoke belongs HERE
+  // (Tank order), not at some approximation past the bumper
+  g.userData.tailTip9 = { x: (-L / 2 - 0.30) / RS, z: 0.7 / RS, h: 0.36 };
+  // BODY ON SPRINGS (Tank order, like the tank): every part that is not
+  // a WHEEL re-hangs on a spring-borne body group — braking dips the
+  // nose, throttle squats the tail, corners roll it — while the tires,
+  // the actual ground contact, stay planted where they are
+  {
+    const bodyG9 = new THREE.Group();
+    const wheelRoots9 = new Set();
+    for (const wr9 of g.userData.wheelRolls || []) {
+      let r9 = wr9;
+      while (r9.parent && r9.parent !== g) r9 = r9.parent;   // rear steer groups too
+      wheelRoots9.add(r9);
+    }
+    for (const ch9 of [...g.children]) if (!wheelRoots9.has(ch9)) bodyG9.add(ch9);
+    g.add(bodyG9);
+    g.userData.bodyG9 = bodyG9;
+    g.userData.wheelsR9 = [...wheelRoots9].filter(w9 => !(g.userData.wheelsF || []).includes(w9));
+    // EACH TIRE is its own contact (Tank order): four corners, each with
+    // its own bump timer — fx +1 front / -1 rear, sz +1 right / -1 left
+    g.userData.corners9 = [...wheelRoots9].map(w9 => ({
+      g: w9, fx: w9.position.x > 0 ? 1 : -1, sz: w9.position.z > 0 ? 1 : -1, t: 0
+    }));
+  }
   return g;
 }
 // ---- crash mechanics on the frame: the metal remembers every hit ----
@@ -9597,10 +9819,15 @@ function updExhaust(dt) {
     c._exT = (c._exT || 0) - dt;
     if (c._exT > 0) continue;
     c._exT = 1 / rate9;
+    // DIRECTLY FROM THE TAILPIPE TIP (Tank order) — the real pipe on the
+    // mesh, not an approximation past the bumper
+    const tp9 = c.mesh && c.mesh.userData.tailTip9;
+    const lx9 = tp9 ? tp9.x : -(c.len / 2 + 3);
+    const lz9 = tp9 ? tp9.z : c.w * 0.22;
     const ca9 = Math.cos(c.angle), sa9 = Math.sin(c.angle);
-    const px9 = c.x - ca9 * (c.len / 2 + 3) - sa9 * c.w * 0.22;
-    const py9 = c.y - sa9 * (c.len / 2 + 3) + ca9 * c.w * 0.22;
-    addPart(px9, py9, 0.5,
+    const px9 = c.x + ca9 * lx9 - sa9 * lz9;
+    const py9 = c.y + sa9 * lx9 + ca9 * lz9;
+    addPart(px9, py9, tp9 ? tp9.h : 0.5,
       -ca9 * 14 + (Math.random() - 0.5) * 8, -sa9 * 14 + (Math.random() - 0.5) * 8,
       1.1 + Math.random() * 0.8,
       0.6 + thr9 * 0.45, 0x8a929c,
@@ -10641,7 +10868,20 @@ function carDamage(c, amt, by) {
   if (godMode && (player.car === c || (c.kind === 'helo' && c.stolen))) return;   // god shields the occupied vehicle and YOUR claimed bird — never police/army property
   c.hp -= amt;
   if (by) c.dmgBy = by;
-  if (c.hp <= 0) explodeCar(c);
+  // WITHIN 10% OF ITS LIFE = DEAD (Tank order): no zombie wrecks limping
+  // on a sliver — the frame gives out
+  const hpMax9 = CAR_KINDS[c.kind].hp + (c.mods ? (c.mods.arm || 0) * 40 : 0);
+  if (c.hp <= hpMax9 * 0.1) explodeCar(c);
+}
+// POLICE RAM RESTRAINT (Tank order): below 6 stars a cruiser ramming the
+// player's vehicle batters it but may NOT total it — ram damage stops at a
+// floor of 25% hp (never under 26 absolute: the fire line is hp<20 "lit
+// for good", and death is 10%). At 6 stars the execution order stands —
+// no floor, they come in for the kill.
+function copRamDmg9(c, amt) {
+  if (c !== player.car || stars() >= 6) return amt;
+  const hpMax9 = CAR_KINDS[c.kind].hp + (c.mods ? (c.mods.arm || 0) * 40 : 0);
+  return Math.max(0, Math.min(amt, c.hp - Math.max(hpMax9 * 0.25, 26)));
 }
 function scare(x, y, r) {
   for (const p of peds) {
@@ -10851,31 +11091,70 @@ function tireGrip(c, dt, gripScale) {
   // sliding tires scrub forward speed (cornering costs momentum)
   c.speed *= Math.max(0, 1 - Math.abs(c.latV) * 0.0015 * dt);
 }
+// THE ONLY FORCED EXIT (Tank order): no seat belt + a high-speed impact
+// to a DEAD STOP = out through the FRONT WINDSHIELD, over the hood. No
+// other impact launches anybody — belted riders stay in their seats.
+function windshield9(c, v9) {
+  if (Math.abs(v9) < 130) return;
+  if (c.driver !== 'ai' && c.driver !== 'cop') return;   // the ghost buckles up
+  if (c.belted9) return;
+  const sgn9 = Math.sign(v9) || 1;
+  const px9 = c.x + Math.cos(c.angle) * sgn9 * (c.len * 0.5 + 8);
+  const py9 = c.y + Math.sin(c.angle) * sgn9 * (c.len * 0.5 + 8);
+  const p9 = mkPed(px9, py9, c.driver === 'cop' ? { cop: true, hp: 25, spd: 78, shirt: 0x20306a } : { hp: 20 });
+  attachPedMesh(p9);
+  peds.push(p9);
+  startRag(p9, Math.cos(c.angle) * sgn9 * Math.abs(v9) * 1.15,
+    Math.sin(c.angle) * sgn9 * Math.abs(v9) * 1.15, Math.abs(v9) * 1.2);
+  sparks(px9, py9);
+  sfx('crash', px9, py9, 60);
+  c.driver = null;
+}
 function moveCar(c, dt) {
   if (!c.drowned && c.kind !== 'boat' && waterAt(c.x, c.y)) {
     c.drowned = true;                                // flooded: the engine locks up for good
     sfx('crash', c.x, c.y, 40);
     if (c === player.car) msg('Engine flooded. She is DONE.', 7);
   }
-  // CURB EDGES (Tank order): the road/sidewalk lip is REAL to tires —
-  // crossing it pops the body up, scrubs a little pace, and kicks the
-  // tank's suspension springs. Grass and lots have no lip.
+  // CURB EDGES (Tank order, rebuilt after the center-point failure): EACH
+  // AXLE samples the ground where ITS TIRES actually sit — the physics
+  // fires the moment the tire row meets the lip, not when some invisible
+  // center point crosses a tile later. Response is per-axle: that axle's
+  // tires ride up and over, the body takes a pitch kick through the
+  // springs at that end and rebounds. No whole-car catch, no dead zone.
   if (c.kind !== 'boat' && c.kind !== 'helo') {
-    const tb9 = tileAt(Math.floor(c.x / TILE), Math.floor(c.y / TILE));
-    const cls9 = tb9 === T_SIDE ? 1 : tb9 === T_ROAD ? 0 : -1;
-    if (cls9 >= 0 && c._curbC9 >= 0 && cls9 !== c._curbC9 && Math.abs(c.speed) > 15) {
-      c.curbT9 = 0.22;
-      c.speed *= 0.965;
-      if (c.kind === 'tank') { c.shockT = 0; c.shockRev = c.speed < 0; c.shockAmp = 0.1; c.rcPV = (c.rcPV || 0) + (cls9 ? 0.5 : -0.35); }
-      if (c === player.car) rumble(0.25, 0.35, 120);
-    }
-    if (cls9 >= 0) c._curbC9 = cls9;
-    if (c.curbT9 > 0) {
-      c.curbT9 -= dt;
-      if (!c.climbT9) {
-        c.curbY9 = Math.sin(Math.PI * Math.max(0, c.curbT9) / 0.22) * (c.kind === 'tank' ? 0.1 : 0.17);
-        if (c.curbT9 <= 0) c.curbY9 = 0;
+    // EVERY TIRE IS ITS OWN CONTACT (Tank order): four corners, each
+    // sampling the ground under ITS OWN tire. The corner that meets the
+    // lip fires alone — its tire rides up, the body takes a pitch AND
+    // roll kick at that corner and rebounds. A square crossing fires
+    // both corners of an axle together and the roll cancels itself; an
+    // angled crossing walks the lip tire by tire.
+    const cca9 = Math.cos(c.angle), csa9 = Math.sin(c.angle);
+    const axO9 = c.len * (c.kind === 'tank' ? 0.42 : 0.32);
+    const latO9 = c.w * 0.5;
+    if (!c._cb49) c._cb49 = [-9, -9, -9, -9];
+    for (let k9 = 0; k9 < 4; k9++) {
+      const fx9 = k9 < 2 ? 1 : -1, sz9 = (k9 % 2) ? 1 : -1;
+      const lx9 = fx9 * axO9, lz9 = sz9 * latO9;
+      const tb9 = tileAt(Math.floor((c.x + cca9 * lx9 - csa9 * lz9) / TILE),
+        Math.floor((c.y + csa9 * lx9 + cca9 * lz9) / TILE));
+      const cls9 = tb9 === T_SIDE ? 1 : tb9 === T_ROAD ? 0 : -1;
+      if (cls9 >= 0 && c._cb49[k9] >= 0 && cls9 !== c._cb49[k9] && Math.abs(c.speed) > 15) {
+        c.speed *= 0.991;                            // a quarter of the old scrub, per tire
+        const dir9 = cls9 ? 1 : -0.8;                // up the lip vs down it
+        if (c.kind === 'tank') {
+          c.shockT = 0; c.shockRev = fx9 < 0; c.shockAmp = 0.2;
+          c.rcPV = (c.rcPV || 0) + fx9 * dir9 * 0.4;
+          c.rcRV = (c.rcRV || 0) - sz9 * dir9 * 0.35;   // that SIDE rises, the hull rolls off it
+        } else {
+          c._bpPV9 = (c._bpPV9 || 0) + fx9 * dir9 * 0.32;
+          c._bpRV9 = (c._bpRV9 || 0) - sz9 * dir9 * 0.3;
+          const cn9 = c.mesh && c.mesh.userData.corners9;
+          if (cn9) for (const q9 of cn9) if (q9.fx === fx9 && q9.sz === sz9) q9.t = 0.22;
+        }
+        if (c === player.car) rumble(0.18, 0.26, 90);
       }
+      if (cls9 >= 0) c._cb49[k9] = cls9;
     }
   }
   if (carHitsSolid(c)) unstickCar(c);
@@ -10898,6 +11177,7 @@ function moveCar(c, dt) {
   // dead stop: bounce
   c.x = px; c.y = py;
   if (Math.abs(c.speed) > 130) {
+    windshield9(c, c.speed);                       // unbelted? meet the glass
     if (c.kind !== 'tank') carDamage(c, Math.abs(c.speed) * 0.06, c.driver === 'player' ? 'p' : null);
     const s9 = c.speed >= 0 ? 1 : -1;
     dentCar(c, c.x + Math.cos(c.angle) * s9 * c.len / 2, c.y + Math.sin(c.angle) * s9 * c.len / 2, Math.abs(c.speed));
@@ -11223,6 +11503,27 @@ function bailDriver(c, gunman) {
   c.driver = null;
 }
 function updTraffic(c, dt) {
+  // DEAD ON ITS SPOT (Tank order): a beaten-to-the-frame car's engine is
+  // SEIZED — the AI has nothing left to drive, the wreck rolls out its
+  // momentum and stays where it stopped. The driver sits tight, and only
+  // bails to leg it once things have been QUIET for a couple of seconds
+  // (nobody steps out into gunfire or flames).
+  if (c.hp <= CAR_KINDS[c.kind].hp * 0.18 && !c.outlaw) {
+    c.speed *= Math.pow(0.02, dt);
+    moveCar(c, dt);
+    if ((c.panicT || 0) <= 0 && !c.onFireT && Math.abs(c.speed) < 6) {
+      c.bailT9 = (c.bailT9 || 0) + dt;
+      if (c.bailT9 > 2.2 && c.driver === 'ai') {
+        const bp9 = mkPed(c.x + Math.cos(c.angle + Math.PI / 2) * 20,
+          c.y + Math.sin(c.angle + Math.PI / 2) * 20);
+        bp9.state = 'flee'; bp9.fleeT = 6; bp9.angle = rndf(0, TAU);
+        attachPedMesh(bp9);
+        peds.push(bp9);
+        c.driver = null;
+      }
+    } else c.bailT9 = 0;
+    return;
+  } else c.bailT9 = 0;
   // a pursued driver plays his personality card once the law closes in
   if (c.outlaw && c.reaction && !c.reacted) {
     c.reactT -= dt;
@@ -11254,7 +11555,12 @@ function updTraffic(c, dt) {
   // non-green axis is a stop line — unless the car is ALREADY inside the
   // box (clear it, never park across the crossing). Outlaws run the red.
   if (!blocked && !c.outlaw && !(c.panicT > 0)) {   // panic runs the red
-    const cbx = colBase(Math.floor(ax / TILE)), cby = rowBase(Math.floor(ay / TILE));
+    // the LAW probe reaches farther than the bumper probe (Tank order):
+    // the stop lands BEFORE the crosswalk stripes, nose clear of the
+    // zebra, so people can pass in front of the stopped car
+    const rlx9 = c.x + Math.cos(c.angle) * (c.len / 2 + 54);
+    const rly9 = c.y + Math.sin(c.angle) * (c.len / 2 + 54);
+    const cbx = colBase(Math.floor(rlx9 / TILE)), cby = rowBase(Math.floor(rly9 / TILE));
     if (cbx >= 0 && cby >= 0 && tlAt(cbx + ',' + cby, c.dir) !== 'g') {
       if (!(colBase(Math.floor(c.x / TILE)) === cbx && rowBase(Math.floor(c.y / TILE)) === cby)) blocked = true;
     }
@@ -11433,11 +11739,15 @@ function fireShell(c, ang, elev) {
     // road wheels from the muzzle end, and the tracks bite the ground
     // the instant it fires: instant resistance plus a recoil shove.
     const rel9 = ang - c.angle;
-    c.rcPV = (c.rcPV || 0) + Math.cos(rel9) * 3.4;   // it SHAKES (Tank order)
-    c.rcRV = (c.rcRV || 0) + Math.sin(rel9) * 2.6;
+    // the recoil SHOVES the hull opposite the muzzle: the far side takes
+    // the weight and squats, the NEAR side LIFTS (Tank order) — firing
+    // forward lifts the nose onto the rear, firing left lifts the left
+    // side onto the right track
+    c.rcPV = (c.rcPV || 0) + Math.cos(rel9) * 2.8;
+    c.rcRV = (c.rcRV || 0) - Math.sin(rel9) * 2.0;
     c.shockT = 0;
     c.shockRev = Math.cos(rel9) < 0;
-    c.shockAmp = 0.4;
+    c.shockAmp = 0.8;                          // full doubled wheel stroke
     c.speed = c.speed * 0.55 - Math.cos(rel9) * 20;
   }
 }
@@ -11552,7 +11862,13 @@ function updArmyTank(c, dt) {
   }
   for (const p of peds) {
     if (p.dead || p.rag || p.cop || p.riding) continue;
-    if (Math.abs(c.speed) > 20 && dist(p.x, p.y, c.x, c.y) < 26) { p.hp -= 500; p.ragBy = false; launchRag(p, c); }
+    if (Math.abs(c.speed) > 8 && dist(p.x, p.y, c.x, c.y) < 26) {
+      // the army tank crushes too — down in place, body stays whole
+      p.hp = 0;
+      killPed(p, false);
+      startRag(p, rndf(-6, 6), rndf(-6, 6), 8);
+      sfx('punch', p.x, p.y, 30);
+    }
   }
 }
 // ---------------------------------------------------------------- taxi fares
@@ -11966,6 +12282,15 @@ function updCutscene(dt) {
 // ---------------------------------------------------------------- police chopper
 let chopper = null;
 let chopperCdT = 0;                          // downed bird: 20s before HQ sends another
+// ONE parked searchlight, LIVE IN THE SCENE FROM BOOT at intensity 0.
+// Adding or removing a light at runtime changes the shader light count and
+// three.js synchronously RECOMPILES every lit material in the city — a
+// multi-second freeze that always landed mid-chase (chopper spawn) or at
+// the bird's explosion (light removed). Fixed pool = constant light count,
+// the same iron rule as the 22 headlights and 18 street lamps.
+const chopperLight9 = new THREE.SpotLight(0xf0f4ff, 0, 110, 0.32, 0.45, 1);
+scene.add(chopperLight9);
+scene.add(chopperLight9.target);
 let lastSeenX = 0, lastSeenY = 0;
 const CH_MAX = 140;   // px/s — slower than road pursuit, but corners mean nothing to it
 function tileHeight(x, y) {
@@ -12045,19 +12370,16 @@ function spawnChopper() {
     x, y, alt: 48, vx: 0, vy: 0, yaw: 0, rotor: 0, rotorSpd: 30, throttle: 1,
     hp: 300, dead: false, spinT: 0, vAlt: 0, leaving: false, homeX: 0, homeY: 0, dmgBy: null,
     mesh: buildChopperMesh(),
-    light: new THREE.SpotLight(0xf0f4ff, 2.4, 110, 0.32, 0.45, 1)
+    light: chopperLight9                     // the parked light — never added/removed
   };
   scene.add(chopper.mesh);
-  scene.add(chopper.light);
-  scene.add(chopper.light.target);
   msg('POLICE CHOPPER INBOUND.', 8);
   console.log('CHOPDBG spawned at ' + Math.round(x) + ',' + Math.round(y));
 }
 function removeChopper() {
   if (!chopper) return;
   scene.remove(chopper.mesh);
-  scene.remove(chopper.light);
-  scene.remove(chopper.light.target);
+  chopperLight9.intensity = 0;               // the light stays in the scene, dark
   chopper = null;
 }
 function chopperDown(by) {
@@ -12437,8 +12759,10 @@ function carCollisions() {
         // near-vertical face, the nose climbs over the center-wheel
         // fulcrum, and the hull's weight crushes the car DOWN until it
         // explodes UNDERNEATH — the frame stays behind.
+        // a CRAWL is enough — reverse speeds are slow, and backing over a
+        // car must climb exactly like rolling over it forward (Tank order)
         if (vict.kind !== 'helo' && vict.kind !== 'boat' && vict.kind !== 'tank'
-          && !vict.crushT9 && Math.abs(tank.speed) > 24) {
+          && !vict.crushT9 && Math.abs(tank.speed) > 12) {
           const ct9 = Math.cos(tank.angle), st9 = Math.sin(tank.angle);
           const lx9 = (vict.x - tank.x) * ct9 + (vict.y - tank.y) * st9;
           // the climbing face must LEAD: contact ahead when rolling
@@ -12447,8 +12771,17 @@ function carCollisions() {
             vict.crushT9 = 0.001;
             vict.crushBy9 = tank;
             tank.climbT9 = 0.001;
-            tank.rcPV = (tank.rcPV || 0) + 1.4;            // the nose rears up
-            tank.shockT = 0; tank.shockRev = tank.speed < 0; tank.shockAmp = 0.16;
+            // ONE-SIDED MOUNT (Tank order): if only one track is on the
+            // object, only THAT side rises — the other stays grounded.
+            // The scripted whole-hull climb fades with off-centeredness;
+            // the per-track elevations carry the rest naturally.
+            const lzT9 = -(vict.x - tank.x) * st9 + (vict.y - tank.y) * ct9;
+            tank.climbCtr9 = 1 - Math.min(1, Math.abs(lzT9) / (tank.w * 0.3));
+            // WHICH END CLIMBS follows the travel: forward lifts the
+            // nose, reverse lifts the REAR (never a rear dive)
+            tank.climbDir9 = Math.sign(tank.speed) || 1;
+            tank.rcPV = (tank.rcPV || 0) + 1.4 * tank.climbDir9;
+            tank.shockT = 0; tank.shockRev = tank.speed < 0; tank.shockAmp = 0.32;
             sfx('crash', vict.x, vict.y, 26);
             if (vict.driver === 'ai' || vict.driver === 'cop') {
               // whoever's inside scrambles out ahead of the treads
@@ -12484,7 +12817,7 @@ function carCollisions() {
           const lx2 = (player.car.x - copC.x) * ca + (player.car.y - copC.y) * sa;
           if (lx2 > copC.len * 0.25 && Math.abs(copC.speed) > 60) {
             copC.ramT = 1.2;
-            carDamage(player.car, 10 + Math.abs(copC.speed) * 0.05, null);
+            carDamage(player.car, copRamDmg9(player.car, 10 + Math.abs(copC.speed) * 0.05), null);
             dentCar(player.car, (copC.x + player.car.x) / 2, (copC.y + player.car.y) / 2, 130 + Math.abs(copC.speed) * 0.6);
             rumble(0.8, 0.5, 300);
             player.car.speed += copC.speed * 0.22;             // the shove
@@ -12496,8 +12829,10 @@ function carCollisions() {
       }
       if (impact > 150 && !at && !bt) {
         const by = a.driver === 'player' || b.driver === 'player' ? 'p' : null;
-        carDamage(a, recvA9 * 0.045, by);
-        carDamage(b, recvB9 * 0.045, by);
+        // a cruiser grinding the player re-lands this EVERY overlapped frame —
+        // below 6 stars the restraint floor keeps that from totaling the car
+        carDamage(a, b.kind === 'cop' ? copRamDmg9(a, recvA9 * 0.045) : recvA9 * 0.045, by);
+        carDamage(b, a.kind === 'cop' ? copRamDmg9(b, recvB9 * 0.045) : recvB9 * 0.045, by);
         dentCar(a, (a.x + b.x) / 2, (a.y + b.y) / 2, recvA9);
         dentCar(b, (a.x + b.x) / 2, (a.y + b.y) / 2, recvB9);
         if (a === player.car || b === player.car) rumble(clamp(impact / 350, 0.3, 1), 0.5, 260);
@@ -12508,6 +12843,12 @@ function carCollisions() {
       // a crush pair stays OVERLAPPED by design — the mutual impact scrub
       // would strangle the tank to a standstill on top of its victim
       if (!crushPair9) {
+        // a light car slamming a heavy mass to a dead stop can put an
+        // unbelted driver through the windshield (Tank order)
+        if (impact > 240) {
+          if (mA9 <= mB9 * 0.5) windshield9(a, a.speed || impact);
+          if (mB9 <= mA9 * 0.5) windshield9(b, b.speed || impact);
+        }
         a.speed *= 0.55; b.speed *= 0.55;
         a.latV *= 0.55; b.latV *= 0.55;
       }
@@ -12650,6 +12991,7 @@ function sayNearestCop(p, line) {
 function pathCrossesRoad(x0, y0, x1, y1) {
   const d = dist(x0, y0, x1, y1);
   const steps = Math.max(1, Math.ceil(d / 24));
+  if (!isFinite(steps)) return false;        // an Infinity distance would spin this loop forever
   for (let i = 1; i <= steps; i++) {
     const t = i / steps;
     if (tileAt(Math.floor((x0 + (x1 - x0) * t) / TILE), Math.floor((y0 + (y1 - y0) * t) / TILE)) === T_ROAD) return true;
@@ -12670,6 +13012,7 @@ function carApproaching(p) {
 function hasLOS(x0, y0, x1, y1) {
   const d = dist(x0, y0, x1, y1);
   const steps = Math.ceil(d / 24);
+  if (!isFinite(steps)) return false;        // an Infinity distance would spin this loop forever
   for (let i = 1; i < steps; i++) {
     const t = i / steps;
     if (solidAtPx(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)) return false;
@@ -15031,7 +15374,7 @@ function update(dt) {
     }
   }
   if (milArmed && islandOfPx(player.x, player.y) !== 3 && Math.floor(player.y / TILE) < MIL.by0) milArmed = false;
-  updEngine();
+  updEngine(dt);
   // deferred recoil from last frame's shot lands NOW — after that shot's
   // reticle was already framed by syncScene — so every bullet impacts under
   // the triangle, and the crosshair still climbs with sustained fire.
@@ -15257,7 +15600,8 @@ function update(dt) {
     player.angle = pc.angle;
     updTrafficLaw(pc, dt);
     if (pc.kind === 'tank') {
-      pc.turret += angDiff(pc.turret, mouseYaw) * Math.min(1, dt * 6);   // mouse aims the turret
+      const ttg9 = pc.turret + angDiff(pc.turret, mouseYaw) * Math.min(1, dt * 6);   // mouse aims the turret...
+      if (turretClear9(pc, ttg9)) pc.turret = ttg9;   // ...but it STALLS against a wall, like real steel
       pc.fireT -= dt;
       if ((mdown || padTankFire) && pc.fireT <= 0) { pc.fireT = 1.1; rumble(0.9, 0.3, 260); fireShell(pc, pc.turret, clamp(-mousePitch, 0, 0.785)); }   // pad: LB fires, RT is gas
     } else if (pc.kind === 'humvee') {
@@ -15400,7 +15744,17 @@ function update(dt) {
   for (const c of cars) {
     if (c.dead) continue;
     if (c.drowned) {
-      c.sink = Math.min(2.8, (c.sink || 0) + dt * 0.9);
+      // HEAVY THINGS DO NOT FLOAT (Tank order): steel goes to the bottom.
+      // Air-filled tires are the ONE exception — an unpunctured set holds
+      // a car bobbing low at the surface (flats9 ends that privilege the
+      // day punctures exist).
+      const heavy9 = c.kind === 'tank' || c.kind === 'helo' || (c.flats9 || 0) > 0;
+      if (heavy9) {
+        c.sink = Math.min(9, (c.sink || 0) + dt * 1.4);
+      } else {
+        c.sink = Math.min(1.5, (c.sink || 0) + dt * 0.9);
+        if (c.sink >= 1.49) c.sink = 1.5 + Math.sin(gtime * 1.7 + c.x * 0.01) * 0.1;   // riding its tires
+      }
       c.speed *= Math.pow(0.1, dt); c.latV *= Math.pow(0.1, dt);
       moveCar(c, dt);                          // drifting dead metal, nothing more
     } else if (c.driver === 'ai') updTraffic(c, dt);
@@ -15431,7 +15785,9 @@ function update(dt) {
       c.smokeT -= dt;
       if (c.smokeT <= 0) {
         c.smokeT = 0.12;
-        addPart(c.x + rndf(-8, 8), c.y + rndf(-8, 8), rndf(1.5, 3), rndf(-10, 10), rndf(-10, 10), rndf(2, 4), rndf(0.6, 1.2), c.hp < 20 ? 0xff8c1a : 0x666666, rndf(1.2, 2.2), c.hp < 20);
+        // a beaten ENGINE smokes through the hood — up front, not from
+        // some random point on the roof
+        addPart(c.x + Math.cos(c.angle) * c.len * 0.32 + rndf(-3, 3), c.y + Math.sin(c.angle) * c.len * 0.32 + rndf(-3, 3), rndf(1.5, 2.4), rndf(-10, 10), rndf(-10, 10), rndf(2, 4), rndf(0.6, 1.2), c.hp < 20 ? 0xff8c1a : 0x666666, rndf(1.2, 2.2), c.hp < 20);
       }
     }
   }
@@ -15468,13 +15824,25 @@ function update(dt) {
     if (p.cop && hc.driver === 'cop') continue;      // police don't squash their own
     const sp = Math.hypot(hc.speed, hc.latV);        // sideways momentum counts
     const tank = hc.kind === 'tank';
-    if (sp > 55 || (tank && sp > 20)) {
+    if (sp > 55 || (tank && sp > 8)) {
       const fresh9 = !p.rag;                         // first contact, not a re-launch
-      p.hp -= tank ? 500 : sp * 0.45;
-      if (hc.driver === 'player' && p.hp <= 0) STATS.pedsRunOver++;
-      p.ragBy = hc.driver === 'player';
-      launchRag(p, hc);
-      hc.speed *= 0.94;
+      if (tank) {
+        // UNDER THE TREADS (Tank order): a tank doesn't launch anyone —
+        // and the body doesn't explode. They drop where the tracks take
+        // them and STAY there; the pads print the blood.
+        p.hp = 0;
+        p.ragBy = hc.driver === 'player';
+        if (hc.driver === 'player') STATS.pedsRunOver++;
+        killPed(p, hc.driver === 'player');
+        startRag(p, rndf(-6, 6), rndf(-6, 6), 8);   // knocked flat in place, no flight
+        sfx('punch', p.x, p.y, 30);
+      } else {
+        p.hp -= sp * 0.45;
+        if (hc.driver === 'player' && p.hp <= 0) STATS.pedsRunOver++;
+        p.ragBy = hc.driver === 'player';
+        launchRag(p, hc);
+        hc.speed *= 0.94;
+      }
       scare(p.x, p.y, 200);
       if (hc.driver === 'player') sayNear(p.x, p.y, 260, CHATTER.pedAlmostHit, 2.6);
       // a HUMAN under your wheels is never a "traffic violation" — witnessed,
@@ -15957,12 +16325,16 @@ function updTankGear9(c, dt, t9) {
     const zcD9 = G9.zc[si9];
     const dI9 = clamp(hullR9.rotation.z * G9.idlX - hullR9.rotation.x * zcD9, -0.5, 1.4);
     const dS9 = clamp(hullR9.rotation.z * G9.spkX - hullR9.rotation.x * zcD9, -0.5, 1.4);
-    G9.idl[si9].position.y = 1.15 + dI9;
-    G9.sprk[si9].position.y = 1.35 + dS9;
+    // heights come from the SAME constants the chain path uses — the
+    // per-frame update once stomped the idler back to a stale hardcoded
+    // 1.15 while the path wrapped at its true height (Tank caught the
+    // track orbiting air above a sunken wheel)
+    G9.idl[si9].position.y = G9.idlY + dI9;
+    G9.sprk[si9].position.y = G9.spkY + dS9;
     if (Math.abs(dI9 - G9._ld9[si9 * 2]) > 0.008 || Math.abs(dS9 - G9._ld9[si9 * 2 + 1]) > 0.008) {
       G9._ld9[si9 * 2] = dI9;
       G9._ld9[si9 * 2 + 1] = dS9;
-      G9.dyn[si9] = G9.mkPath(dI9, dS9);
+      G9.mkPath(dI9, dS9, G9.dyn[si9]);      // in place — zero garbage
       moving9 = true;
     }
     const v9 = G9.broken[si9] ? 0 : c.speed - s9 * om9 * base9;
@@ -15973,6 +16345,19 @@ function updTankGear9(c, dt, t9) {
     G9.spin[si9] -= v9 * RS * dt;                  // ground run flows rearward
     G9.sprk[si9].rotation.z = G9.spin[si9] / G9.sprkR;
     G9.idl[si9].rotation.z = G9.spin[si9] / G9.idlR;
+    for (const rol9 of G9.rollers9[si9]) {         // the return rollers turn with the chain
+      rol9.rotation.z = G9.spin[si9] / 0.42;
+      rol9.position.y = rol9.userData.by9 + hullR9.rotation.z * rol9.userData.bx9 - hullR9.rotation.x * zcD9;
+    }
+  }
+  // LOD (Tank order: high frame rates): reseeding ~460 instance matrices
+  // is the tank's whole CPU bill — full rate up close where the chain
+  // flow reads, third rate at distance, frozen beyond sight of detail
+  const lodD9 = dist(c.x, c.y, player.x, player.y);
+  if (moving9 && G9.seeded && lodD9 > 1500) moving9 = false;
+  else if (moving9 && G9.seeded && lodD9 > 700) {
+    G9._lod9 = ((G9._lod9 || 0) + 1) % 3;
+    if (G9._lod9 !== 0) moving9 = false;
   }
   if (moving9) {
     G9.seeded = true;
@@ -15991,26 +16376,28 @@ function updTankGear9(c, dt, t9) {
           _gm9.setPosition(_gs9.x, _gs9.y, zc9 + rz9);
           G9.linkIM.setMatrixAt(li9++, _gm9);
         }
-        if (k9 % 2 === 0) {                        // rubber pads bridge the rails
-          if (gap9) _gm9.makeScale(0, 0, 0); else _gm9.makeRotationZ(th9);
-          _gm9.setPosition(_gs9.x - _gs9.ty * 0.16, _gs9.y + _gs9.tx * 0.16, zc9);
-          G9.padIM.setMatrixAt(pi9++, _gm9);
-        }
+        // a rubber pad on EVERY slot — the contact band is continuous
+        if (gap9) _gm9.makeScale(0, 0, 0); else _gm9.makeRotationZ(th9);
+        _gm9.setPosition(_gs9.x - _gs9.ty * 0.16, _gs9.y + _gs9.tx * 0.16, zc9);
+        G9.padIM.setMatrixAt(pi9++, _gm9);
       }
     }
     G9.linkIM.instanceMatrix.needsUpdate = true;
     G9.padIM.instanceMatrix.needsUpdate = true;
   }
-  // recoil springs: the hull rocks HARD on the suspension (Tank order:
-  // firing shakes the tank A LOT), rings a few swings, then settles
+  // recoil springs: STRONG shocks (Tank order) — the fire lands a hard
+  // jolt, the stiff springs snap it back and kill the sway fast
   c.rcP = (c.rcP || 0) + (c.rcPV || 0) * dt;
-  c.rcPV = ((c.rcPV || 0) - (c.rcP || 0) * 46 * dt) * Math.pow(0.2, dt);
+  c.rcPV = ((c.rcPV || 0) - (c.rcP || 0) * 70 * dt) * Math.pow(0.06, dt);    // stiffness rolled back (Tank order)
   c.rcR = (c.rcR || 0) + (c.rcRV || 0) * dt;
-  c.rcRV = ((c.rcRV || 0) - (c.rcR || 0) * 46 * dt) * Math.pow(0.2, dt);
+  c.rcRV = ((c.rcRV || 0) - (c.rcR || 0) * 70 * dt) * Math.pow(0.06, dt);
   const hull9 = c.mesh.userData.hullG;
-  hull9.rotation.z = clamp(c.rcP, -0.13, 0.13);
-  hull9.rotation.x = clamp(c.rcR, -0.1, 0.1);
-  hull9.position.y = -Math.min(0.45, Math.abs(c.rcP) * 1.6 + Math.abs(c.rcR) * 1.2);
+  hull9.rotation.z = clamp(c.rcP, -0.085, 0.085);
+  hull9.rotation.x = clamp(c.rcR, -0.07, 0.07);
+  // GROUND CLEARANCE (Tank order): the casters carry the body 0.3 higher
+  // at rest — real daylight between the belly and the road; the squat
+  // spends from that clearance, never below the old floor
+  hull9.position.y = 0.3 - Math.min(0.3, Math.abs(c.rcP) * 1.6 + Math.abs(c.rcR) * 1.2);
   // the shock pulse: fires at the muzzle end of the wheel line and runs
   // to the other, each road wheel bumping in turn
   if (c.shockT !== undefined && c.shockT >= 0) {
@@ -16025,9 +16412,12 @@ function updTankGear9(c, dt, t9) {
   if (c.climbT9) {
     c.climbT9 += dt;
     const tc9 = Math.min(c.climbT9 / 1.1, 1);
-    c.curbY9 = Math.sin(Math.PI * tc9) * 0.85;
-    c.climbPitch9 = Math.sin(Math.PI * Math.min(tc9 * 1.35, 1)) * 0.14;
-    if (!c._climbTip9 && tc9 > 0.5) { c._climbTip9 = true; c.rcPV = (c.rcPV || 0) - 1.5; }   // over the top: the nose drops
+    const cd9 = c.climbDir9 || 1;                  // + forward, - reverse
+    const ctr9 = c.climbCtr9 === undefined ? 1 : c.climbCtr9;   // 1 centered, 0 one-sided
+    c.curbY9 = Math.sin(Math.PI * tc9) * 0.85 * ctr9;
+    // the CLIMBING end rises: nose up going forward, REAR up backing in
+    c.climbPitch9 = Math.sin(Math.PI * Math.min(tc9 * 1.35, 1)) * 0.14 * cd9 * ctr9;
+    if (!c._climbTip9 && tc9 > 0.5) { c._climbTip9 = true; c.rcPV = (c.rcPV || 0) - 1.5 * cd9 * ctr9; }   // over the top: the climbing end drops
     if (tc9 >= 1) { c.climbT9 = 0; c._climbTip9 = false; c.curbY9 = 0; c.climbPitch9 = 0; }
   }
   // NATURAL ATTITUDE (Tank order): each track rides ITS OWN elevation
@@ -16047,18 +16437,32 @@ function updTankGear9(c, dt, t9) {
   c.endH9[0] = Math.max(0, c.endH9[0] - dt * 3);
   c.endH9[1] = Math.max(0, c.endH9[1] - dt * 3);
   if (c._rideY9 > 0.02) c.curbY9 = Math.max(c.curbY9 || 0, c._rideY9);
+  else if (!c.climbT9 && (c.curbT9 || 0) <= 0) c.curbY9 = 0;   // fully settled: BACK ON THE GROUND, no residue
   const pat9 = Math.min(1, Math.abs(c.speed) / 110);
   for (let si9 = 0; si9 < 2; si9++)
     for (let w9 = 0; w9 < 7; w9++) {
-      let y9 = 0.66;
+      let y9 = 0.925;                        // resting ON the chain's inner face
       if (c.shockT >= 0) {
         const ord9 = c.shockRev ? w9 : 6 - w9;
         const tp9 = c.shockT - ord9 * 0.045;
         if (tp9 > 0) y9 += Math.sin(Math.min(tp9 * 18, Math.PI)) * Math.exp(-tp9 * 5.5) * (c.shockAmp || 0.3);
       }
-      if (pat9 > 0.02) y9 += Math.sin(t9 * 15 + w9 * 1.7 + si9 * 2.4) * 0.028 * pat9;
-      G9.arms[si9][w9].position.y = y9;
+      if (pat9 > 0.02) y9 += Math.sin(t9 * 15 + w9 * 1.7 + si9 * 2.4) * 0.056 * pat9;
+      // WHEEL TRAVEL x2 (Tank order) — the stroke lives in the casters,
+      // capped so a wheel never buries into the hull
+      G9.arms[si9][w9].position.y = Math.min(y9, 1.47);
     }
+}
+// a traversing turret STOPS against a wall (Tank order — his turret was
+// sweeping its bustle and barrel clean through buildings): the muzzle tip
+// and the bustle rear must both stay out of solid, building-height tiles
+function turretClear9(c, ang9) {
+  for (const r9 of [41.6, -16]) {
+    const px9 = c.x + Math.cos(ang9) * r9, py9 = c.y + Math.sin(ang9) * r9;
+    const ix9 = Math.floor(px9 / TILE), iy9 = Math.floor(py9 / TILE);
+    if (inGrid(ix9, iy9) && solid[idx(ix9, iy9)] === 1 && heightMap[idx(ix9, iy9)] > 3.5) return false;
+  }
+  return true;
 }
 function trackHit9(c, hx, hy, dmg) {
   // TRACK HP (Tank order): a hit landing on either track strip eats that
@@ -16163,6 +16567,34 @@ function syncScene(dt, t) {
     }
     if (c.mesh.userData.turret) c.mesh.userData.turret.rotation.y = -(c.turret - c.angle);
     if (c.kind === 'tank') updTankGear9(c, dt, t);   // chains, springs, shock
+    // BODY ON SPRINGS (Tank order): the shell answers the driving — the
+    // targets come from real accel and yaw, the springs chase them, the
+    // wheels never move. Impacts arrive for free as one-frame dv spikes.
+    const bG9 = c.mesh.userData.bodyG9;
+    if (bG9 && dt > 0) {
+      const dv9 = c._bpV9 === undefined ? 0 : (c.speed - c._bpV9) / dt;
+      c._bpV9 = c.speed;
+      const om29 = c._bpA9 === undefined ? 0 : angDiff(c._bpA9, c.angle) / dt;
+      c._bpA9 = c.angle;
+      const pT9 = clamp(dv9 * 0.0004, -0.055, 0.055);                                  // + = nose up under throttle
+      const rT9 = clamp(-om29 * c.speed * 0.00016 - (c.latV || 0) * 0.0012, -0.05, 0.05);   // lean OUT of the corner
+      // STIFF street suspension (Tank order): lifting off the gas gets a
+      // firm settle, not a nosedive — doubled rate, heavy damping
+      c._bpPV9 = ((c._bpPV9 || 0) + (pT9 - (c._bpP9 || 0)) * 200 * dt) * Math.pow(0.006, dt);
+      c._bpP9 = (c._bpP9 || 0) + c._bpPV9 * dt;
+      c._bpRV9 = ((c._bpRV9 || 0) + (rT9 - (c._bpR9 || 0)) * 200 * dt) * Math.pow(0.006, dt);
+      c._bpR9 = (c._bpR9 || 0) + c._bpRV9 * dt;
+      bG9.rotation.z = c._bpP9;
+      bG9.rotation.x = c._bpR9;
+      bG9.position.y = -Math.min(0.2, Math.abs(c._bpP9) * 0.9 + Math.abs(c._bpR9) * 0.7);
+      // curbs arrive through EACH TIRE (Tank order): only the corner that
+      // took the lip rides up 0.16 — the lip's own height — and settles
+      const cn9 = c.mesh.userData.corners9;
+      if (cn9) for (const q9 of cn9) if (q9.t > 0) {
+        q9.t -= dt;
+        q9.g.position.y = 0.64 + Math.sin(Math.PI * Math.max(0, q9.t) / 0.22) * 0.16;
+      }
+    }
     if (c.mesh.userData.hmvTurret) {
       c.mesh.userData.hmvTurret.rotation.y = -((c.turret === undefined ? c.angle : c.turret) - c.angle);
       c.mesh.userData.hmvGun.rotation.z = c.tpitch || 0;
@@ -18398,6 +18830,25 @@ if (location.hash === '#trafficlaw') {
   spawnBullet(pc9.x - 20, pc9.y, 900, 0, 0.5, 10, 8, 'p', 2, 0);
   for (let i9 = 0; i9 < 15; i9++) { update(1 / 60); syncScene(1 / 60); pc9.mesh.updateMatrixWorld(true); }
   ck('directHitDriverBolts', (pc9.panicT || 0) > 0 && pc9.pullover === false);
+  // LAWFUL STOP (Tank order): an AI car at a red halts with its nose
+  // CLEAR of the zebra — people can pass in front of it
+  pcar.x = (K[0] + 40) * TILE;                     // clear the approach lane
+  setT(9);                                          // EW red
+  const zc9 = mkCar((K[0] - 5) * TILE, lane, 0, 'sedan', 'ai');
+  attachCarMesh(zc9); cars.push(zc9);
+  zc9.speed = 90;
+  for (let i9 = 0; i9 < 300; i9++) updTraffic(zc9, 1 / 60);
+  const bandStart9 = (K[0] - 0.5) * TILE - 7.6;    // west crosswalk's near edge
+  ck('stopsShortOfTheZebra', zc9.speed < 3 && zc9.x + zc9.len / 2 < bandStart9 - 1);
+  zc9.dead = true;
+  // and NO zebra was ever painted on concrete: every crosswalk segment's
+  // midpoint must be ROAD — T junction closed sides and elbows are bare
+  let zebraOnConcrete9 = 0;
+  for (const cw9 of crosswalks) for (const to9 of cw9.to) {
+    const mx9 = (cw9.x + to9.x) / 2, my9 = (cw9.y + to9.y) / 2;
+    if (tileAt(Math.floor(mx9 / TILE), Math.floor(my9 / TILE)) !== T_ROAD) zebraOnConcrete9++;
+  }
+  ck('noZebraOnConcrete', zebraOnConcrete9 === 0);
   // REAL crews: officers drive cruisers, soldiers drive military iron
   ck('cruisersCrewedByPolice', pcop9.mesh.userData.figDress === 'cop');
   ck('civiliansStayCivilian', pc9.mesh.userData.figDress === 'civ');
@@ -19324,6 +19775,27 @@ if (location.hash === '#perf') {
       ' flatCasters=' + flat + ' callsWithShadowPass=' + c1 + ' callsWithout=' + c2 +
       ' shadowPassCalls=' + (c1 - c2) + ' tris=' + Math.round(t1 / 1000) + 'k | ' +
       [...mats.entries()].sort((a, b) => b[1] - a[1]).map(e9 => e9[0] + 'x' + e9[1]).join(' '));
+    // A/B: the DISTRICT CHUNKING is the shadow-cost fix — same pixels,
+    // the passes just stop rasterizing the whole baked city. OFF below
+    // reproduces the pre-chunk routing (un-cullable merged statics).
+    // Every frame redraws the shadow, exactly like the live game.
+    const glC9 = renderer.getContext();
+    const pxW9 = 128, pxA9 = new Uint8Array(pxW9 * pxW9 * 4), pxB9 = new Uint8Array(pxW9 * pxW9 * 4);
+    const pxX9 = (glC9.drawingBufferWidth - pxW9) >> 1, pxY9 = (glC9.drawingBufferHeight - pxW9) >> 1;
+    for (const mm9 of mergedStatics9) mm9.frustumCulled = false;
+    let tAB9 = performance.now();
+    for (let i9 = 0; i9 < 60; i9++) { _shadowDirty = true; renderGPU(); }
+    const msOff9 = (performance.now() - tAB9) / 60;
+    glC9.readPixels(pxX9, pxY9, pxW9, pxW9, glC9.RGBA, glC9.UNSIGNED_BYTE, pxA9);
+    for (const mm9 of mergedStatics9) mm9.frustumCulled = true;
+    tAB9 = performance.now();
+    for (let i9 = 0; i9 < 60; i9++) { _shadowDirty = true; renderGPU(); }
+    const msOn9 = (performance.now() - tAB9) / 60;
+    glC9.readPixels(pxX9, pxY9, pxW9, pxW9, glC9.RGBA, glC9.UNSIGNED_BYTE, pxB9);
+    let pxD9 = 0;
+    for (let i9 = 0; i9 < pxA9.length; i9++) if (pxA9[i9] !== pxB9[i9]) pxD9++;
+    console.log('PERFCHUNK renderMsUnchunked=' + msOff9.toFixed(2) + ' renderMsChunked=' + msOn9.toFixed(2) +
+      ' centerPatchIdentical=' + (pxD9 === 0) + ' diffBytes=' + pxD9);
     // CPU side: where the main-thread milliseconds actually go
     let tU9 = 0, tR9 = 0, tH9 = 0;
     const N9 = 180;
@@ -19353,8 +19825,8 @@ if (location.hash === '#perf') {
       w9.onerror = e9 => console.log('PERFWRK error: ' + e9.message);
       w9.postMessage(21);
     } catch (e9) { console.log('PERFWRK blocked: ' + e9.message); }
-  }, 1500);
-}
+  }, 300);   // BEFORE the frame-budget block's 400ms fleet spawn — this
+}            // census must see the clean city, not 23 test vehicles + wrecks
 if (location.hash === '#cores') {
   // NUVOLA CORES receipt (Tank order: use the CPU cores to extend
   // potential): the worker pool mirrors the tile grid and runs pursuit
@@ -20822,6 +21294,165 @@ if (location.hash === '#sfxcheck') {
   };
   setTimeout(step9, 600);
 }
+if (location.hash === '#diesel') {
+  // TANK DIESEL receipt: the rig builds on boarding, the deep idle is
+  // audible, holding FULL throttle against a pinned hull (max load — a
+  // brake-stand) charges the spool until the whine sits in scream range,
+  // lift-off fires the wastegate blow-by EXACTLY once and dumps the spool,
+  // and stepping out fades the whole rig. REAL-TIME run — the spool and
+  // the meters ride the real clock; renderer off so they get main-thread
+  // time. Mechanics only — the MIX is judged by Tank's ears in game.
+  window._noRender = true;
+  startGame();
+  godMode = true;
+  radioOn = false;                       // the meter must hear the RIG, not the radio
+  audioInit();
+  if (!AC) { console.log('DSLDBG acLive=false fails=1'); } else {
+  AC.resume();
+  const anD = AC.createAnalyser();       // tapped onto dslG once the rig exists —
+  let anDOn = false;                     // rig-only signal, honest idle metering
+  const rmsD = () => { const b = new Float32Array(anD.fftSize); anD.getFloatTimeDomainData(b); let s = 0; for (const v of b) s += v * v; return Math.sqrt(s / b.length); };
+  let dslFails = 0;
+  const RDS = [], ckDS = (n9, v9) => { RDS.push(n9 + '=' + v9); if (!v9) dslFails++; };
+  const tkD = mkCar(player.x + 40, player.y, 0, 'tank', null);
+  tkD.keep = true; attachCarMesh(tkD); cars.push(tkD);
+  tkD.driver = 'player'; player.car = tkD;
+  const pinD = setInterval(() => { tkD.speed = 0; }, 50);   // brake-stand: full throttle, zero pace = max load
+  setTimeout(() => {
+    ckDS('rigBuilt', !!dslG && !!tbOsc && !!dslLfo && !!tbHissG);
+    ckDS('idleSpoolDown', _tbSpool < 0.15);
+    if (dslG && !anDOn) { dslG.connect(anD); anDOn = true; }
+    let idlePk = 0;
+    const ivD = setInterval(() => { idlePk = Math.max(idlePk, rmsD()); }, 25);
+    setTimeout(() => {
+      clearInterval(ivD);
+      RDS.push('idlePk=' + idlePk.toFixed(4));
+      ckDS('idleAudible', idlePk > 0.003);
+      keys.KeyW = true;                                     // full throttle, held
+      setTimeout(() => {
+        ckDS('spoolCharged', _tbSpool > 0.7);
+        ckDS('whineInScreamRange', !!tbOsc && tbOsc.frequency.value > 1800);
+        ckDS('whineLoud', !!tbG && tbG.gain.value > 0.03);
+        ckDS('knockHarderUnderLoad', !!dslClatG && dslClatG.gain.value > 0.075);
+        const blows0 = _tbBlowN;
+        keys.KeyW = false;                                  // lift-off
+        setTimeout(() => {
+          ckDS('blowByFiredOnce', _tbBlowN === blows0 + 1);
+          ckDS('spoolDumped', _tbSpool < 0.45);
+          player.car = null; tkD.driver = null;             // step out
+          clearInterval(pinD);
+          setTimeout(() => {
+            ckDS('rigFadedOnExit', !!dslG && dslG.gain.value < 0.01);
+            ckDS('spoolUnwound', _tbSpool < 0.1);
+            console.log('DSLDBG ' + RDS.join(' ') + ' fails=' + dslFails);
+          }, 900);
+        }, 500);
+      }, 3000);
+    }, 700);
+  }, 600);
+  }
+}
+if (location.hash === '#pickupvis') {
+  // PICKUP VISIBILITY receipt (Tank: collected items stayed standing —
+  // only the beam obeyed .visible): the boot merge/freeze must leave
+  // pickup bodies LIVE inside pk.mesh so the whole group hides on
+  // collect, shows on respawn, and spins. Runs after the boot IIFE, so
+  // it sees the world exactly as the merge left it.
+  window._noRender = true;
+  startGame();
+  godMode = true;
+  let pvFails = 0;
+  const RPV = [], ckPV = (n9, v9) => { RPV.push(n9 + '=' + v9); if (!v9) pvFails++; };
+  const pks9 = pickups.filter(p9 => !p9.temp && p9.mesh);
+  ckPV('worldPickupsExist', pks9.length > 50);
+  ckPV('allBodiesLive', pks9.every(p9 => p9.mesh.children.length >= 2));
+  ckPV('allUnfrozen', pks9.every(p9 => p9.mesh.children.every(c9 => c9.matrixAutoUpdate !== false)));
+  ckPV('armoryBodiesLive', armoryPicks.every(a9 => a9.mesh && a9.mesh.children.length > 0));
+  const pk9 = pks9.find(p9 => p9.type !== 'star');
+  const spin0 = pk9 ? pk9.mesh.children[0].rotation.y : 0;
+  player.car = null;
+  if (pk9) { player.x = pk9.x; player.y = pk9.y; }
+  update(1 / 60);
+  ckPV('collected', !!pk9 && pk9.active === false);
+  ckPV('wholeGroupHidden', !!pk9 && pk9.mesh.visible === false);
+  ckPV('spunWhileActive', !!pk9 && pk9.mesh.children[0].rotation.y !== spin0);
+  if (pk9) pk9.t = 0.001;
+  update(1 / 60);
+  ckPV('respawnShowsBody', !!pk9 && pk9.active === true && pk9.mesh.visible === true);
+  console.log('PKVDBG ' + RPV.join(' ') + ' fails=' + pvFails);
+}
+if (location.hash === '#choplight') {
+  // FIXED-LIGHT-COUNT receipt (Tank: freezes at hard impacts/explosions,
+  // worst when police ram the rear): the chopper spawn used to scene.add
+  // a NEW SpotLight — one light-count change = three.js recompiling every
+  // lit material in the city, a multi-second stall landing exactly when
+  // the ram's heat spike summons the bird (and again when it dies). Now
+  // ONE searchlight is parked in the scene from boot. Also proves the
+  // non-finite guards: a NaN crash coordinate must not throw (an uncaught
+  // throw inside update() kills the rAF loop = permanent freeze), and an
+  // Infinity distance must not spin the LOS/road marches.
+  window._noRender = true;
+  startGame();
+  godMode = true;
+  audioInit();
+  let clFails = 0;
+  const RCL = [], ckCL = (n9, v9) => { RCL.push(n9 + '=' + v9); if (!v9) clFails++; };
+  let lights0 = 0;
+  scene.traverse(o9 => { if (o9.isLight) lights0++; });
+  heat = 4;                                  // a real chase — below 3 stars the game sends the bird home
+  spawnChopper();
+  let lights1 = 0;
+  scene.traverse(o9 => { if (o9.isLight) lights1++; });
+  ckCL('spawnAddsNoLight', lights1 === lights0);
+  ckCL('parkedLightReused', chopper.light === chopperLight9);
+  update(1 / 60); syncScene(1 / 60, 1);
+  ckCL('beamOnWhileAlive', chopperLight9.intensity > 2);
+  removeChopper();
+  let lights2 = 0;
+  scene.traverse(o9 => { if (o9.isLight) lights2++; });
+  ckCL('removeDropsNoLight', lights2 === lights0);
+  ckCL('beamDarkWhenGone', chopperLight9.intensity === 0);
+  let threw9 = false;
+  try { sfx('crash', NaN, NaN); sfx('boom', Infinity, -Infinity); } catch (e9) { threw9 = true; }
+  ckCL('nanSoundNoThrow', !threw9);
+  ckCL('infLosBounded', hasLOS(0, 0, Infinity, 0) === false);
+  ckCL('infRoadBounded', pathCrossesRoad(0, 0, Infinity, 0) === false);
+  console.log('CHLTDBG ' + RCL.join(' ') + ' fails=' + clFails);
+}
+if (location.hash === '#ramlaw') {
+  // POLICE RAM RESTRAINT receipt (Tank: 2-4 star cruisers were ramming his
+  // vehicle until it BLEW UP — that treatment is reserved for 6 stars):
+  // a cruiser grinds the player's sedan through the REAL carCollisions()
+  // branch, 400 violent closings per phase. Below 6 stars the hp floors
+  // above the fire line and the car survives; at 6 stars it executes.
+  // Heat and cop hp are re-pinned every pass (the impact branch itself
+  // adds heat, and a dead cruiser's explosion would muddy the phase).
+  window._noRender = true;
+  startGame();
+  let rlFails = 0;
+  const RRL = [], ckRL = (n9, v9) => { RRL.push(n9 + '=' + v9); if (!v9) rlFails++; };
+  const pvR = mkCar(player.x + 200, player.y, 0, 'sedan', 'player');
+  pvR.keep = true; attachCarMesh(pvR); cars.push(pvR); player.car = pvR;
+  const cpR = mkCar(player.x + 160, player.y, 0, 'cop', null);
+  cpR.keep = true; cpR.driver = 'cop'; attachCarMesh(cpR); cars.push(cpR);
+  const hpMaxR = CAR_KINDS.sedan.hp;
+  const grind9 = (n9) => {
+    for (let i9 = 0; i9 < n9 && !pvR.dead; i9++) {
+      cpR.x = pvR.x - 40; cpR.y = pvR.y; cpR.angle = 0; cpR.hp = 99999;
+      cpR.speed = 150; pvR.speed = -150;
+      carCollisions();
+    }
+  };
+  for (let r9 = 0; r9 < 40 && !pvR.dead; r9++) { heat = 3; grind9(10); }
+  ckRL('lowWantedBattered', pvR.hp < hpMaxR * 0.9);
+  ckRL('lowWantedNotTotaled', !pvR.dead);
+  ckRL('flooredAboveFire', pvR.hp >= Math.max(hpMaxR * 0.25, 26) - 0.01);
+  ckRL('notBurning', !(pvR.onFireT > 0));
+  heat = 6.5;
+  for (let r9 = 0; r9 < 40 && !pvR.dead; r9++) { heat = 6.5; grind9(10); }
+  ckRL('sixStarsExecutes', pvR.dead === true);
+  console.log('RAMDBG ' + RRL.join(' ') + ' fails=' + rlFails);
+}
 if (location.hash === '#rambar') {
   // push-bar receipt: absorbs frontal hits, bends, tears off at 0 HP,
   // and only THEN does the cruiser's nose crumple
@@ -20968,7 +21599,20 @@ if (location.hash === '#tankphys') {
     attachCarMesh(tk9); cars.push(tk9);
     const G9 = tk9.mesh.userData.gear9;
     ckT('rearSprocketDrives', !!G9 && G9.sprkR > G9.idlR);
-    ckT('doubleChainBothSides', !!G9 && G9.linkIM.count === G9.n * 4 && G9.padIM.count === G9.n && G9.n > 60);
+    ckT('doubleChainBothSides', !!G9 && G9.linkIM.count === G9.n * 4 && G9.padIM.count === G9.n * 2 && G9.n > 60);
+    // the front-mounted idler hangs ELEVATED off the frame (Tank order):
+    // its rim never touches the ground — the suspension carries it
+    ckT('frontIdlerRidesElevated', G9.idl[0].position.y - 0.8 > 0.3);
+    // two return rollers per side hold the run at proper level, and the
+    // chain path passes exactly over their crowns
+    ckT('returnRollersHoldTheLine', G9.rollers9[0].length === 2 && G9.rollers9[1].length === 2
+      && G9.dyn[0].pth.some(p9 => Math.abs(p9[0] + 2.3) < 0.01 && Math.abs(p9[1] - 2.56) < 0.03));
+    // ONLY the tracks touch the world: pad rubber bottoms out at exactly
+    // 0.00, the wheels ride the chain's inner face, and the collision
+    // envelope's width IS the tracks' outer faces
+    ckT('padsAreTheGroundContact', Math.abs(G9.dyn[0].pth[0][1] - 0.16 - 0.11) < 1e-9);
+    ckT('wheelsRideTheChain', Math.abs(G9.arms[0][0].position.y - 0.6 - (G9.dyn[0].pth[0][1] + 0.055)) < 1e-9);
+    ckT('contactEnvelopeIsTheTracks', Math.abs((Math.abs(G9.zc[0]) + 0.95) / RS - tk9.w / 2) < 0.8);
     // straight run: both chains flow together, forward
     tk9.speed = 100;
     updTankGear9(tk9, 1 / 60, 1);
@@ -21006,8 +21650,13 @@ if (location.hash === '#tankphys') {
     updTankGear9(tk9, 1 / 60, 1.08);
     ckT('rockCarriesTheEndWheels', G9.idl[0].position.y > 1.2 && G9.sprk[0].position.y < 1.34);
     tk9.rcPV = 0; tk9.rcRV = 0;
+    // firing LEFT: the left side LIFTS, the right track takes the weight
+    // (positive roll = lean right). Firing right mirrors it exactly.
+    fireShell(tk9, tk9.angle - Math.PI / 2, 0);
+    const leftLifts9 = tk9.rcRV > 0.5;
+    tk9.rcRV = 0;
     fireShell(tk9, tk9.angle + Math.PI / 2, 0);
-    ckT('traverseShotRolls', Math.abs(tk9.rcRV) > 0.5);
+    ckT('traverseShotRolls', leftLifts9 && tk9.rcRV < -0.5);
     // spike the test rounds — a live shell would land on the crush victim
     for (const s9 of shells) { s9.done = true; if (s9.mesh) { s9.mesh.visible = false; s9.mesh = null; } }
     // TRACK HP: a low LEFT-side hit breaks that chain — no power, a
@@ -21085,6 +21734,46 @@ if (location.hash === '#tankphys') {
     ckT('tracksRideTheVehicle', ride9);
     ckT('weightBlowsItUnderTheHull', vc9.dead && cg9 < 300);
     ckT('frameLingersFlattened', !!vc9.mesh && vc9.mesh.visible === true && vc9.wreckT9 > 15 && vc9.mesh.scale.y < 0.8);
+    // REVERSE CLIMB (Tank order): backing into a car at a CRAWL mounts it
+    // exactly like rolling forward — no dead stop against the bumper
+    const rv9 = mkCar(tk9.x - 55, tk9.y, 0, 'sedan', null);
+    attachCarMesh(rv9); cars.push(rv9);
+    tk9.angle = 0; tk9._gpa9 = 0; tk9.speed = -30; tk9.climbT9 = 0;
+    update(1 / 60);
+    ckT('reverseCrawlClimbsToo', rv9.crushT9 > 0 && !rv9.dead);
+    // PEOPLE GO UNDER A TANK (Tank order): taken down where they stand,
+    // never launched airborne off the bow
+    const pv9 = mkPed(tk9.x + 45, tk9.y, { spd: 0 });
+    attachPedMesh(pv9); peds.push(pv9);
+    const pvx9 = pv9.x, pvy9 = pv9.y;
+    const gb09 = gibs.length;
+    tk9.angle = 0; tk9._gpa9 = 0; tk9.speed = 40;
+    let pg9 = 0;
+    while (!pv9.dead && pg9++ < 90) update(1 / 60);
+    ckT('underTheTreadsNeverLaunched', pv9.dead && pg9 < 90
+      && dist(pv9.x, pv9.y, pvx9, pvy9) < 30 && gibs.length === gb09);
+    // backing in, the REAR rises — pitch goes nose-DOWN, never a rear dive
+    updTankGear9(tk9, 1 / 60, 1.3);
+    updTankGear9(tk9, 1 / 60, 1.32);
+    ckT('reverseClimbLiftsTheRear', tk9.climbDir9 === -1 && tk9.climbPitch9 < 0);
+    rv9.dead = true; rv9.wreckT9 = 0;
+    // ONE-SIDED MOUNT: right track up on a car — the LEFT track stays on
+    // the ground; only the mounted side rises (pose = lift + roll about
+    // the grounded track, checked as world math)
+    const vs9 = mkCar(tk9.x + 55, tk9.y + 9, 0, 'sedan', null);
+    attachCarMesh(vs9); cars.push(vs9);
+    tk9.angle = 0; tk9._gpa9 = 0; tk9.speed = 55; player.car = tk9;
+    update(1 / 60);
+    const sided9 = vs9.crushT9 > 0 && (tk9.climbCtr9 || 0) < 0.35;
+    for (let i9 = 0; i9 < 36; i9++) { update(1 / 60); syncScene(1 / 60, 8 + i9 * 0.02); }
+    const leftY9 = (tk9.curbY9 || 0) + Math.sin(tk9.mesh.rotation.x) * 2.8;
+    ckT('oneSidedMountKeepsLeftGrounded', sided9 && (tk9.curbY9 || 0) > 0.15
+      && Math.abs(leftY9) < 0.3 && tk9.mesh.rotation.x < -0.02);
+    // and the attitude axes FOLLOW THE HULL at every heading — yaw is
+    // applied first, roll/pitch live in the hull's own frame (the world-
+    // axis default read BACKWARDS at any heading but due east)
+    ckT('attitudeAxesFollowTheHull', tk9.mesh.rotation.order === 'YZX');
+    vs9.dead = true; vs9.wreckT9 = 0; player.car = null;
     // curb edges: lips exist citywide, bump tires, kick the tank springs
     ckT('curbLipsBuilt', curbLipN9 > 200);
     let cbx9 = -1, cby9 = -1;
@@ -21094,17 +21783,229 @@ if (location.hash === '#tankphys') {
     attachCarMesh(cc9); cars.push(cc9);
     cc9.speed = 60; cc9.angle = 0;
     let mg9 = 0;
-    while (!(cc9.curbT9 > 0) && mg9++ < 120) moveCar(cc9, 1 / 60);
-    ckT('curbLipBumpsTheTires', cbx9 > 0 && cc9.curbT9 > 0 && mg9 < 120);
+    const cnn9 = cc9.mesh.userData.corners9;
+    const fArm9 = () => cnn9.some(q9 => q9.fx === 1 && q9.t > 0);
+    const rArm9 = () => cnn9.some(q9 => q9.fx === -1 && q9.t > 0);
+    while (!fArm9() && mg9++ < 120) moveCar(cc9, 1 / 60);
+    // the FRONT tires fire first — at THEIR positions, before the rears
+    const fFirst9 = fArm9() && !rArm9();
+    let mg29 = 0;
+    while (!rArm9() && mg29++ < 90) moveCar(cc9, 1 / 60);
+    ckT('curbLipBumpsTheTires', cbx9 > 0 && fFirst9 && rArm9() && mg9 < 120);
     const tt9 = mkCar((cbx9 + 0.5) * TILE, (cby9 + 0.5) * TILE, 0, 'tank', null);
     attachCarMesh(tt9); cars.push(tt9);
-    tt9.speed = 60; tt9.angle = 0; tt9.shockT = -1;
+    tt9.speed = 60; tt9.angle = 0; tt9.shockT = -1; tt9.rcPV = 0;
     let mh9 = 0;
-    while (!(tt9.curbT9 > 0) && mh9++ < 120) moveCar(tt9, 1 / 60);
-    ckT('curbKicksTheTankSprings', tt9.curbT9 > 0 && tt9.shockT >= 0 && tt9.shockAmp === 0.1);
+    while (!(tt9.shockT >= 0) && mh9++ < 120) moveCar(tt9, 1 / 60);
+    ckT('curbKicksTheTankSprings', tt9.shockT >= 0 && tt9.shockAmp === 0.2 && Math.abs(tt9.rcPV) > 0.1);
     cc9.dead = true; tt9.dead = true;
     player.car = null; tk9.driver = null; tk9.dead = true;
     console.log('TNKDBG ' + RT.join(' ') + ' fails=' + tFails);
+  }, 400);
+}
+if (location.hash === '#perf') {
+  // FRAME BUDGET receipt (Tank order: route everything for high FPS):
+  // measures the update+sync cost with a working tank fleet + traffic
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    for (const o9 of cars) o9.dead = true;
+    const fleet9 = [];
+    for (let i9 = 0; i9 < 3; i9++) {
+      const t9 = mkCar(player.x + 120 + i9 * 90, player.y + (i9 - 1) * 60, 0, 'tank', null);
+      attachCarMesh(t9); cars.push(t9); t9.speed = 60; fleet9.push(t9);
+    }
+    for (let i9 = 0; i9 < 20; i9++) {
+      const c9 = mkCar(player.x + 200 + (i9 % 5) * 60, player.y - 200 + Math.floor(i9 / 5) * 60, 0, 'sedan', null);
+      attachCarMesh(c9); cars.push(c9); c9.speed = 40;
+    }
+    const t09 = performance.now();
+    for (let i9 = 0; i9 < 240; i9++) { for (const f9 of fleet9) f9.speed = 60; update(1 / 60); syncScene(1 / 60, 1 + i9 * 0.016); }
+    const msAll9 = (performance.now() - t09) / 240;
+    for (const f9 of fleet9) f9.dead = true;
+    const t19 = performance.now();
+    for (let i9 = 0; i9 < 240; i9++) { update(1 / 60); syncScene(1 / 60, 5 + i9 * 0.016); }
+    const msNoTk9 = (performance.now() - t19) / 240;
+    console.log('PERFDBG msPerFrame withTanks=' + msAll9.toFixed(3) + ' withoutTanks=' + msNoTk9.toFixed(3) + ' tankCost=' + (msAll9 - msNoTk9).toFixed(3));
+  }, 400);
+}
+if (location.hash === '#belts') {
+  // SEAT BELT LAW receipt (Tank order): impacts never launch anyone; the
+  // ONLY forced exit is unbelted + high speed + dead stop = through the
+  // windshield; a seized car's driver sits tight, then bails when quiet.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let bFails = 0;
+    const RB = [], ckB = (n9, v9) => { RB.push(n9 + '=' + v9); if (!v9) bFails++; };
+    // a wall with a clear road run-up
+    let wx9 = -1, wy9 = -1;
+    outerW9: for (let iy9 = 30; iy9 < GRID_H - 4; iy9++) for (let ix9 = 10; ix9 < GRID_W - 4; ix9++)
+      if (solid[idx(ix9, iy9)] === 1 && tileAt(ix9 - 1, iy9) === T_ROAD && tileAt(ix9 - 2, iy9) === T_ROAD
+        && !solidAtPx((ix9 - 1.6) * TILE, (iy9 + 0.5) * TILE)) { wx9 = ix9; wy9 = iy9; break outerW9; }
+    ckB('wallFound', wx9 > 0);
+    // the receipt blows things up — the ghost watches from a SAFE distance
+    // (a wasted player turns update() into a 4-second no-op and starves
+    // every timer this board depends on)
+    godMode = true;
+    outerP9: for (let iy9 = 2; iy9 < GRID_H - 2; iy9++) for (let ix9 = 2; ix9 < GRID_W - 2; ix9++)
+      if (tileAt(ix9, iy9) === T_ROAD && Math.hypot(ix9 - wx9, iy9 - wy9) > 30) {
+        player.x = (ix9 + 0.5) * TILE; player.y = (iy9 + 0.5) * TILE; break outerP9;
+      }
+    const mkC9 = (belt9) => {
+      const c9 = mkCar((wx9 - 1.6) * TILE, (wy9 + 0.5) * TILE, 0, 'sedan', 'ai');
+      c9.belted9 = belt9; c9.angle = 0; c9.speed = 160;
+      attachCarMesh(c9); cars.push(c9);
+      return c9;
+    };
+    const cB9 = mkC9(true);
+    for (let i9 = 0; i9 < 40 && cB9.driver; i9++) moveCar(cB9, 1 / 60);
+    ckB('beltedStaysInside', cB9.driver === 'ai');
+    const pedN09 = peds.length;
+    const cU9 = mkC9(false);
+    for (let i9 = 0; i9 < 40 && cU9.driver; i9++) moveCar(cU9, 1 / 60);
+    ckB('unbeltedMeetsTheGlass', cU9.driver === null && peds.length > pedN09 && !!peds[peds.length - 1].rag);
+    // slow stop: nobody flies at city speeds, belted or not
+    const cS9 = mkC9(false);
+    cS9.speed = 80;
+    for (let i9 = 0; i9 < 50; i9++) moveCar(cS9, 1 / 60);
+    ckB('slowStopKeepsThemSeated', cS9.driver === 'ai');
+    // beaten to the frame + stopped + QUIET: the driver bails and legs it
+    const cD9 = mkCar((wx9 - 4.5) * TILE, (wy9 + 0.5) * TILE, 0, 'sedan', 'ai');
+    attachCarMesh(cD9); cars.push(cD9);
+    cD9.hp = 10; cD9.speed = 0; cD9.panicT = 0;
+    for (let i9 = 0; i9 < 220 && cD9.driver; i9++) updTraffic(cD9, 1 / 60);
+    ckB('crippledCarBailsWhenSafe', cD9.driver === null);
+    // under fire = NOT safe: they stay put behind the wheel
+    const cP9 = mkCar((wx9 - 4.5) * TILE, (wy9 + 0.5) * TILE, 0, 'sedan', 'ai');
+    attachCarMesh(cP9); cars.push(cP9);
+    cP9.hp = 10; cP9.speed = 0;
+    for (let i9 = 0; i9 < 200; i9++) { cP9.panicT = 5; updTraffic(cP9, 1 / 60); }
+    ckB('underFireTheyStayPut', cP9.driver === 'ai');
+    // WITHIN 10% OF ITS LIFE = DEAD: 15% still limps, one more hit ends it
+    const cX9 = mkCar((wx9 - 6) * TILE, (wy9 + 0.5) * TILE, 0, 'sedan', null);
+    attachCarMesh(cX9); cars.push(cX9);
+    carDamage(cX9, 85, null);
+    const alive159 = !cX9.dead;
+    carDamage(cX9, 6, null);
+    ckB('tenPercentIsDead', alive159 && cX9.dead === true);
+    // BUOYANCY: air-filled tires bob a car at the surface; steel sinks
+    let wtX9 = -1, wtY9 = -1;
+    outerWt9: for (let iy9 = 2; iy9 < GRID_H - 2; iy9++) for (let ix9 = 2; ix9 < GRID_W - 2; ix9++)
+      if (tiles[idx(ix9, iy9)] === T_WATER) { wtX9 = ix9; wtY9 = iy9; break outerWt9; }
+    // stand at the shore: driverless cars beyond 1800px get swept away,
+    // and these two need every frame of their sinking observed
+    player.x = (wtX9 + 0.5) * TILE - 120; player.y = (wtY9 + 0.5) * TILE;
+    const fl9 = mkCar((wtX9 + 0.5) * TILE, (wtY9 + 0.5) * TILE, 0, 'sedan', null);
+    attachCarMesh(fl9); cars.push(fl9); fl9.drowned = true;
+    const sk9 = mkCar((wtX9 + 0.5) * TILE, (wtY9 + 0.5) * TILE, 0, 'tank', null);
+    attachCarMesh(sk9); cars.push(sk9); sk9.drowned = true;
+    for (let i9 = 0; i9 < 240; i9++) update(1 / 60);
+    ckB('tiresFloatTheCar', fl9.sink <= 1.7);
+    ckB('steelSinksTheTank', sk9.sink > 3);
+    // and DEEP water holds no footprints, however wet the world is
+    WEATHER.wet = 1;
+    const pv9 = { x: player.x, y: player.y };
+    player.x = (wtX9 + 0.5) * TILE; player.y = (wtY9 + 0.5) * TILE;
+    player._mkPX = player.x - 12; player._mkPY = player.y; player._mkD = 20;
+    updMarks(1 / 60);
+    // judge LOCALLY: rain legitimately prints the wet streets citywide —
+    // the law is that no print lands ON the deep water itself
+    ckB('deepWaterHoldsNoPrints', !marks9.some(m9 => m9 && Math.hypot(m9.x - player.x * RS, m9.z - player.y * RS) < 12));
+    WEATHER.wet = 0; player.x = pv9.x; player.y = pv9.y; exitSwim();
+    godMode = false;
+    fl9.dead = true; sk9.dead = true;
+    cB9.dead = true; cU9.dead = true; cS9.dead = true; cD9.dead = true; cP9.dead = true;
+    console.log('BELTDBG ' + RB.join(' ') + ' fails=' + bFails);
+  }, 400);
+}
+if (location.hash === '#cardyn') {
+  // CAR BODY-ON-SPRINGS + TAILPIPE receipt (Tank order): the shell rides
+  // its shocks over planted tires, and exhaust leaves the REAL pipe tip.
+  window._noRender = true;
+  startGame();
+  setTimeout(() => {
+    let dFails = 0;
+    const RD = [], ckD = (n9, v9) => { RD.push(n9 + '=' + v9); if (!v9) dFails++; };
+    const cd9 = mkCar(player.x + 60, player.y, 0, 'sedan', null);
+    attachCarMesh(cd9); cars.push(cd9);
+    const bG9 = cd9.mesh.userData.bodyG9;
+    // the split: a body group exists and NO wheel lives inside it
+    const wheelFree9 = (cd9.mesh.userData.wheelRolls || []).every(w9 => {
+      for (let p9 = w9; p9; p9 = p9.parent) if (p9 === bG9) return false;
+      return true;
+    });
+    ckD('bodyRidesTheSprings', !!bG9 && wheelFree9);
+    // braking DIPS the nose (negative pitch), throttle LIFTS it —
+    // sustained ramps, the way real pedals actually arrive
+    cd9.speed = 220;
+    syncScene(1 / 60, 1);
+    for (let i9 = 0; i9 < 18; i9++) { cd9.speed -= 280 / 60; syncScene(1 / 60, 1 + i9 * 0.02); }
+    ckD('brakingDipsTheNose', cd9._bpP9 < -0.02);
+    for (let i9 = 0; i9 < 50; i9++) syncScene(1 / 60, 1.6 + i9 * 0.02);   // settle
+    for (let i9 = 0; i9 < 18; i9++) { cd9.speed += 210 / 60; syncScene(1 / 60, 2.6 + i9 * 0.02); }
+    ckD('throttleLiftsTheNose', cd9._bpP9 > 0.015);
+    // cornering rolls the body — and the roll flips with the turn
+    cd9.speed = 150;
+    for (let i9 = 0; i9 < 12; i9++) { cd9.angle -= 0.03; syncScene(1 / 60, 3 + i9 * 0.02); }
+    const rollL9 = cd9._bpR9;
+    for (let i9 = 0; i9 < 24; i9++) { cd9.angle += 0.03; syncScene(1 / 60, 4 + i9 * 0.02); }
+    ckD('cornersRollTheBody', Math.abs(rollL9) > 0.008 && Math.abs(cd9._bpR9) > 0.008
+      && Math.sign(rollL9) !== Math.sign(cd9._bpR9));
+    // the tires never leave the ground while the body pitches
+    cd9.mesh.updateMatrixWorld(true);
+    const ww9 = new THREE.Vector3();
+    cd9.mesh.userData.wheelRolls[0].getWorldPosition(ww9);
+    const wy09 = ww9.y;
+    cd9.speed = 200;
+    for (let i9 = 0; i9 < 12; i9++) { cd9.speed -= 280 / 60; syncScene(1 / 60, 5 + i9 * 0.02); }   // hard decel: body dives
+    cd9.mesh.updateMatrixWorld(true);
+    cd9.mesh.userData.wheelRolls[0].getWorldPosition(ww9);
+    ckD('tiresStayPlanted', Math.abs(ww9.y - wy09) < 0.02 && Math.abs(bG9.rotation.z) > 0.01);
+    // exhaust: the puff is born AT the tailpipe tip, height and all
+    const tp9 = cd9.mesh.userData.tailTip9;
+    ckD('tailpipeTipKnown', !!tp9 && tp9.x < -cd9.len / 2 * 0.9);
+    player.car = cd9; cd9.driver = 'player'; cd9._thr = 1; cd9._exT = 0;
+    cd9.speed = 0; cd9.angle = 0;
+    const pi09 = poolIdx;
+    updExhaust(1 / 60);
+    const sp9 = pool[pi09];
+    const ex9 = (cd9.x + tp9.x) * RS, ez9 = (cd9.y + tp9.z) * RS;
+    ckD('smokeLeavesTheTip', poolIdx !== pi09
+      && Math.abs(sp9.position.x - ex9) < 0.05 && Math.abs(sp9.position.z - ez9) < 0.05
+      && Math.abs(sp9.position.y - tp9.h) < 0.05);
+    // curbs through the TIRES: front axle lifts first, the rear follows
+    // when it arrives, and each settles back to rest
+    player.car = null; cd9.driver = null;
+    const cnr9 = cd9.mesh.userData.corners9;
+    for (const q9 of cnr9) if (q9.fx === 1) q9.t = 0.22;
+    for (let i9 = 0; i9 < 6; i9++) syncScene(1 / 60, 6 + i9 * 0.01);   // ride to mid-lift
+    const fw9 = cd9.mesh.userData.wheelsF[0];
+    const fLift9 = fw9.position.y > 0.66;
+    for (const q9 of cnr9) if (q9.fx === -1) q9.t = 0.22;
+    for (let i9 = 0; i9 < 6; i9++) syncScene(1 / 60, 6.5 + i9 * 0.01);
+    const rw9 = cd9.mesh.userData.wheelsR9[0];
+    ckD('frontAxleTakesTheLipFirst', fLift9 && rw9.position.y > 0.66);
+    // the REAL law: at an ANGLED crossing, the leading tire fires while
+    // its axle-mate has not — each tire independent, as ordered
+    let abx9 = -1, aby9 = -1;
+    outerA9: for (let iy9 = 30; iy9 < GRID_H - 4; iy9++) for (let ix9 = 10; ix9 < GRID_W - 4; ix9++)
+      if (tileAt(ix9, iy9) === T_ROAD && tileAt(ix9 + 1, iy9) === T_SIDE
+        && tileAt(ix9, iy9 + 1) === T_ROAD && tileAt(ix9 + 1, iy9 + 1) === T_SIDE) { abx9 = ix9; aby9 = iy9; break outerA9; }
+    const ca29 = mkCar((abx9 - 1.2) * TILE, (aby9 + 0.5) * TILE, 0, 'sedan', null);
+    attachCarMesh(ca29); cars.push(ca29);
+    ca29.angle = 0.45; ca29.speed = 60;
+    const cn29 = ca29.mesh.userData.corners9;
+    const fl29 = () => cn29.some(q9 => q9.fx === 1 && q9.sz === -1 && q9.t > 0);
+    const fr29 = () => cn29.some(q9 => q9.fx === 1 && q9.sz === 1 && q9.t > 0);
+    let mg49 = 0;
+    while (!fl29() && !fr29() && mg49++ < 240) moveCar(ca29, 1 / 60);
+    ckD('eachTireFiresIndependently', abx9 > 0 && mg49 < 240 && (fl29() !== fr29()));
+    ca29.dead = true;
+    for (let i9 = 0; i9 < 30; i9++) syncScene(1 / 60, 7 + i9 * 0.02);
+    ckD('axlesSettleBackToRest', Math.abs(fw9.position.y - 0.64) < 0.01 && Math.abs(rw9.position.y - 0.64) < 0.01);
+    cd9.dead = true;
+    console.log('CARDBG ' + RD.join(' ') + ' fails=' + dFails);
   }, 400);
 }
 if (location.hash === '#aim') {
@@ -21720,7 +22621,10 @@ if (location.hash === '#cargibs') {
   explodeCar(c9);
   const shed = gibs.length - n0;
   const stripped = c9.mesh.userData.wheelRolls.length === 0 && c9.mesh.userData.trim.length === 0 && c9.mesh.userData.panels.every(d9 => d9.gone);
-  const hullStays = c9.mesh.userData.bodyMesh.parent === c9.mesh;
+  // the hull rides the SPRUNG body group now (Tank order: body on
+  // springs) — still bolted to the car either way
+  const hullStays = c9.mesh.userData.bodyMesh.parent === c9.mesh
+    || c9.mesh.userData.bodyMesh.parent === c9.mesh.userData.bodyG9;
   let flew = false;
   const h1 = gibs[n0].h;
   for (let i = 0; i < 240; i++) { updGibs(1 / 60); if (gibs.length > n0 && gibs[n0].h > h1 + 0.5) flew = true; }
@@ -21927,17 +22831,37 @@ let curbLipN9 = 0;
     }
   curbLipN9 = lips9.length;
   if (curbLipN9) {
-    const lipIM9 = new THREE.InstancedMesh(new THREE.BoxGeometry(0.5, 0.16, TILE * RS + 0.02),
-      new THREE.MeshLambertMaterial({ color: 0x9aa0a8 }), curbLipN9);
-    lipIM9.frustumCulled = false;
-    const lm9 = new THREE.Matrix4();
-    for (let i9 = 0; i9 < curbLipN9; i9++) {
-      const L9 = lips9[i9];
-      if (L9[2]) lm9.makeRotationY(Math.PI / 2); else lm9.identity();
-      lm9.setPosition(L9[0] * TILE * RS, 0.08, L9[1] * TILE * RS);
-      lipIM9.setMatrixAt(i9, lm9);
+    // CHUNKED per district with culling ON (Tank order: high frame
+    // rates) — the old single citywide mesh drew EVERY lip in EVERY
+    // pass forever; now the GPU only draws the chunks in view
+    const CH9 = 36;                                  // chunk size, tiles
+    const lipMat9 = new THREE.MeshLambertMaterial({ color: 0x9aa0a8 });
+    const buckets9 = new Map();
+    for (const L9 of lips9) {
+      const k9 = Math.floor(L9[0] / CH9) + ',' + Math.floor(L9[1] / CH9);
+      if (!buckets9.has(k9)) buckets9.set(k9, []);
+      buckets9.get(k9).push(L9);
     }
-    scene.add(lipIM9);
+    const lm9 = new THREE.Matrix4();
+    for (const arr9 of buckets9.values()) {
+      const g9 = new THREE.BoxGeometry(0.5, 0.16, TILE * RS + 0.02);
+      let x09 = 1e9, x19 = -1e9, y09 = 1e9, y19 = -1e9;
+      for (const L9 of arr9) {
+        x09 = Math.min(x09, L9[0]); x19 = Math.max(x19, L9[0]);
+        y09 = Math.min(y09, L9[1]); y19 = Math.max(y19, L9[1]);
+      }
+      const cx9 = (x09 + x19) / 2 * TILE * RS, cz9 = (y09 + y19) / 2 * TILE * RS;
+      const rad9 = Math.hypot((x19 - x09) / 2, (y19 - y09) / 2) * TILE * RS + 8;
+      g9.boundingSphere = new THREE.Sphere(new THREE.Vector3(cx9, 0.1, cz9), rad9);
+      const im9 = new THREE.InstancedMesh(g9, lipMat9, arr9.length);
+      for (let i9 = 0; i9 < arr9.length; i9++) {
+        const L9 = arr9[i9];
+        if (L9[2]) lm9.makeRotationY(Math.PI / 2); else lm9.identity();
+        lm9.setPosition(L9[0] * TILE * RS, 0.08, L9[1] * TILE * RS);
+        im9.setMatrixAt(i9, lm9);
+      }
+      scene.add(im9);
+    }
   }
 }
 (function () {
@@ -21964,6 +22888,11 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
   const dyn9 = new Set([player.mesh, ghostSeat, capitolFlagM, saveIcon, oceanWater, moonDisc, ...boltSegs9].filter(Boolean));
   for (const c9 of cars) if (c9.mesh) dyn9.add(c9.mesh);
   for (const p9 of peds) if (p9.mesh) dyn9.add(p9.mesh);
+  // pickups hide on collect, respawn, spin and flicker — freeze or bake
+  // them and the body stands on the street forever while only the beam
+  // obeys .visible (the "picked it up but it's still there" bug)
+  for (const pk9 of pickups) if (pk9.mesh) dyn9.add(pk9.mesh);
+  for (const ap9 of armoryPicks) if (ap9.mesh) dyn9.add(ap9.mesh);
   let frozen9 = 0;
   const freeze9 = (o9) => {
     if (dyn9.has(o9)) return;
@@ -22000,6 +22929,8 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
   skipRoot9(player.mesh); skipRoot9(ghostSeat); skipRoot9(capitolFlagM); skipRoot9(saveIcon);
   for (const c9 of cars) skipRoot9(c9.mesh);
   for (const p9 of peds) skipRoot9(p9.mesh);
+  for (const pk9 of pickups) skipRoot9(pk9.mesh);      // collectables toggle .visible —
+  for (const ap9 of armoryPicks) skipRoot9(ap9.mesh);  // baked bodies would never leave
   scene.updateMatrixWorld(true);
   const lamb9 = [], basi9 = [];
   let skipped9 = 0;
@@ -22061,16 +22992,48 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
     const mm9 = new THREE.Mesh(gg9, mat9);
     mm9.castShadow = true;                         // both kinds cast, exactly as they did unmerged
     mm9.receiveShadow = wantNor9;                  // receiving is a lit-material concept — Basic ignores it
-    mm9.frustumCulled = false;                     // the city is always on screen
-    mm9.matrixAutoUpdate = false; mm9.updateMatrix();
+    gg9.computeBoundingSphere();                   // chunk culls per pass — shadow/mirror/main each
+    mm9.matrixAutoUpdate = false; mm9.updateMatrix();  // draw only the chunks inside THEIR frustum
     scene.add(mm9);
     return mm9;
   };
-  if (lamb9.length) mergedStatics9.push(bake9(lamb9, new THREE.MeshLambertMaterial({ vertexColors: true }), true));
-  if (basi9.length) mergedStatics9.push(bake9(basi9, new THREE.MeshBasicMaterial({ vertexColors: true }), false));
+  // DISTRICT CHUNKING (Tank: shadow must redraw every frame, NO cadence —
+  // speed comes from the pass being cheaper): one city-wide mesh can never
+  // be frustum-culled, so the ±160 shadow box was rasterizing the ENTIRE
+  // city every update. Baking per ~320-unit cell keeps the draw-call win
+  // (a handful of chunks per pass) while every pass culls the rest. The
+  // cell is a grouping heuristic only — each chunk's bounding sphere is
+  // computed from its real verts, so culling is always correct.
+  const CELL9 = 320;
+  const cellV9 = new THREE.Vector3();
+  const cellOf9 = (o9) => {
+    const g9 = o9.geometry;
+    if (!g9.boundingSphere) g9.computeBoundingSphere();
+    cellV9.copy(g9.boundingSphere.center).applyMatrix4(o9.matrixWorld);
+    return Math.floor(cellV9.x / CELL9) + '_' + Math.floor(cellV9.z / CELL9);
+  };
+  const splitCells9 = (list9) => {
+    const cm9 = new Map();
+    for (const o9 of list9) {
+      const k9 = cellOf9(o9);
+      let a9 = cm9.get(k9);
+      if (!a9) { a9 = []; cm9.set(k9, a9); }
+      a9.push(o9);
+    }
+    return [...cm9.values()];
+  };
+  let cells19 = 0;
+  if (lamb9.length) {
+    const lambM9 = new THREE.MeshLambertMaterial({ vertexColors: true });
+    for (const cl9 of splitCells9(lamb9)) { mergedStatics9.push(bake9(cl9, lambM9, true)); cells19++; }
+  }
+  if (basi9.length) {
+    const basiM9 = new THREE.MeshBasicMaterial({ vertexColors: true });
+    for (const cl9 of splitCells9(basi9)) { mergedStatics9.push(bake9(cl9, basiM9, false)); cells19++; }
+  }
   for (const o9 of lamb9) o9.parent.remove(o9);
   for (const o9 of basi9) o9.parent.remove(o9);
-  console.log('GPUMERGE lambert=' + lamb9.length + ' basic=' + basi9.length + ' noNormalSkipped=' + skipped9);
+  console.log('GPUMERGE lambert=' + lamb9.length + ' basic=' + basi9.length + ' chunks=' + cells19 + ' noNormalSkipped=' + skipped9);
   // phase 2 — TEXTURED statics. A multi-material box pays one draw call
   // PER FACE GROUP (a facade building = up to 6 calls) in every pass.
   // Textures are shared via the TEXS cache, so bucketing groups by exact
@@ -22109,19 +23072,21 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
     const mats9 = Array.isArray(o9.material) ? o9.material : [o9.material];
     const grps9 = (g9.groups && g9.groups.length) ? g9.groups
       : [{ start: 0, count: g9.index ? g9.index.count : g9.attributes.position.count, materialIndex: 0 }];
+    const cell9 = cellOf9(o9);                     // district chunk — see phase-1 comment
     for (const gr9 of grps9) {
       if (!gr9.count) continue;
       const m9 = mats9[gr9.materialIndex] || mats9[0];
       const k9 = m9.type + '|' + imgId9(m9.map) +
         '|' + (m9.emissive ? m9.emissive.getHexString() : '-') + '|' + m9.side;
-      let b9 = buckets9.get(k9);
-      if (!b9) { b9 = { mat: m9, parts: [], nv: 0, ni: 0 }; buckets9.set(k9, b9); }
+      let b9 = buckets9.get(k9 + '@' + cell9);
+      if (!b9) { b9 = { mat: m9, sig: k9, parts: [], nv: 0, ni: 0 }; buckets9.set(k9 + '@' + cell9, b9); }
       b9.parts.push({ o9, gr9, m9 });
       b9.nv += g9.attributes.position.count;
       b9.ni += gr9.count;
     }
   }
   const v9 = new THREE.Vector3(), nm9 = new THREE.Matrix3();
+  const texMatC9 = new Map();                    // signature → shared baked material
   for (const b9 of buckets9.values()) {
     const isLam9 = b9.mat.type === 'MeshLambertMaterial';
     const pos9 = new Float32Array(b9.nv * 3), uv9 = new Float32Array(b9.nv * 2), tcol9 = new Float32Array(b9.nv * 3);
@@ -22163,25 +23128,32 @@ if (oceanWater) { oceanWater.castShadow = false; oceanWater.receiveShadow = fals
     gg9.setAttribute('uv', new THREE.BufferAttribute(uv9, 2));
     gg9.setAttribute('color', new THREE.BufferAttribute(tcol9, 3));
     gg9.setIndex(new THREE.BufferAttribute(idx9, 1));
-    const bm9 = b9.mat.clone();
-    bm9.color.set(0xffffff); bm9.vertexColors = true;   // tint now rides the verts
-    if (bm9.map) {
-      // the uv transform is baked into the merged uvs — the bucket's map
-      // must sample with an identity transform
-      bm9.map = bm9.map.clone();
-      bm9.map.offset.set(0, 0); bm9.map.repeat.set(1, 1); bm9.map.rotation = 0;
-      bm9.map.updateMatrix();
-      bm9.map.needsUpdate = true;
+    // ONE material + ONE GL texture per signature, shared by every
+    // district chunk of that signature — cloning per chunk would upload
+    // the same image to the GPU dozens of times
+    let bm9 = texMatC9.get(b9.sig);
+    if (!bm9) {
+      bm9 = b9.mat.clone();
+      bm9.color.set(0xffffff); bm9.vertexColors = true;   // tint now rides the verts
+      if (bm9.map) {
+        // the uv transform is baked into the merged uvs — the bucket's map
+        // must sample with an identity transform
+        bm9.map = bm9.map.clone();
+        bm9.map.offset.set(0, 0); bm9.map.repeat.set(1, 1); bm9.map.rotation = 0;
+        bm9.map.updateMatrix();
+        bm9.map.needsUpdate = true;
+      }
+      texMatC9.set(b9.sig, bm9);
     }
     const mm9 = new THREE.Mesh(gg9, bm9);
     mm9.castShadow = true; mm9.receiveShadow = true;
-    mm9.frustumCulled = false;
+    gg9.computeBoundingSphere();                 // chunk culls per pass, same as phase 1
     mm9.matrixAutoUpdate = false; mm9.updateMatrix();
     scene.add(mm9);
     mergedStatics9.push(mm9);                    // GOJILLIA needs to know what to crumple
   }
   for (const o9 of texM9) o9.parent.remove(o9);
-  console.log('GPUMERGE2 texturedMeshes=' + texM9.length + ' buckets=' + buckets9.size);
+  console.log('GPUMERGE2 texturedMeshes=' + texM9.length + ' signatures=' + texMatC9.size + ' chunks=' + buckets9.size);
 }
 // the city is final — mirror both grids into the worker cores (the
 // drivable mask was baked right after genCity, where receipts can see it)

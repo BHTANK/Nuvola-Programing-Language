@@ -712,6 +712,8 @@ function runConsole(raw) {
       player.car.hp = CAR_KINDS[player.car.kind].hp;
       player.car.onFireT = 0;
       player.car.burnT = 0;
+      player.car.rolled9 = null;                     // the shop rights a rolled shell too
+      if (player.car.mesh) player.car.mesh.rotation.x = 0;
       undentCar(player.car);
       const gfx9 = player.car.mesh && player.car.mesh.userData.gear9;
       if (gfx9) { gfx9.hp = [360, 360]; gfx9.broken = [false, false]; gfx9.seeded = false; }   // fresh tracks too
@@ -3020,14 +3022,14 @@ function dirAng(d) { return [0, Math.PI / 2, Math.PI, -Math.PI / 2][d]; }
 // fuelCap = tank size in gallons (Tank's spec: commuter 10, sport 13, taxi
 // 15, truck 17, cop 20); kinds without fuelCap (tank/helo/boat) never stall
 const CAR_KINDS = {
-  sedan: { hp: 100, max: 260, color: null, len: 40, w: 21, grip: 750, skid: 200, fuelCap: 10, mass: 1.0 },
-  taxi: { hp: 100, max: 270, color: 0xe8b800, len: 40, w: 21, grip: 760, skid: 205, fuelCap: 15, mass: 1.0 },
-  truck: { hp: 160, max: 190, color: 0x7a7f85, len: 52, w: 24, grip: 430, skid: 140, fuelCap: 17, mass: 1.9 },
-  cop: { hp: 120, max: 300, color: 0xf0f0f4, len: 42, w: 21, grip: 820, skid: 230, fuelCap: 20, mass: 1.15 },
-  sport: { hp: 80, max: 340, color: 0xc81e1e, len: 38, w: 19, grip: 950, skid: 260, fuelCap: 13, mass: 0.85 },
+  sedan: { hp: 100, max: 260, color: null, len: 40, w: 21, grip: 750, skid: 200, fuelCap: 10, mass: 1.0, rwd: true },
+  taxi: { hp: 100, max: 270, color: 0xe8b800, len: 40, w: 21, grip: 760, skid: 205, fuelCap: 15, mass: 1.0, rwd: true },
+  truck: { hp: 160, max: 190, color: 0x7a7f85, len: 52, w: 24, grip: 430, skid: 140, fuelCap: 17, mass: 1.9, rwd: true },
+  cop: { hp: 120, max: 300, color: 0xf0f0f4, len: 42, w: 21, grip: 820, skid: 230, fuelCap: 20, mass: 1.15, rwd: true },
+  sport: { hp: 80, max: 340, color: 0xc81e1e, len: 38, w: 19, grip: 950, skid: 260, fuelCap: 13, mass: 0.85, rwd: true },
   // the VELOCE — F40-class exotic (original design, no badge): fastest iron
   // in the city, fragile, found ONLY on Capitol Shores (island 3)
-  veloce: { hp: 75, max: 420, color: 0xd21818, len: 39, w: 20, grip: 1020, skid: 275, fuelCap: 13, mass: 0.8 },
+  veloce: { hp: 75, max: 420, color: 0xd21818, len: 39, w: 20, grip: 1020, skid: 275, fuelCap: 13, mass: 0.8, rwd: true },
   // the HUMVEE: military iron with an M2 ring — 360°, all elevations,
   // fifty-cal death on the fire button. Lives at the base AND the car lot.
   humvee: { hp: 260, max: 230, color: 0x4a5240, len: 48, w: 26, grip: 900, skid: 220, fuelCap: 25, mass: 2.4 },
@@ -3145,8 +3147,11 @@ function heatCap() { return (mission && heat < 6) ? 5.9 : 6.9; }
 function addHeat(n) {
   if (pardonMode) return;
   // the army doesn't mobilize over one more stray shot: past 5 stars the
-  // meter fills at half rate — star 6 is EARNED, and it will kill you
+  // meter fills at half rate — star 6 is EARNED, and it will kill you.
+  // STAGED ESCALATION (Tank order): the first two stars come easy — star
+  // three and up, when the heat is REALLY on, have to be earned too
   if (heat >= 5 && n > 0) n *= 0.55;
+  else if (heat >= 2 && n > 0) n *= 0.6;
   heat = Math.min(heatCap(), heat + n);
   if (tankGraceT > 0) heat = Math.min(heat, 5.9);   // the theft bought you a running start
   wantedClearT = stars() >= 4 ? 20 : 30;
@@ -9596,6 +9601,7 @@ function buildCarMesh(c) {
     g.add(bodyG9);
     g.userData.bodyG9 = bodyG9;
     g.userData.wheelsR9 = [...wheelRoots9].filter(w9 => !(g.userData.wheelsF || []).includes(w9));
+    g.userData.rollsR9 = (g.userData.wheelRolls || []).filter(r9 => g.userData.wheelsR9.includes(r9.parent));
     // EACH TIRE is its own contact (Tank order): four corners, each with
     // its own bump timer — fx +1 front / -1 rear, sz +1 right / -1 left
     g.userData.corners9 = [...wheelRoots9].map(w9 => ({
@@ -10682,6 +10688,103 @@ function roadPoint(fromX, fromY, minD, maxD, island) {
   const h = hospitals[island >= 1 ? island : 0] || hospitals[0];
   return { x: h.x, y: h.y, ix: Math.floor(h.x / TILE), iy: Math.floor(h.y / TILE) };
 }
+// ---- LEG ENGINE routing (mission plan): missions are placed by DRIVING
+// distance on the road grid, never crow-flies. One-shot BFS flood over
+// drivable tiles (the water-depth flood pattern — no step guard needed,
+// the grid is 25,760 tiles and this runs only at mission placement).
+// Barriers on closed spans are SOLID, so a locked bridge honestly blocks
+// the route — that is the whole point.
+const _rdSeen = new Int32Array(GRID_W * GRID_H);
+const _rdDepth = new Int32Array(GRID_W * GRID_H);
+let _rdStamp = 0;
+function _rdSnap9(ix, iy) {
+  // feet may stand on sidewalk — snap to the nearest drivable tile
+  for (let r9 = 0; r9 < 4; r9++)
+    for (let dy9 = -r9; dy9 <= r9; dy9++)
+      for (let dx9 = -r9; dx9 <= r9; dx9++) {
+        const nx9 = ix + dx9, ny9 = iy + dy9;
+        if (inGrid(nx9, ny9) && drivable[ny9 * GRID_W + nx9] && solid[ny9 * GRID_W + nx9] !== 1) return ny9 * GRID_W + nx9;
+      }
+  return -1;
+}
+function routeDist(fx, fy, tx, ty) {
+  const s9 = _rdSnap9(Math.floor(fx / TILE), Math.floor(fy / TILE));
+  const g9 = _rdSnap9(Math.floor(tx / TILE), Math.floor(ty / TILE));
+  if (s9 < 0 || g9 < 0) return -1;
+  if (s9 === g9) return 0;
+  _rdStamp++;
+  const q9 = [s9];
+  _rdSeen[s9] = _rdStamp; _rdDepth[s9] = 0;
+  let qh9 = 0;
+  while (qh9 < q9.length) {
+    const cur9 = q9[qh9++];
+    const cx9 = cur9 % GRID_W, cy9 = (cur9 / GRID_W) | 0, cd9 = _rdDepth[cur9];
+    for (let k9 = 0; k9 < 4; k9++) {
+      const nx9 = cx9 + (k9 === 0 ? 1 : k9 === 1 ? -1 : 0);
+      const ny9 = cy9 + (k9 === 2 ? 1 : k9 === 3 ? -1 : 0);
+      if (!inGrid(nx9, ny9)) continue;
+      const n9 = ny9 * GRID_W + nx9;
+      if (_rdSeen[n9] === _rdStamp) continue;
+      if (n9 !== g9 && (solid[n9] === 1 || !drivable[n9])) continue;
+      if (n9 === g9) return (cd9 + 1) * TILE;
+      _rdSeen[n9] = _rdStamp; _rdDepth[n9] = cd9 + 1;
+      q9.push(n9);
+    }
+  }
+  return -1;                                   // no road route exists (locked spans)
+}
+// locked-span centers, same points the minimap paints red
+const SPAN_PTS9 = [{ x: 69 * TILE, y: 29 * TILE }, { x: 69 * TILE, y: 65 * TILE }, { x: 29 * TILE, y: 101 * TILE }, { x: 109 * TILE, y: 101 * TILE }];
+function _crowNearSpan9(fx, fy, tx, ty, sp9) {
+  // does the straight line from A to B pass close by span sp9?
+  const p9 = SPAN_PTS9[sp9];
+  const dx9 = tx - fx, dy9 = ty - fy, l29 = dx9 * dx9 + dy9 * dy9;
+  if (!l29) return false;
+  const t9 = clamp(((p9.x - fx) * dx9 + (p9.y - fy) * dy9) / l29, 0, 1);
+  return dist(p9.x, p9.y, fx + dx9 * t9, fy + dy9 * t9) < 8 * TILE;
+}
+function farRoadPoint(fx, fy, minRoute9, pastSpan9) {
+  // sample road points, keep the first whose DRIVING distance clears the
+  // bar; pastSpan: the crow line must brush a LOCKED span while the road
+  // detours around it — you see the bridge you cannot use, and you keep
+  // driving. Best-effort fallback: the farthest reachable candidate.
+  let best9 = null, bestD9 = -1;
+  for (let t9 = 0; t9 < 16; t9++) {
+    const p9 = roadPoint(fx, fy, Math.min(minRoute9 * 0.45, 2200), 12000);
+    const rd9 = routeDist(fx, fy, p9.x, p9.y);
+    if (rd9 < 0) continue;
+    if (pastSpan9 !== undefined) {
+      if (bridgesOpen[pastSpan9]) { /* span already open — plain far rules */ }
+      else if (!_crowNearSpan9(fx, fy, p9.x, p9.y, pastSpan9) || rd9 < dist(fx, fy, p9.x, p9.y) * 1.3) {
+        if (rd9 > bestD9) { bestD9 = rd9; best9 = { x: p9.x, y: p9.y, route: rd9 }; }
+        continue;
+      }
+    }
+    if (rd9 >= minRoute9) return { x: p9.x, y: p9.y, route: rd9 };
+    if (rd9 > bestD9) { bestD9 = rd9; best9 = { x: p9.x, y: p9.y, route: rd9 }; }
+  }
+  if (best9) return best9;
+  const p9 = roadPoint(fx, fy, 900, 2200);
+  return { x: p9.x, y: p9.y, route: routeDist(fx, fy, p9.x, p9.y) };
+}
+// authored placement anchors — the vocabulary the story data pass writes in
+function legAnchor9(name9) {
+  const A9 = {
+    home: homePos, hideout: hideoutPos, jason: jasonSpot, docks: dockContact,
+    ledger: pressPts && pressPts[0], precinct: policeStation, capitol: capitolPos,
+    stadium: stadiumPos, army: armyBase, garage: garagePad,
+    dealer: dealerLot && { x: (dealerLot.x0 + 5) * TILE, y: (dealerLot.y0 + 5) * TILE },
+    hospital0: hospitals[0], hospital1: hospitals[1], hospital2: hospitals[2]
+  };
+  return A9[name9] || null;
+}
+function resolveLegPoint(spec9, fx, fy, isl) {
+  if (spec9.at) { const a9 = legAnchor9(spec9.at); if (a9) return { x: a9.x, y: a9.y }; }
+  if (spec9.x !== undefined) return { x: spec9.x, y: spec9.y };
+  if (spec9.far) return farRoadPoint(fx, fy, spec9.far, spec9.pastSpan);
+  const p9 = roadPoint(fx, fy, spec9.minD || 600, spec9.maxD || 1400, isl);
+  return { x: p9.x, y: p9.y };
+}
 function laneSetup(c, ix, iy) {
   const rb = rowBase(iy), cb = colBase(ix);
   if (rb >= 0 && cb < 0) {
@@ -11111,10 +11214,27 @@ function windshield9(c, v9) {
   c.driver = null;
 }
 function moveCar(c, dt) {
+  if (c.pitSpin9) {
+    // PIT SPIN: the rear broke loose — the nose yaws while momentum keeps
+    // its own world direction (steerCar's re-projection), and the tires
+    // grip the slide back down. Physics owns the spin, save, or roll.
+    const da9 = c.pitSpin9.v * dt;
+    c.angle += da9;
+    const csP9 = Math.cos(da9), snP9 = Math.sin(da9);
+    const fP9 = c.speed, lP9 = c.latV || 0;
+    c.speed = fP9 * csP9 + lP9 * snP9;
+    c.latV = lP9 * csP9 - fP9 * snP9;
+    c.pitSpin9.v *= Math.pow(0.25, dt);
+    c.pitSpin9.t -= dt;
+    if (c.pitSpin9.t <= 0 || Math.abs(c.pitSpin9.v) < 0.15) c.pitSpin9 = null;
+  }
   if (!c.drowned && c.kind !== 'boat' && waterAt(c.x, c.y)) {
     c.drowned = true;                                // flooded: the engine locks up for good
     sfx('crash', c.x, c.y, 40);
     if (c === player.car) msg('Engine flooded. She is DONE.', 7);
+    // the swim-rule law closes an old hole: a drowned mission car used to
+    // sink WITHOUT failing the job — an unwinnable ghost mission
+    if (mission && mission.car === c) failMission('The car is at the bottom of the harbor.');
   }
   // CURB EDGES (Tank order, rebuilt after the center-point failure): EACH
   // AXLE samples the ground where ITS TIRES actually sit — the physics
@@ -11139,7 +11259,7 @@ function moveCar(c, dt) {
       const tb9 = tileAt(Math.floor((c.x + cca9 * lx9 - csa9 * lz9) / TILE),
         Math.floor((c.y + csa9 * lx9 + cca9 * lz9) / TILE));
       const cls9 = tb9 === T_SIDE ? 1 : tb9 === T_ROAD ? 0 : -1;
-      if (cls9 >= 0 && c._cb49[k9] >= 0 && cls9 !== c._cb49[k9] && Math.abs(c.speed) > 15) {
+      if (cls9 >= 0 && c._cb49[k9] >= 0 && cls9 !== c._cb49[k9] && (Math.abs(c.speed) > 15 || Math.abs(c.latV || 0) > 90)) {
         c.speed *= 0.991;                            // a quarter of the old scrub, per tire
         const dir9 = cls9 ? 1 : -0.8;                // up the lip vs down it
         if (c.kind === 'tank') {
@@ -11147,10 +11267,26 @@ function moveCar(c, dt) {
           c.rcPV = (c.rcPV || 0) + fx9 * dir9 * 0.4;
           c.rcRV = (c.rcRV || 0) - sz9 * dir9 * 0.35;   // that SIDE rises, the hull rolls off it
         } else {
+          // the lip delivers the same jolt front or rear — the stiffer
+          // front SPRING (car sync block) decides what the body does with it
           c._bpPV9 = (c._bpPV9 || 0) + fx9 * dir9 * 0.32;
           c._bpRV9 = (c._bpRV9 || 0) - sz9 * dir9 * 0.3;
           const cn9 = c.mesh && c.mesh.userData.corners9;
           if (cn9) for (const q9 of cn9) if (q9.fx === fx9 && q9.sz === sz9) q9.t = 0.22;
+        }
+        // ROLLOVER HOOK (Tank order): tires sliding hard SIDEWAYS that
+        // catch a rising lip trip the chassis — lateral energy becomes roll
+        if (!c.rolled9 && cls9 === 1 && Math.abs(c.latV || 0) > 130 && sz9 === Math.sign(c.latV)
+          && c.kind !== 'tank' && c.kind !== 'helo' && c.kind !== 'boat') {
+          // NO minimum roll: the lateral energy is all the flip gets —
+          // gravity in updRoll9 decides if it goes over or slams back.
+          // WIDTH is the stabilizer: a wide track converts the same slide
+          // into less roll (mass already had its say in the impulse)
+          c.rolled9 = { ang: 0, w: Math.min(Math.abs(c.latV) * 0.012 * (21 / c.w), 6.5), dir: sz9, q: 0, settled: false };
+          if (c.mesh) c.mesh.rotation.order = 'YZX';   // roll in the CAR'S frame (the heading-flip lesson)
+          c.latV *= 0.3;                               // the rest of the energy went into the trip
+          sfx('crash', c.x, c.y, 220);
+          if (c === player.car) rumble(1, 0.8, 500);
         }
         if (c === player.car) rumble(0.18, 0.26, 90);
       }
@@ -11333,6 +11469,23 @@ function stepPlayerCar(c, dt) {
     moveCar(c, dt);
     return;
   }
+  if (c.rolled9) {
+    const R9 = c.rolled9;
+    if (!R9.commit9 && !R9.settled) {
+      // TWO WHEELS, STILL DRIVING (Tank order): the contact side keeps
+      // ANGLED power and the steer tire still turns the car — the fight
+      // for the flip happens with the throttle and wheel both live
+      const thr9 = (key('KeyW') || key('ArrowUp')) ? 1 : padThrottle;
+      const brk9 = (key('KeyS') || key('ArrowDown')) ? 1 : padBrakeV;
+      c.speed = clamp(c.speed + (thr9 * 115 - brk9 * 160 * Math.sign(c.speed || 1)) * dt, -95, 300);
+      const st9 = (key('KeyA') || key('ArrowLeft') ? -1 : 0) + (key('KeyD') || key('ArrowRight') ? 1 : 0) +
+        (Math.abs(padLX) > 0.25 ? Math.sign(padLX) : 0);
+      if (st9) c.angle += st9 * Math.min(1.5, Math.abs(c.speed) * 0.011) * Math.sign(c.speed || 1) * 0.6 * dt;
+      c.steerVis = st9 * 0.25;
+    } else c.steerVis = 0;
+    updRoll9(c, dt);
+    return;
+  }
   // keyboard is digital; pad triggers are analog throttle/brake, stick steers
   // — an empty tank means the ENGINE IS DEAD (Tank order): no throttle, no
   // reverse; coast, brake and steer are all that's left
@@ -11352,8 +11505,27 @@ function stepPlayerCar(c, dt) {
   const s0 = c.speed;
   // the throttle point: partial pull = proportional cruise target
   const cap = thrN > 0 && thrN < 0.98 ? kmax * Math.max(0.12, thrN) : kmax;
-  if (thrN > 0 && c.speed < cap) c.speed = Math.min(cap, c.speed + 210 * thrN * dt);
-  if (brkN > 0) c.speed -= 280 * brkN * dt;
+  // DRIFT (Tank order): gas + brake TOGETHER on a REAR-DRIVE car feeds the
+  // rear tires more power than friction can hold — the rear spins up and
+  // breaks loose. Nothing scripted: FRICTION (grip × weather × tune) is
+  // what the rear holds, POWER (engine × throttle × the kind's own muscle)
+  // is what breaks it, SPEED gates the inertia, MASS carries the slide.
+  // Every vehicle drifts exactly like itself — learn yours.
+  const K9d = CAR_KINDS[c.kind];
+  if (K9d.rwd && thrN > 0.5 && brkN > 0.35 && Math.abs(c.speed) > 45 && !c.noFuel) {
+    const pow9 = 210 * thrN * modF(c, 'eng') * (K9d.max / 260);
+    const hold9 = K9d.grip * modF(c, 'grip') * weatherGrip(c) * 0.17;
+    c.drift9 = Math.min(1, (c.drift9 || 0) + Math.max(0, pow9 / hold9 - 1) * 1.8 * dt);
+  } else c.drift9 = Math.max(0, (c.drift9 || 0) - dt * 2.5);
+  const drifting9 = (c.drift9 || 0) > 0.5;
+  c.wheelSpin9 = drifting9 ? c.drift9 : 0;
+  if (drifting9) {
+    // spinning rears half-drive; only the fronts still bite the brakes
+    c.speed += Math.sign(c.speed || 1) * (210 * thrN * 0.5 * modF(c, 'eng') - 280 * brkN * 0.25) * dt;
+  } else {
+    if (thrN > 0 && c.speed < cap) c.speed = Math.min(cap, c.speed + 210 * thrN * dt);
+    if (brkN > 0) c.speed -= 280 * brkN * dt;
+  }
   if (thrN <= 0 && brkN <= 0) {
     // throttle released: the car COASTS — light aero drag plus rolling
     // resistance, not an anchor. Brakes and handbrake do the stopping.
@@ -11363,7 +11535,7 @@ function stepPlayerCar(c, dt) {
   if (hand) c.speed *= Math.pow(0.3, dt);
   // easing the trigger back settles DOWN to the new cruise point smoothly
   // (engine braking), never an instant clamp
-  if (thrN > 0 && c.speed > cap) c.speed = Math.max(cap, c.speed * Math.pow(0.62, dt));
+  if (!drifting9 && thrN > 0 && c.speed > cap) c.speed = Math.max(cap, c.speed * Math.pow(0.62, dt));
   if (s0 !== 0 && c.speed * s0 < 0) {
     // sign flipped under input this frame: stop dead, hold the beat
     c.speed = 0;
@@ -11453,7 +11625,9 @@ function stepPlayerCar(c, dt) {
   const pull9 = c.frame ? (c.frame.fr - c.frame.fl) * 0.22 : 0;
   if (pull9 && Math.abs(c.speed) > 30) steerCar(c, pull9 * clamp(c.speed / 200, -1, 1) * dt);
   c.steerVis = steer * 0.42;                     // wheels track the wheel, even at a standstill
-  tireGrip(c, dt, hand ? 0.35 : 1);              // handbrake cuts grip: controlled slides
+  // handbrake cuts grip; a POWERED drift cuts it harder still, and mass
+  // (inertia) is what keeps the slide carrying once the rear is loose
+  tireGrip(c, dt, hand ? 0.35 : drifting9 ? 0.13 / Math.sqrt(K9d.mass) : 1);
   moveCar(c, dt);
   STATS.distanceDriven += Math.abs(c.speed) * dt;
   // skid feedback: screech + rubber on the road
@@ -11510,6 +11684,7 @@ function updTraffic(c, dt) {
   // (nobody steps out into gunfire or flames).
   if (c.hp <= CAR_KINDS[c.kind].hp * 0.18 && !c.outlaw) {
     c.speed *= Math.pow(0.02, dt);
+    c.latV = (c.latV || 0) * Math.pow(0.02, dt);   // it stays where it stopped — sideways too
     moveCar(c, dt);
     if ((c.panicT || 0) <= 0 && !c.onFireT && Math.abs(c.speed) < 6) {
       c.bailT9 = (c.bailT9 || 0) + dt;
@@ -11524,6 +11699,22 @@ function updTraffic(c, dt) {
     } else c.bailT9 = 0;
     return;
   } else c.bailT9 = 0;
+  // a broadside hands the tires SIDEWAYS momentum (Tank order) — lane
+  // driving only integrates forward, so the scoot rides its own channel
+  // here and the tires grip it back off
+  if (Math.abs(c.latV || 0) > 90) {
+    // crash-hot slide: route the WHOLE frame through moveCar so walls,
+    // water, and the ROLLOVER HOOK all see it — lane driving resumes
+    // once the tires burn it back under control
+    tireGrip(c, dt, 1);
+    moveCar(c, dt);
+    return;
+  }
+  if (Math.abs(c.latV || 0) > 6) {
+    tireGrip(c, dt, 1);
+    c.x += -Math.sin(c.angle) * c.latV * dt;
+    c.y += Math.cos(c.angle) * c.latV * dt;
+  }
   // a pursued driver plays his personality card once the law closes in
   if (c.outlaw && c.reaction && !c.reacted) {
     c.reactT -= dt;
@@ -11570,8 +11761,14 @@ function updTraffic(c, dt) {
   const dv = DIRV[c.dir];
   c.x += dv[0] * c.speed * dt;
   c.y += dv[1] * c.speed * dt;
-  if (c.dir === 0 || c.dir === 2) c.y += (c.laneY - c.y) * Math.min(1, dt * 4);
-  else c.x += (c.laneX - c.x) * Math.min(1, dt * 4);
+  // lane centering is STEERING, not a magnet (Tank: a shoved car slid
+  // back onto the road on rails while sitting still) — sideways travel
+  // is capped by the distance the car actually ROLLED this frame, so a
+  // stopped car stays where physics put it and a driver pulling away
+  // angles back to his lane over a couple of car lengths
+  const ctrCap9 = Math.abs(c.speed) * dt * 0.45;
+  if (c.dir === 0 || c.dir === 2) c.y += clamp((c.laneY - c.y) * Math.min(1, dt * 4), -ctrCap9, ctrCap9);
+  else c.x += clamp((c.laneX - c.x) * Math.min(1, dt * 4), -ctrCap9, ctrCap9);
   c.angle += angDiff(c.angle, dirAng(c.dir)) * Math.min(1, dt * 8);
   const ix = Math.floor(c.x / TILE), iy = Math.floor(c.y / TILE);
   if (isRoadColIdx(ix) && isRoadRowIdx(iy)) {
@@ -11631,14 +11828,13 @@ function updCopCar(c, dt) {
     if (lx2 < -pc2.len * 0.15 && lx2 > -pc2.len * 0.9 && Math.abs(ly2) > pc2.w * 0.35 && Math.abs(ly2) < pc2.w * 1.35) {
       c.pitT = 6;
       const side = Math.sign(ly2) || 1;
-      pc2.latV += -side * 150;                 // rear steps out, away from the cruiser
-      pc2.speed *= 0.8;
+      pitKick9(pc2, side);                     // rear breaks loose, nose yaws — the real maneuver
       c.speed *= 0.85;
       dentCar(pc2, (c.x + pc2.x) / 2, (c.y + pc2.y) / 2, 190);
       rumble(0.65, 0.65, 320);
-      skidOn(pc2, 1);
       msg('PIT — they clipped your rear quarter!', 5);
-      if (window._pitdbg) console.log('PITDBG executed side=' + side + ' latV=' + Math.round(pc2.latV));
+      sayNearestCop(pc2, pick(CHATTER.copPit));
+      if (window._pitdbg) console.log('PITDBG executed side=' + side + ' latV=' + Math.round(pc2.latV) + ' spin=' + (pc2.pitSpin9 ? pc2.pitSpin9.v.toFixed(2) : '0'));
     }
   }
   let t = focus();
@@ -11943,6 +12139,11 @@ function updTaxi(dt) {
 // water, buoyancy floats you back up, breath is finite once submerged.
 let swim = null;
 function enterSwim() {
+  // HANDS-FULL LAW (mission plan): carrying the job means the water is not
+  // a route — a hands-full leg dies the moment you go in. On a wheels job
+  // the hands are only full once the cargo car is actually IN HAND (stage 1)
+  if (mission && mission.hands === 'full' && !(mission.type === 'wheels' && mission.stage === 0))
+    failMission('Hands full — the water took the job with it.');
   const dpt = depthAtPx(player.x, player.y);
   swim = { z: dpt > 4 ? 2.2 : 0, breath: 18, bubT: 0 };
   player.wvx = player.wvy = 0;
@@ -12075,33 +12276,61 @@ const CHATTER = {
     'Quiet night. Too quiet.',
     'Overtime again. Combine pays the city, city pays me.',
     'You hear about that Ledger piece? All smoke.',
-    'Coffee\'s cold. Night\'s long.'
+    'Coffee\'s cold. Night\'s long.',
+    'Dispatch says stay sharp. Dispatch always says that.',
+    'My cruiser pulls left. Motor pool says it\'s fine. It\'s not fine.',
+    'Twenty years and these streets still surprise me.',
+    'Sarge wants reports by six. Sarge can wait.'
   ],
   copSpot: [
     'Freeze! Hands where I can see \'em!',
     'It\'s him — call it in!',
     'Stop right there!',
-    'You\'re done running, ghost!'
+    'You\'re done running, ghost!',
+    'Eyes on the suspect — moving in!',
+    'There! By the corner — GO GO GO!',
+    'All units, he\'s HERE!',
+    'Don\'t make this worse, pal!'
   ],
   copSwat: [
     'SWAT\'s rolling — pin him down!',
     'Where\'s that air support?!',
     'Weapons free! WEAPONS FREE!',
-    'He\'s not walking away this time!'
+    'He\'s not walking away this time!',
+    'Perimeter\'s set — squeeze him!',
+    'Watch your crossfire! Civilians on the block!'
   ],
   copDisarm: [
     'Drop the weapon! NOW!',
-    'Holster it — last warning!'
+    'Holster it — last warning!',
+    'I see that iron! Put it AWAY!'
   ],
   copBust: [
     'You\'re done, ghost.',
-    'Cuff him. Watch the hands.'
+    'Cuff him. Watch the hands.',
+    'End of the road. Hands behind your back.',
+    'Book him. The Ledger can write THAT up.'
   ],
   copBaton: [
     'Stop resisting!',
     'Give it up!',
     'On the ground, NOW!',
-    'We can do this all night!'
+    'We can do this all night!',
+    'Last chance before this gets ugly!'
+  ],
+  copMad: [
+    'You HIT my cruiser?! Oh, you\'re DONE!',
+    'That\'s city property, you maniac!',
+    'He\'s ramming units — take him DOWN!',
+    'You just made this personal!',
+    'Officer needs backup — vehicle assault in progress!',
+    'My CAR! You\'re paying for that in YEARS!'
+  ],
+  copPit: [
+    'PIT executed — he\'s spinning!',
+    'Got him loose — box him in!',
+    'Textbook. Now WRAP him up!',
+    'He\'s sideways! Close it, close it!'
   ],
   goonAggro: [
     'There he is — light him up!',
@@ -12714,6 +12943,125 @@ function updGunship(dt) {
     sfx('rocket', sx3, sy3);
   }
 }
+// THE PIT, PROPERLY EXECUTED (Tank order): a punch to the rear quarter
+// breaks the rear tires loose — the car takes a lateral kick AND a yaw
+// spin around its nose, scaled by how fast it was going. The driver
+// panics; grip, speed, and hands decide spin-out, save, or rollover.
+function pitKick9(vict9, side9) {
+  const sp9 = Math.abs(vict9.speed);
+  vict9.latV = (vict9.latV || 0) - side9 * Math.min(150, 40 + sp9 * 0.7);
+  vict9.pitSpin9 = { v: side9 * Math.min(2.4, 0.5 + sp9 * 0.012) * Math.sign(vict9.speed || 1), t: 1.1 };
+  vict9.speed *= 0.82;
+  vict9.panicT = Math.max(vict9.panicT || 0, 2.2);
+  skidOn(vict9, 1);
+}
+// ROLLOVER (Tank order): tires that hook an edge mid-slide trip the
+// chassis — the lateral energy becomes roll. Every quarter turn batters
+// the shell; land back on the wheels and you drive away, anywhere else
+// the car settles disabled on its side or roof until repaired.
+function updRoll9(c, dt) {
+  const R9 = c.rolled9;
+  if (!R9.settled) {
+    if (!R9.commit9 && R9.ang < 6) {
+      // TWO-WHEEL BALANCE (Tank precision order): a gravity PENDULUM
+      // about the contact tires. Restoring torque −G·sin(θb − ang)
+      // weakens toward the balance angle θb = atan(halfTrack / CoM
+      // height) — every vehicle tips by its own geometry, width is the
+      // stabilizer (mass had its say upstream when the impulse set the
+      // slide). The wheel is LIVE: steering against the roll rights it,
+      // into the roll throws it over — fast hands, fast answers, both
+      // ways. Lose below balance and gravity rides it DOWN through the
+      // angles: the landing is exactly as hard as the speed it comes in.
+      if (R9.bal9 === undefined) R9.bal9 = Math.atan((c.w * RS * 0.5) / 1.3);
+      let tq9 = -5.2 * Math.sin(R9.bal9 - R9.ang);
+      if (c === player.car && !player.dead) {
+        const st9 = (key('KeyA') || key('ArrowLeft') ? -1 : 0) + (key('KeyD') || key('ArrowRight') ? 1 : 0) +
+          (Math.abs(padLX) > 0.25 ? Math.sign(padLX) : 0);
+        if (st9 !== 0) {
+          // STEER INTO THE FALL to catch it (Tank: countersteer wasn't
+          // working — the sign was backwards): turning TOWARD the tipped
+          // side drives the contact patch back under the weight, exactly
+          // like catching a falling broom. Steering away helps it over.
+          // Authority rides your SPEED — a crawling car can't steer out
+          // of a roll, a fast one snaps back hard.
+          const auth9 = Math.min(3.6, 0.9 + Math.abs(c.speed) * 0.014);
+          tq9 += (st9 === R9.dir ? -1 : 0.6) * auth9;
+        }
+      } else if (c.driver) tq9 -= 1.8;   // ANY driver fights the flip on reflex — cop, cabbie, mobster alike
+      R9.w += tq9 * dt;
+      R9.ang += R9.w * dt;
+      if (R9.ang >= R9.bal9) R9.commit9 = true;   // over the balance — it's going
+      else if (R9.ang <= 0) {
+        // BACK ON FOUR TIRES: gravity brought it down — fast or gentle,
+        // the springs and the sheet metal answer to the arrival speed
+        const wIn9 = Math.abs(R9.w);
+        c.rolled9 = null;
+        if (c.mesh) c.mesh.rotation.x = 0;
+        c._bpRV9 = (c._bpRV9 || 0) - R9.dir * Math.min(1.0, wIn9 * 0.3);
+        if (wIn9 > 2.0) carDamage(c, CAR_KINDS[c.kind].hp * 0.03, null);
+        sfx('crash', c.x, c.y, 60 + Math.min(160, wIn9 * 50));
+        if (c === player.car) rumble(Math.min(1, wIn9 * 0.3), 0.4, 220);
+      }
+    } else if (R9.back9) {
+      // slumping back off the SIDE crest — gravity brings it down to the
+      // last stable base it passed
+      R9.ang -= R9.w * dt;
+      R9.w += 2.4 * dt;
+      if (R9.ang <= R9.back9.t) {
+        const k9 = Math.round(R9.back9.t / (Math.PI / 2));
+        if (k9 % 4 === 0) { c.rolled9 = null; if (c.mesh) c.mesh.rotation.x = 0; }
+        else { R9.ang = R9.back9.t; R9.back9 = null; R9.settled = true; }
+        carDamage(c, CAR_KINDS[c.kind].hp * 0.04, null);   // the slump-down thump
+        sfx('crash', c.x, c.y, 110);
+        if (c === player.car) rumble(0.5, 0.4, 200);
+        if (c.rolled9 && c.rolled9.settled && mission && mission.car === c) failMission('The car is wrecked.');
+      }
+    } else {
+      R9.commit9 = true;
+      R9.ang += R9.w * dt;
+      R9.w *= Math.pow(0.28, dt);
+      const q9 = Math.floor(R9.ang / (Math.PI / 2));
+      if (q9 > (R9.q || 0)) {
+        R9.q = q9;
+        R9.w *= 0.75;                          // every landing crunches energy out
+        carDamage(c, CAR_KINDS[c.kind].hp * 0.12, null);
+        sfx('crash', c.x, c.y, 160);
+        if (c === player.car) rumble(0.9, 0.6, 260);
+      }
+      if (R9.w < 1.1) {
+        const k9 = Math.round(R9.ang / (Math.PI / 2));
+        if (k9 % 2 !== 0) {
+          // a car's SIDE is a knife edge, not a bed (Tank: side rests were
+          // far too common) — it tips ON to the roof or slumps BACK to the
+          // wheels, whichever side of the crest the energy died on
+          if (R9.ang >= k9 * (Math.PI / 2)) R9.w = 1.35;               // over the crest — carry on
+          else { R9.back9 = { t: (k9 - 1) * (Math.PI / 2) }; R9.w = 1.1; }   // short of it — slump home
+        } else {
+          R9.ang = k9 * (Math.PI / 2);
+          if (k9 % 4 === 0) { c.rolled9 = null; if (c.mesh) c.mesh.rotation.x = 0; }
+          else {
+            R9.settled = true;
+            if ((R9.q || 0) < k9) {            // the settling fall IS a landing — bill the
+              carDamage(c, CAR_KINDS[c.kind].hp * 0.12, null);   // crunch unless that quarter already paid
+              sfx('crash', c.x, c.y, 160);
+              if (c === player.car) rumble(0.9, 0.6, 260);
+            }
+            // a mission car on its roof is a lost mission, not a soft-lock
+            if (mission && mission.car === c) failMission('The car is wrecked — it\'s not driving anywhere.');
+          }
+        }
+      }
+    }
+  }
+  if (c.rolled9 && !c.rolled9.commit9 && !c.rolled9.settled) {
+    c.speed *= Math.pow(0.75, dt);             // two wheels still carry the power
+    c.latV = (c.latV || 0) * Math.pow(0.25, dt);
+  } else {
+    c.speed *= Math.pow(0.12, dt);             // committed metal scrubs hard
+    c.latV = (c.latV || 0) * Math.pow(0.08, dt);
+  }
+  moveCar(c, dt);
+}
 function carCollisions() {
   for (let i = 0; i < cars.length; i++) {
     const a = cars[i];
@@ -12768,6 +13116,7 @@ function carCollisions() {
           // the climbing face must LEAD: contact ahead when rolling
           // forward, behind in reverse — a side scrape stays a scrape
           if (lx9 * Math.sign(tank.speed) > tank.len * 0.18) {
+            if (vict.rolled9) { vict.rolled9 = null; if (vict.mesh) vict.mesh.rotation.x = 0; }   // the treads stomp a rolled shell flat first
             vict.crushT9 = 0.001;
             vict.crushBy9 = tank;
             tank.climbT9 = 0.001;
@@ -12800,8 +13149,13 @@ function carCollisions() {
       // impact carries MASS and closing speed along the contact normal:
       // the heavy party delivers, the light party receives (Tank order)
       const mA9 = CAR_KINDS[a.kind].mass || 1, mB9 = CAR_KINDS[b.kind].mass || 1;
-      const cvx9 = a.speed * Math.cos(a.angle) - b.speed * Math.cos(b.angle);
-      const cvy9 = a.speed * Math.sin(a.angle) - b.speed * Math.sin(b.angle);
+      // FULL velocity vectors — forward AND lateral: a sliding car carries
+      // its sideways momentum into the hit (Tank order: current travel
+      // speed vs the impact of the collision)
+      const cvx9 = (Math.cos(a.angle) * a.speed - Math.sin(a.angle) * (a.latV || 0))
+                 - (Math.cos(b.angle) * b.speed - Math.sin(b.angle) * (b.latV || 0));
+      const cvy9 = (Math.sin(a.angle) * a.speed + Math.cos(a.angle) * (a.latV || 0))
+                 - (Math.sin(b.angle) * b.speed + Math.cos(b.angle) * (b.latV || 0));
       const closing9 = Math.abs(cvx9 * nx + cvy9 * ny);
       const recvA9 = closing9 * 2 * mB9 / (mA9 + mB9);
       const recvB9 = closing9 * 2 * mA9 / (mA9 + mB9);
@@ -12820,8 +13174,8 @@ function carCollisions() {
             carDamage(player.car, copRamDmg9(player.car, 10 + Math.abs(copC.speed) * 0.05), null);
             dentCar(player.car, (copC.x + player.car.x) / 2, (copC.y + player.car.y) / 2, 130 + Math.abs(copC.speed) * 0.6);
             rumble(0.8, 0.5, 300);
-            player.car.speed += copC.speed * 0.22;             // the shove
-            player.car.latV += (Math.random() < 0.5 ? -1 : 1) * 26;
+            // the shove itself now arrives through the MASS-ENERGY impulse
+            // in the tail — the old scripted push-bar boost double-counted it
             sfx('crash', (copC.x + player.car.x) / 2, (copC.y + player.car.y) / 2);
             sparks((copC.x + player.car.x) / 2, (copC.y + player.car.y) / 2);
           }
@@ -12838,7 +13192,12 @@ function carCollisions() {
         if (a === player.car || b === player.car) rumble(clamp(impact / 350, 0.3, 1), 0.5, 260);
         sfx('crash', (a.x + b.x) / 2, (a.y + b.y) / 2, impact);
         sparks((a.x + b.x) / 2, (a.y + b.y) / 2);
-        if (by && (a.kind === 'cop' || b.kind === 'cop')) addHeat(0.3);
+        if (by && (a.kind === 'cop' || b.kind === 'cop')) {
+          addHeat(0.3);
+          // the officer is not amused — one bark per grind, not per frame
+          const cc9 = a.kind === 'cop' ? a : b;
+          if ((cc9.madT9 || 0) <= 0) { cc9.madT9 = 5; sayNearestCop(cc9, pick(CHATTER.copMad)); }
+        }
       }
       // a crush pair stays OVERLAPPED by design — the mutual impact scrub
       // would strangle the tank to a standstill on top of its victim
@@ -12849,8 +13208,53 @@ function carCollisions() {
           if (mA9 <= mB9 * 0.5) windshield9(a, a.speed || impact);
           if (mB9 <= mA9 * 0.5) windshield9(b, b.speed || impact);
         }
-        a.speed *= 0.55; b.speed *= 0.55;
-        a.latV *= 0.55; b.latV *= 0.55;
+        if (!at && !bt) {
+          // MASS-ENERGY TRANSFER (Tank order): the hit hands the victim its
+          // momentum by mass — one impulse along the contact normal, split
+          // by the mass ratio, decomposed into each car's OWN frame:
+          // forward = roll/shove along the body, lateral = tire scoot/skid.
+          // Restitution 0.35: metal crumples, it doesn't bounce. Momentum
+          // is conserved by construction. Physics owns everything after.
+          // Tanks stay on their crush machinery (the scrub below).
+          const rel9 = cvx9 * nx + cvy9 * ny;          // >0 = still approaching
+          if (rel9 > 0) {
+            const dvA9 = 1.35 * rel9 * mB9 / (mA9 + mB9);
+            const dvB9 = 1.35 * rel9 * mA9 / (mA9 + mB9);
+            const caA9 = Math.cos(a.angle), saA9 = Math.sin(a.angle);
+            const caB9 = Math.cos(b.angle), saB9 = Math.sin(b.angle);
+            a.speed += -(nx * caA9 + ny * saA9) * dvA9;
+            a.latV = (a.latV || 0) + (nx * saA9 - ny * caA9) * dvA9;
+            b.speed += (nx * caB9 + ny * saB9) * dvB9;
+            b.latV = (b.latV || 0) + (-nx * saB9 + ny * caB9) * dvB9;
+          }
+          // A PLAYER CAN PIT ANYONE (Tank order): land your nose on their
+          // rear quarter at speed and the rear breaks loose — the same
+          // maneuver the law runs on you, same physics, any victim
+          const att9 = a === player.car ? a : b === player.car ? b : null;
+          const vpt9 = att9 === a ? b : a;
+          if (att9 && vpt9.kind !== 'tank' && vpt9.kind !== 'helo' && vpt9.kind !== 'boat'
+            && (vpt9.pitCd9 || 0) <= 0 && Math.abs(att9.speed) > 60) {
+            const caV9 = Math.cos(vpt9.angle), saV9 = Math.sin(vpt9.angle);
+            const lxV9 = (att9.x - vpt9.x) * caV9 + (att9.y - vpt9.y) * saV9;
+            const lzV9 = -(att9.x - vpt9.x) * saV9 + (att9.y - vpt9.y) * caV9;
+            if (lxV9 < -vpt9.len * 0.15 && lxV9 > -vpt9.len * 0.95 && Math.abs(lzV9) > vpt9.w * 0.3 && Math.abs(lzV9) < vpt9.w * 1.4) {
+              vpt9.pitCd9 = 1.5;
+              pitKick9(vpt9, Math.sign(lzV9) || 1);
+              msg('PIT — you clipped their rear quarter!', 4);
+              // POLICE TAKE IT PERSONALLY (Tank order): spinning a cruiser
+              // is assaulting an officer, not a fender tap
+              if (vpt9.kind === 'cop') {
+                addHeat(1);
+                copSeen = true;
+                msg('You PIT a CRUISER — the law takes that PERSONALLY.', 6);
+                sayNearestCop(vpt9, pick(CHATTER.copMad));
+              }
+            }
+          }
+        } else {
+          a.speed *= 0.55; b.speed *= 0.55;
+          a.latV *= 0.55; b.latV *= 0.55;
+        }
       }
     }
   }
@@ -13551,8 +13955,9 @@ function killPed(p, byPlayer) {
   if (byPlayer) {
     if (frenzy) frenzy.kills++;
     if (p.cop) addHeat(1.2);
-    // mission hostiles are the Combine's problem, not the city's — no heat
-    else if (p.guard || p.target || p.goon) { /* the job IS the fight */ }
+    // mission hostiles are the Combine's problem, not the city's — no heat.
+    // The faction brand itself counts too: Combine blood is always free.
+    else if (p.guard || p.target || p.goon || p.combine) { /* the job IS the fight */ }
     else addHeat(0.6);
     if (!p.cop && Math.random() < 0.35) {
       const pk = { x: p.x, y: p.y, type: 'cash', val: ri(20, 90), active: true, t: 0, temp: true };
@@ -13617,8 +14022,12 @@ function computeAim() {
 function combatMission() {
   // the cordon: cops hold the perimeter of a sanctioned mission firefight —
   // no witnessed-gunfire heat, no open-carry disarm, no mid-fight arrests.
-  // escort waves (armed hunters on the informant) are exactly such a fight.
-  return !!mission && (mission.type === 'goons' || mission.type === 'hit' || mission.type === 'escort');
+  // EVERY job that fields armed Combine counts (Tank order: "as long as my
+  // targets are the Combine, I should be scott free"): goons crews, hits,
+  // escort hunter waves, sting springs, search watchmen, escape chasers.
+  // Cops and civilians dying still bill full heat — killPed handles that.
+  return !!mission && (mission.type === 'goons' || mission.type === 'hit' || mission.type === 'escort' ||
+    mission.type === 'sting' || mission.type === 'search' || mission.type === 'escape');
 }
 function gunfireWitnessed() {
   stingGo();                                 // a sting waits for YOUR first shot
@@ -13641,42 +14050,13 @@ function gunfireWitnessed() {
     msg('Shots fired in front of the law!', 8);
   }
 }
-// TRAFFIC LAW (Tank order): run a RED at a signalized crossing, or drive
-// INTO ONCOMING for more than a second, with any officer's eyes on you —
-// that's a star. Yellow is legal; empty streets tell no tales.
-function updTrafficLaw(pc, dt) {
-  if (pardonMode || pc.kind === 'boat' || pc.kind === 'helo') return;
-  pc.redCdT = (pc.redCdT || 0) - dt;
-  const moving = Math.abs(pc.speed) > 30;
-  const travelA = pc.angle + (pc.speed < 0 ? Math.PI : 0);
-  const tdir = ((Math.round(travelA / (Math.PI / 2)) % 4) + 4) % 4;
-  const ix = Math.floor(pc.x / TILE), iy = Math.floor(pc.y / TILE);
-  const cb = colBase(ix), rb = rowBase(iy);
-  const coreKey = cb >= 0 && rb >= 0 ? cb + ',' + rb : null;
-  // RED LIGHT: the frame the car ENTERS a signalized box against its red.
-  // TICKET CAP (Tank order): reckless driving only ever writes the FIRST
-  // star — at 1+ stars the law stops ticketing and starts chasing. Only
-  // a body under your wheels escalates past it.
-  if (coreKey && pc._coreKey !== coreKey && moving && pc.redCdT <= 0 && stars() < 1
-    && signalized.has(coreKey) && tlAt(coreKey, tdir) === 'r' && policeCanSee()) {
-    pc.redCdT = 5;                             // one run, one ticket
-    addHeat(1);
-    msg('RAN A RED LIGHT in front of the law!', 7);
-  }
-  pc._coreKey = coreKey;
-  // ONCOMING: driving AGAINST the lane's installed flow past the 1s grace
-  // (heading perpendicular = crossing/turning, that's legal)
-  const legal9 = laneDirAt(pc.x, pc.y);
-  const wrong = moving && legal9 >= 0 && tdir === (legal9 + 2) % 4;
-  if (wrong) {
-    pc.wrongT = (pc.wrongT || 0) + dt;
-    if (pc.wrongT > 1 && stars() < 1 && policeCanSee()) {   // same one-star cap
-      pc.wrongT = -4;                          // ticketed — grace before the next one
-      addHeat(1);
-      msg('DRIVING INTO ONCOMING in front of the law!', 7);
-    }
-  } else pc.wrongT = Math.min(pc.wrongT || 0, 0);
-}
+// TRAFFIC LAW (Tank orders 2026-07-12/13): fully REPEALED for the player.
+// Red lights are legal AND driving into oncoming is legal — he runs reds
+// like a mad man and drifts wherever the corner takes him. AI traffic
+// still obeys its own laws in updTraffic (shared signal state only). The
+// one street crime left is a BODY under the wheels — billed where the
+// ped-contact pass catches it, and that one still escalates.
+function updTrafficLaw(pc, dt) {}
 // AIM TRIANGLE (do not re-break):
 //   1) mark M = where the look ray hits the world (crosshairPoint)
 //   2) 3rd-person camera sits above the character and lookAt(M)  → reticle ON M
@@ -14332,6 +14712,7 @@ const STORY = [
   { t: 'Jason knows a guy', brief: 'A dockworker keeps lists of what the Combine ships at night. Meet him. Come back safe.', type: 'meeting', reward: 120 },
   {
     t: 'Stop the presses', brief: 'The morning edition is wall-to-wall lies about you. Take the delivery car off the street.', type: 'wheels', reward: 250,
+    stage: { at: 'ledger', brief: 'The vans load behind the Ledger. It starts here — and so does the clock.' },
     chain: [
       { type: 'rush', n: 4, timer: 75, brief: 'Their other three vans are still rolling — hit every drop corner before dawn.' }
     ]
@@ -14347,7 +14728,7 @@ const STORY = [
       'MARA: Stay on YOURS. Try to keep up.'
     ]
   },
-  { t: 'Evidence on wheels', brief: 'A sedan full of proof. They want it gone. You want it more — and they WILL chase.', type: 'wheels', reward: 750, hot: 2 },
+  { t: 'Evidence on wheels', brief: 'A sedan full of proof. They want it gone. You want it more — and they WILL chase.', type: 'wheels', reward: 750, hot: 2, far: 2600, hands: 'full' },
   {
     t: 'Two faces', brief: 'A detective on their payroll meets his handlers tonight. Spring the trap — nobody walks.', type: 'sting', n: 4, reward: 900,
     partner: { name: 'MARA', shirt: 0x2a6a3a },
@@ -14516,6 +14897,7 @@ let pendingStealth = false;                  // armed by story.stealth, lands on
 function inFront(q, x, y) { return Math.cos(q.angle) * (x - q.x) + Math.sin(q.angle) * (y - q.y) > 0; }
 function objectivePoint() {
   if (!mission) return null;
+  if (mission.type === 'stage' || mission.type === 'travel') return mission.target;
   if (mission.type === 'wheels') return mission.stage === 0 ? { x: mission.car.x, y: mission.car.y } : mission.target;
   if (mission.type === 'hit') return mission.target.dead ? null : { x: mission.target.x, y: mission.target.y };
   if (mission.type === 'rush') return mission.pts[mission.i];
@@ -14568,14 +14950,35 @@ function startMission(island) {
         startCutscene(np9, L9, null);
       }
     }
+    if (story.sixStar) {
+      heat = 6; wantedClearT = 30; copSeen = true;
+      msg('SIX STARS — the state answers with EVERYTHING it has. The trap is live.', 10);
+    }
+  }
+  // LEG ENGINE (mission plan): a staged job arms NOTHING at the phone — the
+  // phone is only the broker. The marker leads to the authored START POINT;
+  // arriving there triggers the brief, spawns the work AROUND that point,
+  // and starts the clock. Travel is free, by any means.
+  if (story && story.stage) {
+    mission = {
+      type: 'stage', target: resolveLegPoint(story.stage, player.x, player.y, isl),
+      hands: story.stage.hands || null, reward, title,
+      next9: { story, type, reward, title, isl }
+    };
+    msg('Get to the START POINT — marker on the map. The clock starts when you arrive.', 12);
+    return;
+  }
+  buildMissionWork(story, type, reward, title, isl);
+}
+// the work itself — spawned at the phone for plain jobs, at the start
+// point for staged ones (blunder/stealth arm here so they land on the
+// WORK, never on a free-travel leg)
+function buildMissionWork(story, type, reward, title, isl) {
+  if (story) {
     if (story.blunder) pendingBlunder = rndf(10, 20);
     if (story.stealth) {
       pendingStealth = true;
       msg('STEALTH JOB — stay out of eyelines. Takedowns from BEHIND are silent; gunfire is not.', 12);
-    }
-    if (story.sixStar) {
-      heat = 6; wantedClearT = 30; copSeen = true;
-      msg('SIX STARS — the state answers with EVERYTHING it has. The trap is live.', 10);
     }
   }
   if (type === 'wheels') {
@@ -14585,7 +14988,9 @@ function startMission(island) {
     c.driver = null; c.keep = true; c.speed = 0;
     attachCarMesh(c);
     cars.push(c);
-    const t = roadPoint(p.x, p.y, 1000, 2000, isl);
+    // story.far = the drop-off is placed by DRIVING distance (route px),
+    // pastSpan taunts a locked bridge on the way — the leg-engine law
+    const t = story && story.far ? farRoadPoint(p.x, p.y, story.far, story.pastSpan) : roadPoint(p.x, p.y, 1000, 2000, isl);
     mission = { type: 'wheels', stage: 0, car: c, target: { x: t.x, y: t.y }, reward, title };
     if (!story) msg('JOB: Boost the marked car and deliver it.', 10);
   } else if (type === 'hit') {
@@ -14736,12 +15141,23 @@ function startMission(island) {
       console.log('CHNDBG stage 1/' + mission.stageTotal + ' type=' + mission.type);
     }
     if (story.hot) mission.hot = story.hot;
+    if (story.hands) mission.hands = story.hands;   // hands-full: water is not a route
+    if (story.finish) {
+      // the LAST LEG: the payout waits at the end of the drive
+      mission.finishPt = resolveLegPoint(story.finish, player.x, player.y, isl);
+      mission.finishBrief = story.finish.brief || '';
+      mission.finishHands = story.finish.hands || null;
+      mission.finishTimer = story.finish.timer;
+      mission.stageNo = mission.stageNo || 1;
+      mission.stageTotal = (mission.stageTotal || 1) + 1;
+    }
   }
 }
 // staged jobs: the payout only comes when the LAST objective falls —
 // everything before that rolls straight into the next stage
 function advanceStage(d) {
-  const keep = { reward: mission.reward, title: mission.title, chain: mission.chain, stageTotal: mission.stageTotal, stageNo: (mission.stageNo || 1) + 1 };
+  const keep = { reward: mission.reward, title: mission.title, chain: mission.chain, stageTotal: mission.stageTotal, stageNo: (mission.stageNo || 1) + 1,
+    finishPt: mission.finishPt, finishBrief: mission.finishBrief, finishHands: mission.finishHands, finishTimer: mission.finishTimer, hands: mission.hands };
   clearGuards();
   sfx('mission');
   cineSting = { t: 1.6, title: 'OBJECTIVE COMPLETE', pay: 0, kind: 'obj', why: d.brief };
@@ -14833,6 +15249,25 @@ function completeMission() {
     advanceStage(mission.chain.shift());
     return;
   }
+  // LEG ENGINE: a finish leg holds the payout hostage — the work is done,
+  // now GET THERE. The clock carries over if one was running (the plan:
+  // the clock runs from the start point to the last point).
+  if (mission.finishPt && mission.type !== 'travel') {
+    const fin9 = mission;
+    clearGuards();
+    sfx('mission');
+    cineSting = { t: 1.6, title: 'OBJECTIVE COMPLETE', pay: 0, kind: 'obj', why: fin9.finishBrief || 'Now the last leg.' };
+    mission = {
+      type: 'travel', target: fin9.finishPt,
+      hands: fin9.finishHands || null,
+      // the clock carries — but a buzzer-beater finish still gets 10s to move
+      timer: fin9.timer !== undefined ? Math.max(fin9.timer, 10) : fin9.finishTimer,
+      reward: fin9.reward, title: fin9.title,
+      stageNo: fin9.stageTotal || 2, stageTotal: fin9.stageTotal || 2
+    };
+    msg(fin9.finishBrief || 'Get to the marked point — the job pays at the end of the road.', 12);
+    return;
+  }
   player.cash += mission.reward;
   STATS.missionsPassed++;
   STATS.cashEarned += mission.reward;
@@ -14885,6 +15320,7 @@ function completeMission() {
   }
 }
 function failMission(why) {
+  pendingBlunder = 0; pendingStealth = false;   // armed extras die with the job, never leak to the next one
   cineSting = { t: 2.2, title: 'MISSION FAILED', pay: 0, kind: 'fail', why: why || '' };
   rumble(0.5, 0.15, 320);
   STATS.missionFails++;
@@ -14983,6 +15419,30 @@ function updMission(dt) {
   if (!mission) return;
   if (pendingBlunder) { mission.blunderT = pendingBlunder; pendingBlunder = 0; }
   if (pendingStealth) { mission.stealth = true; pendingStealth = false; }
+  // LEG ENGINE — the free-travel legs
+  if (mission.type === 'stage') {
+    const f9 = focus();
+    if (!cutscene && dist(f9.x, f9.y, mission.target.x, mission.target.y) < 55) {
+      const nx9 = mission.next9;
+      mission = null;
+      sfx('mission');
+      cineSting = { t: 1.6, title: 'ON SITE', pay: 0, kind: 'obj', why: (nx9.story.stage && nx9.story.stage.brief) || 'The clock is running.' };
+      if (nx9.story.stage && nx9.story.stage.brief) msg(nx9.story.stage.brief, 10);
+      // island containment re-read HERE — the phone's snapshot goes stale
+      // when the stage sits across the water from where the call came in
+      buildMissionWork(nx9.story, nx9.type, nx9.reward, nx9.title, anyBridgeOpen() ? undefined : islandOfPx(player.x, player.y));
+    }
+    return;
+  }
+  if (mission.type === 'travel') {
+    if (mission.timer !== undefined) {
+      if (!cutscene) mission.timer -= dt;   // the movie pauses the clock
+      if (mission.timer <= 0) { failMission('Time ran out!'); return; }
+    }
+    const f9 = focus();
+    if (!cutscene && dist(f9.x, f9.y, mission.target.x, mission.target.y) < 55) completeMission();
+    return;
+  }
   // stealth law: one alerted sentry and the job is BLOWN
   if (mission.stealth && !cutscene) {
     for (const q of peds) {
@@ -15743,6 +16203,8 @@ function update(dt) {
 
   for (const c of cars) {
     if (c.dead) continue;
+    if (c.pitCd9 > 0) c.pitCd9 -= dt;
+    if (c.madT9 > 0) c.madT9 -= dt;
     if (c.drowned) {
       // HEAVY THINGS DO NOT FLOAT (Tank order): steel goes to the bottom.
       // Air-filled tires are the ONE exception — an unpunctured set holds
@@ -15755,13 +16217,44 @@ function update(dt) {
         c.sink = Math.min(1.5, (c.sink || 0) + dt * 0.9);
         if (c.sink >= 1.49) c.sink = 1.5 + Math.sin(gtime * 1.7 + c.x * 0.01) * 0.1;   // riding its tires
       }
+      if (c.rolled9 && !c.rolled9.settled) {   // the water ends a roll where it is
+        c.rolled9.ang = Math.round(c.rolled9.ang / (Math.PI / 2)) * (Math.PI / 2);
+        c.rolled9.settled = true;
+      }
       c.speed *= Math.pow(0.1, dt); c.latV *= Math.pow(0.1, dt);
       moveCar(c, dt);                          // drifting dead metal, nothing more
+    } else if (c.rolled9 && c.driver !== 'player') {
+      updRoll9(c, dt);
+      // settled on its side or roof: the driver climbs out once it's quiet
+      if (c.rolled9 && c.rolled9.settled && (c.panicT || 0) <= 0 && !c.onFireT &&
+        (c.driver === 'ai' || c.driver === 'cop' || c.driver === 'mob' || c.driver === 'mil')) {
+        c.bailT9 = (c.bailT9 || 0) + dt;
+        if (c.bailT9 > 2.2) {
+          const bp9 = mkPed(c.x + Math.cos(c.angle + Math.PI / 2) * 20, c.y + Math.sin(c.angle + Math.PI / 2) * 20,
+            c.driver === 'cop' ? { cop: true, hp: 50, spd: 75, shirt: 0x20306a } : undefined);
+          bp9.state = 'flee'; bp9.fleeT = 6; bp9.angle = rndf(0, TAU);
+          attachPedMesh(bp9); peds.push(bp9);
+          c.driver = null;
+        }
+      }
     } else if (c.driver === 'ai') updTraffic(c, dt);
     else if (c.driver === 'mil') updMilGuard(c, dt);
     else if (c.driver === 'cop') { if (c.kind === 'tank') updArmyTank(c, dt); else updCopCar(c, dt); }
     else if (c.driver === 'mob') updMobCar(c, dt);
-    else if (c.driver === null && (Math.abs(c.speed) > 2 || Math.abs(c.latV) > 2)) { c.speed *= Math.pow(0.2, dt); tireGrip(c, dt, 1); moveCar(c, dt); }
+    else if (c.driver === null && (Math.abs(c.speed) > 2 || Math.abs(c.latV) > 2)) {
+      // PARK (Tank order): an unoccupied car sits with the pawl engaged —
+      // locked wheels SKID when shoved, they never roll away, and the
+      // pawl swallows anything under a real hit. Boats have no pawl:
+      // a nudged hull glides on the water like it always did.
+      if (c.kind === 'boat') {
+        c.speed *= Math.pow(0.2, dt);
+        tireGrip(c, dt, 1); moveCar(c, dt);
+      } else {
+        c.speed *= Math.pow(0.04, dt);
+        if (Math.abs(c.speed) < 12 && Math.abs(c.latV) < 12) { c.speed = 0; c.latV = 0; }
+        else { tireGrip(c, dt, 1); moveCar(c, dt); }
+      }
+    }
     if (c.onFireT > 0) {
       // fire eats the car at 8 HP/s — whether it ever lets go depends on
       // how hurt the metal already is:
@@ -16508,6 +17001,10 @@ function syncScene(dt, t) {
     c.mesh.position.set(c.x * RS, gHeightAt(c) + (c.empl || 0) - (c.sink || 0) + (c.curbY9 || 0), c.y * RS);
     c.mesh.scale.y = 1 - (c.crushF9 || 0) * 0.55;   // the weight above flattens it
     c.mesh.rotation.y = -c.angle;
+    if (c.rolled9) {                                 // rolling/settled: the shell rides its roll angle
+      c.mesh.rotation.x = c.rolled9.dir * c.rolled9.ang;
+      if (!c.drowned) c.mesh.position.y += Math.abs(Math.sin(c.rolled9.ang)) * c.w * RS * 0.4;
+    }
     if (c.kind === 'tank') {
       // the whole BASE tilts: scripted climb pitch + NATURAL pitch from
       // end elevations (rear rises -> nose down) + natural side lean
@@ -16564,6 +17061,11 @@ function syncScene(dt, t) {
       }
       c.wheelRoll = (c.wheelRoll || 0) + c.speed * RS * dt / 0.62;
       for (const wr of c.mesh.userData.wheelRolls) wr.rotation.z = -c.wheelRoll;
+      if ((c.wheelSpin9 || 0) > 0.1 && c.mesh.userData.rollsR9) {
+        // the REAR tires over-spin while the drift is lit — power without grip
+        c._wspin9 = (c._wspin9 || 0) + c.wheelSpin9 * 34 * dt;
+        for (const wr9 of c.mesh.userData.rollsR9) wr9.rotation.z = -c.wheelRoll - c._wspin9;
+      }
     }
     if (c.mesh.userData.turret) c.mesh.userData.turret.rotation.y = -(c.turret - c.angle);
     if (c.kind === 'tank') updTankGear9(c, dt, t);   // chains, springs, shock
@@ -16579,8 +17081,13 @@ function syncScene(dt, t) {
       const pT9 = clamp(dv9 * 0.0004, -0.055, 0.055);                                  // + = nose up under throttle
       const rT9 = clamp(-om29 * c.speed * 0.00016 - (c.latV || 0) * 0.0012, -0.05, 0.05);   // lean OUT of the corner
       // STIFF street suspension (Tank order): lifting off the gas gets a
-      // firm settle, not a nosedive — doubled rate, heavy damping
-      c._bpPV9 = ((c._bpPV9 || 0) + (pT9 - (c._bpP9 || 0)) * 200 * dt) * Math.pow(0.006, dt);
+      // firm settle, not a nosedive — doubled rate, heavy damping.
+      // FRONT SPRING (Tank order): the body-to-front-wheel spring itself
+      // runs 300 vs the rear's 200 — nose-down displacement compresses the
+      // FRONT coils, so they answer. Everything downstream (dive depth,
+      // settle, what a curb jolt does to the shell) is physics' business.
+      const pk9 = (pT9 < 0 || (c._bpP9 || 0) < 0) ? 300 : 200;
+      c._bpPV9 = ((c._bpPV9 || 0) + (pT9 - (c._bpP9 || 0)) * pk9 * dt) * Math.pow(0.006, dt);
       c._bpP9 = (c._bpP9 || 0) + c._bpPV9 * dt;
       c._bpRV9 = ((c._bpRV9 || 0) + (rT9 - (c._bpR9 || 0)) * 200 * dt) * Math.pow(0.006, dt);
       c._bpR9 = (c._bpR9 || 0) + c._bpRV9 * dt;
@@ -16643,23 +17150,29 @@ function syncScene(dt, t) {
       p.mesh.rotation.set(0, -p.angle, 0);
     }
   }
-  // the Ghost at the wheel: rides the driver's bucket of whatever he drives
-  // (tank is buttoned up, the bird's cockpit is its own mesh — those stay)
+  // the Ghost at the wheel: LOCKED INTO THE SEAT (Tank order) — parented
+  // into the car's sprung body so he inherits EVERY transform the shell
+  // has (yaw, rollover roll+lift, boat waves, sink, garage air, springs,
+  // even the crush) from the matrix pass the car already pays for. The
+  // old world-space re-placement ran trig every frame and knew only yaw —
+  // the body stayed upright while the car flipped through it. This is
+  // BOTH the lock-in and an FPS win: the per-frame seat math is gone.
+  // (Tank is buttoned up, the bird's cockpit is its own mesh — those stay.)
   const pcSeat = player.car && !player.car.dead && player.car.mesh
     && player.car.kind !== 'tank' && player.car.kind !== 'helo' ? player.car : null;
   ghostSeat.visible = !!pcSeat && state !== 'menu' && !player.dead;
   if (pcSeat) {
-    const udS = pcSeat.mesh.userData;
-    const fxS = udS.driverFig ? udS.driverFig.position.x : -1.4;   // boats: the bench
-    const fyS = udS.driverFig ? udS.driverFig.position.y : 2.1;
-    const fzS = udS.driverFig ? udS.driverFig.position.z : 0;
-    const csS = Math.cos(pcSeat.angle), snS = Math.sin(pcSeat.angle);
-    ghostSeat.position.set(
-      pcSeat.x * RS + csS * fxS - snS * fzS,
-      fyS + (pcSeat.alt || 0) + gHeightAt(pcSeat) - (pcSeat.sink || 0),
-      pcSeat.y * RS + snS * fxS + csS * fzS);
-    ghostSeat.rotation.y = -pcSeat.angle;
-  }
+    const seatG9 = pcSeat.mesh.userData.bodyG9 || pcSeat.mesh;   // boats have no spring group
+    if (ghostSeat.parent !== seatG9) {
+      const udS = pcSeat.mesh.userData;
+      seatG9.add(ghostSeat);
+      ghostSeat.position.set(
+        udS.driverFig ? udS.driverFig.position.x : -1.4,         // boats: the bench
+        udS.driverFig ? udS.driverFig.position.y : 2.1,
+        udS.driverFig ? udS.driverFig.position.z : 0);
+      ghostSeat.rotation.y = 0;                                  // faces where the car faces
+    }
+  } else if (ghostSeat.parent !== scene) scene.add(ghostSeat);   // back to the world on foot
   // player
   player.mesh.visible = !player.car && state !== 'menu' && !player.dead;
   if (player.mesh.visible) {
@@ -17250,13 +17763,15 @@ function drawHUD(t) {
       goons: 'Drop the crew: ' + mission.count + '/' + mission.need,
       meeting: mission.stage === 0 ? 'Go talk to ' + mission.whoName : 'Return to ' + mission.homeName,
       search: 'Evidence ' + mission.found + '/' + (mission.pts ? mission.pts.length : 0) + '  (on foot)',
-      escape: 'Lose the tail — get to the hideout'
+      escape: 'Lose the tail — get to the hideout',
+      stage: 'Get to the START POINT — the clock waits',
+      travel: 'Get to the marked point'
     };
     hctx.fillStyle = '#ffd23f';
     hctx.font = 'bold 15px monospace';
     const stageTag = mission.stageTotal > 1 ? '  [' + mission.stageNo + '/' + mission.stageTotal + ']' : '';
     hctx.fillText((mission.title ? mission.title + stageTag + '  —  ' : '') + lines[mission.type], VW / 2, yy + 4);
-    if (mission.type === 'rush' || mission.type === 'goons' || mission.type === 'escape') {
+    if ((mission.type === 'rush' || mission.type === 'goons' || mission.type === 'escape' || mission.type === 'travel') && mission.timer !== undefined) {
       hctx.font = 'bold 26px monospace';
       hctx.fillStyle = mission.timer < 15 ? '#ff4040' : '#fff';
       hctx.fillText(Math.ceil(mission.timer) + 's', VW / 2, yy + 36);
@@ -18674,35 +19189,35 @@ if (location.hash === '#trafficlaw') {
   peds.push(wcop);
   const drive = (x9, y9) => { pcar.x = x9; pcar.y = y9; pcar.angle = 0; pcar.speed = 120; player.x = pcar.x; player.y = pcar.y; };
   const lane = (K[1] + 1) * TILE + TILE / 2;
-  // 1) run the red under the officer's eyes
+  // 1) run the red under the officer's eyes — REPEALED (Tank order: "I run
+  // reds like a mad man"): a witnessed red run writes NOTHING now
   heat = 0; wantedClearT = 0; copSeen = false;
   setT(9);                                     // EW red at this crossing
   drive((K[0] - 2) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
   drive((K[0] + 0.5) * TILE, lane); updTrafficLaw(pcar, 1 / 60);   // ENTER the box
-  ck('redRunStar', stars() === 1);
-  // 2) green is legal
-  heat = 0; pcar._coreKey = null; pcar.redCdT = 0;
+  ck('redRunFree', stars() === 0);
+  // 2) green is legal (trivially, now that reds are too)
+  heat = 0;
   setT(1);
   drive((K[0] - 2) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
   drive((K[0] + 0.5) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
   ck('greenNoStar', stars() === 0);
-  // 3) nobody watching = no ticket
+  // 3) nobody watching, red run — still nothing
   wcop.dead = true;
-  heat = 0; pcar._coreKey = null; pcar.redCdT = 0;
+  heat = 0;
   setT(9);
   drive((K[0] - 2) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
   drive((K[0] + 0.5) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
   ck('unseenNoStar', stars() === 0);
   wcop.dead = false;
-  // 4) oncoming: NORTH lane heading EAST (legal flow is west), 1s grace
-  heat = 0; pcar.wrongT = 0;
+  // 4) oncoming: REPEALED (Tank order) — drive against the flow all
+  // night, the law has nothing to write
+  heat = 0;
   drive((K[0] - 5) * TILE, K[1] * TILE + TILE / 2);
   pcar.speed = 100;
-  for (let i = 0; i < 54; i++) updTrafficLaw(pcar, 1 / 60);   // 0.9s in
-  ck('under1sNoStar', stars() === 0);
-  for (let i = 0; i < 12; i++) updTrafficLaw(pcar, 1 / 60);   // past the second
-  ck('oncomingStar', stars() === 1);
-  heat = 0; pcar.wrongT = 0;
+  for (let i = 0; i < 120; i++) updTrafficLaw(pcar, 1 / 60);
+  ck('oncomingFree', stars() === 0);
+  heat = 0;
   drive((K[0] - 5) * TILE, lane);                             // legal lane eastbound
   pcar.speed = 100;
   for (let i = 0; i < 90; i++) updTrafficLaw(pcar, 1 / 60);
@@ -18753,18 +19268,18 @@ if (location.hash === '#trafficlaw') {
     const fresh2 = peds.filter(q2 => q2.cop && !q2.dead && dist(q2.x, q2.y, gm.x, gm.y) < 700).length;
     ck('copKillerDrawsBackup', fresh2 >= 2 && gm.outlawT > 20);
   } else { ck('gunmanShoots', false); ck('copKillerDrawsBackup', false); }
-  // ---- LIVE LOOP: the real update() chain writes the ticket (Tank's field
-  // test failed because his save had the PARDON on — prove both directions)
+  // ---- LIVE LOOP: the real update() chain through a red writes NOTHING
+  // now that the red-light penalty is repealed — prove it end to end
   pardonMode = false; godMode = true;
-  heat = 0; pcar._coreKey = null; pcar.redCdT = 0; pcar.wrongT = 0;
+  heat = 0; pcar.wrongT = 0;
   drive((K[0] - 2) * TILE, lane);
   pcar.speed = 0;
   keys['KeyW'] = true;
   for (let i = 0; i < 150; i++) { setT(9); update(1 / 60); }
   keys['KeyW'] = false;
-  ck('liveLoopRedStar', stars() >= 1);
-  pardonMode = true;                           // the pardon really waives it
-  heat = 0; pcar._coreKey = null; pcar.redCdT = 0;
+  ck('liveLoopRedFree', stars() === 0);
+  pardonMode = true;                           // and the pardon changes nothing about it
+  heat = 0;
   drive((K[0] - 2) * TILE, lane);
   pcar.speed = 0;
   keys['KeyW'] = true;
@@ -18772,10 +19287,9 @@ if (location.hash === '#trafficlaw') {
   keys['KeyW'] = false;
   ck('pardonWaivesTicket', stars() === 0);
   pardonMode = false;
-  // ---- TICKET CAP: at 1 star the law stops writing — a second witnessed
-  // red run adds NOTHING
+  // ---- reds add nothing at ANY star count either
   heat = 1; wantedClearT = 30; copSeen = true;
-  pcar._coreKey = null; pcar.redCdT = 0; pcar.wrongT = 0;
+  pcar.wrongT = 0;
   setT(9);
   drive((K[0] - 2) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
   drive((K[0] + 0.5) * TILE, lane); updTrafficLaw(pcar, 1 / 60);
@@ -18790,16 +19304,28 @@ if (location.hash === '#trafficlaw') {
     const wit = mkPed(pcar.x + 46, pcar.y - 90, { cop: true, hp: 50, spd: 75, shirt: 0x20306a });
     attachPedMesh(wit);
     peds.push(wit);
-    const vic = mkPed(pcar.x + 46, pcar.y, copHit ? { cop: true, hp: 50, spd: 75, shirt: 0x20306a } : undefined);
+    // spd 0: a wandering victim strolls off the run line before the car
+    // arrives (RNG-lucky staging before — caught when the physics changes
+    // shifted the random stream) — the dummy STANDS on its mark
+    const vic = mkPed(pcar.x + 46, pcar.y, copHit ? { cop: true, hp: 50, spd: 0, shirt: 0x20306a } : { spd: 0 });
     attachPedMesh(vic);
     peds.push(vic);
     keys['KeyW'] = true;
-    for (let i = 0; i < 40; i++) { setT(1); update(1 / 60); }
+    // run line pinned: leftover probe cars now BOUNCE and DEFLECT the
+    // runner (impulse physics) — the run-over LAW is what's on trial
+    // here, not the drive
+    for (let i = 0; i < 40; i++) { setT(1); pcar.speed = 130; pcar.latV = 0; pcar.y = lane; pcar.angle = 0; update(1 / 60); }
     keys['KeyW'] = false;
+    R.push('[mow' + (copHit ? 'C' : '') + ' vicDead=' + vic.dead + ' rag=' + !!vic.rag + ' heat=' + heat.toFixed(1) + ' dx=' + Math.round(pcar.x - (K[0] - 5) * TILE) + ' vy=' + Math.round(vic.y - lane) + ']');
     wit.dead = true;
     vic.dead = true;
     return stars();
   };
+  // the mow runs need a CLEAR lane — the personality probes left cars
+  // parked mid-street, and impulse physics turns them into pinballs that
+  // stall round one (round two always ran clean off round one's punt)
+  let park9 = 0;
+  for (const c9 of cars) if (c9 !== pcar) { c9.x = WORLD_W - 300 - (park9++ % 12) * 70; c9.y = WORLD_H - 300; c9.speed = 0; c9.latV = 0; }
   ck('runOverEscalates', mow(false) >= 2);
   ck('copRunOverWorse', mow(true) >= 3);
   // ---- picked-up iron stays STOWED: hands keep what they had
@@ -19018,11 +19544,27 @@ if (location.hash === '#ghostseat') {
   rdown = false;
   adsCamera(1 / 60);
   ck('aimPathLeavesBodyHidden', player.mesh.visible === false);
+  // the ghost is PARENTED into the seat now — read its WORLD position
   const fig9 = pcar.mesh.userData.driverFig.position;
   const cs9 = Math.cos(pcar.angle), sn9 = Math.sin(pcar.angle);
   const ex9 = pcar.x * RS + cs9 * fig9.x - sn9 * fig9.z;
   const ez9 = pcar.y * RS + sn9 * fig9.x + cs9 * fig9.z;
-  ck('ghostInSeat', Math.hypot(ghostSeat.position.x - ex9, ghostSeat.position.z - ez9) < 0.01);
+  pcar.mesh.updateMatrixWorld(true);
+  const gw9 = new THREE.Vector3();
+  ghostSeat.getWorldPosition(gw9);
+  ck('ghostInSeat', Math.hypot(gw9.x - ex9, gw9.z - ez9) < 0.05);
+  ck('ghostLockedToShell', ghostSeat.parent === pcar.mesh.userData.bodyG9);
+  // flip the car under him: the body must ride the roll, not stand through it
+  pcar.rolled9 = { ang: Math.PI / 2, w: 0, dir: 1, q: 1, settled: true, commit9: true };
+  pcar.mesh.rotation.order = 'YZX';
+  syncScene(1 / 60, 1);
+  pcar.mesh.updateMatrixWorld(true);
+  const gq9 = new THREE.Quaternion();
+  ghostSeat.getWorldQuaternion(gq9);
+  const gup9 = new THREE.Vector3(0, 1, 0).applyQuaternion(gq9);
+  ck('ghostRidesTheRoll', Math.abs(gup9.y) < 0.25);   // on its side, his up-axis is sideways too
+  pcar.rolled9 = null; pcar.mesh.rotation.x = 0;
+  syncScene(1 / 60, 1);
   const ai9 = mkCar(pcar.x + 200, pcar.y, 0, 'sedan', 'ai');
   attachCarMesh(ai9);
   cars.push(ai9);
@@ -20911,7 +21453,9 @@ if (location.hash === '#chain') {
   startMission(0);
   const iv = setInterval(() => {
     if (!mission) { console.log('CHNDBG complete, missionsDone=' + missionsDone + ' cash=' + player.cash); clearInterval(iv); return; }
-    if (mission.type === 'wheels') {
+    if (mission.type === 'stage') {                 // job 5 opens with a leg now — walk to the Ledger dock
+      player.x = mission.target.x; player.y = mission.target.y;
+    } else if (mission.type === 'wheels') {
       const c = mission.car;
       if (mission.stage === 0) {
         player.x = c.x; player.y = c.y;
@@ -20927,6 +21471,75 @@ if (location.hash === '#chain') {
       player.x = pt.x; player.y = pt.y;
     }
   }, 900);
+}
+if (location.hash === '#legs') {
+  // LEG ENGINE receipt (mission plan slice 1): the phone is a broker — a
+  // staged job arms NOTHING until the start point; route distance is
+  // DRIVING distance with locked spans honestly blocking; far placement
+  // clears its bar by road; pastSpan taunts a locked bridge; the finish
+  // leg holds the payout and carries the clock; hands-full legs die in
+  // the water; a drowned mission car fails the job (the old ghost hole).
+  window._noRender = true;
+  startGame();
+  godMode = true;
+  let lgFails = 0;
+  const RLG = [], ckLG = (n9, v9) => { RLG.push(n9 + '=' + v9); if (!v9) lgFails++; };
+  // --- routeDist: same island >= crow; locked harbor = NO route
+  const pa9 = roadPoint(playerStart.x, playerStart.y, 500, 1200, 0);
+  const pb9 = roadPoint(playerStart.x, playerStart.y, 1600, 2600, 0);
+  const rdA9 = routeDist(pa9.x, pa9.y, pb9.x, pb9.y);
+  ckLG('routeAtLeastCrow', rdA9 >= dist(pa9.x, pa9.y, pb9.x, pb9.y) - 2 * TILE);
+  const pi19 = roadPoint(playerStart.x, playerStart.y, 400, 1400, 1);
+  ckLG('lockedSpansBlockRoute', routeDist(pa9.x, pa9.y, pi19.x, pi19.y) === -1);
+  setBarrier(0, false); bridgesOpen[0] = true;      // open the north harbor for the far tests
+  ckLG('openSpanRoutes', routeDist(pa9.x, pa9.y, pi19.x, pi19.y) > 0);
+  // --- far placement by road
+  const fp9 = farRoadPoint(pa9.x, pa9.y, 2600);
+  ckLG('farClearsTheBar', fp9.route >= 2600);
+  // --- pastSpan: south harbor LOCKED — the crow line brushes it, the road detours
+  const ne9 = roadPoint(52 * TILE, 62 * TILE, 100, 700, 0);
+  let ps9 = null;
+  for (let t9 = 0; t9 < 3 && !ps9; t9++) {
+    const c9 = farRoadPoint(ne9.x, ne9.y, 800, 1);
+    if (_crowNearSpan9(ne9.x, ne9.y, c9.x, c9.y, 1) && c9.route > dist(ne9.x, ne9.y, c9.x, c9.y) * 1.29) ps9 = c9;
+  }
+  ckLG('pastSpanTaunts', !!ps9);
+  setBarrier(0, true); bridgesOpen[0] = false;      // restore the fresh-game gates
+  // --- the staged start: job 5 arms nothing at the phone
+  missionsDone = 4;
+  startMission(0);
+  ckLG('phoneIsABroker', !!mission && mission.type === 'stage' && mission.timer === undefined);
+  const sp9 = objectivePoint();
+  ckLG('markerLeadsToStart', !!sp9 && sp9.x === mission.target.x && sp9.y === mission.target.y);
+  player.x = mission.target.x; player.y = mission.target.y;
+  for (let i9 = 0; i9 < 5 && mission && mission.type === 'stage'; i9++) update(1 / 60);
+  ckLG('arrivalArmsTheWork', !!mission && mission.type === 'wheels');
+  ckLG('workSpawnsAtTheStage', !!mission && dist(mission.car.x, mission.car.y, player.x, player.y) <= 1900);
+  failMission('receipt done');
+  // --- the finish leg holds the payout and carries the clock
+  const cash09 = player.cash;
+  mission = { type: 'goons', targets: [], count: 1, need: 1, timer: 42, reward: 500, title: 'LEGTEST', finishPt: { x: player.x + 800, y: player.y }, finishBrief: 'go', stageNo: 1, stageTotal: 2 };
+  completeMission();
+  ckLG('finishHoldsThePayout', !!mission && mission.type === 'travel' && player.cash === cash09);
+  ckLG('clockCarriesOver', !!mission && Math.abs(mission.timer - 42) < 1);
+  player.x = mission.target.x; player.y = mission.target.y;
+  update(1 / 60);
+  ckLG('finishArrivalPays', mission === null && player.cash === cash09 + 500);
+  // --- hands-full law: the water kills the leg
+  mission = { type: 'travel', target: { x: player.x + 5000, y: player.y }, hands: 'full', reward: 1, title: 'W' };
+  enterSwim();
+  ckLG('handsFullDiesInWater', mission === null);
+  swim = null;
+  // --- a drowned mission car fails the job
+  let wx9 = 0, wy9 = 0;
+  for (let iy9 = 4; iy9 < GRID_H - 4 && !wx9; iy9++) for (let ix9 = 4; ix9 < GRID_W - 4; ix9++)
+    if (tileAt(ix9, iy9) === T_WATER) { wx9 = (ix9 + 0.5) * TILE; wy9 = (iy9 + 0.5) * TILE; break; }
+  const wc9 = mkCar(wx9, wy9, 0, 'sedan', null);
+  wc9.keep = true; attachCarMesh(wc9); cars.push(wc9);
+  mission = { type: 'wheels', stage: 0, car: wc9, target: { x: 0, y: 0 }, reward: 1, title: 'W' };
+  moveCar(wc9, 1 / 60);
+  ckLG('drownedMissionCarFails', mission === null && wc9.drowned === true);
+  console.log('LEGDBG ' + RLG.join(' ') + ' fails=' + lgFails);
 }
 if (location.hash === '#baton') {
   // state-driven receipt: 1 star = baton out + swings + arrest lands;
@@ -21453,6 +22066,201 @@ if (location.hash === '#ramlaw') {
   ckRL('sixStarsExecutes', pvR.dead === true);
   console.log('RAMDBG ' + RRL.join(' ') + ' fails=' + rlFails);
 }
+if (location.hash === '#impact') {
+  // IMPACT PHYSICS receipt (Tank orders): mass-energy hands the victim its
+  // momentum (conserved by construction), broadsides scoot the tires
+  // sideways, an unoccupied car sits in PARK (pawl holds the weak, locked
+  // wheels skid the strong to a stop), and tires that hook a lip mid-slide
+  // ROLL the car — quarter turns batter it, off-wheels settles disabled,
+  // wheels-down drives away.
+  window._noRender = true;
+  startGame();
+  godMode = true;
+  let imFails = 0;
+  const RIM = [], ckIM = (n9, v9) => { RIM.push(n9 + '=' + v9); if (!v9) imFails++; };
+  const mk9 = (kind9, x9, y9, ang9, drv9) => { const c9 = mkCar(x9, y9, ang9, kind9, drv9); c9.keep = true; attachCarMesh(c9); cars.push(c9); return c9; };
+  const bx9 = player.x + 300, by9 = player.y;
+  // --- 1) mass-energy: sedan at 200 into a parked truck's tail
+  const tr9 = mk9('truck', bx9, by9, 0, null);
+  const sd9 = mk9('sedan', bx9 - 40, by9, 0, null);
+  sd9.speed = 200; tr9.speed = 0;
+  carCollisions();
+  ckIM('victimTakesTheEnergy', tr9.speed > 30);
+  ckIM('strikerShedsIt', sd9.speed < 160);
+  ckIM('momentumConserved', Math.abs((tr9.speed * 1.9 + sd9.speed * 1.0) - 200) < 8);
+  // --- 2) broadside: the tires scoot sideways
+  sd9.x = bx9 + 600; sd9.y = by9; sd9.angle = 0; sd9.speed = 0; sd9.latV = 0;
+  const cp9 = mk9('cop', bx9 + 600, by9 - 22, 1, null);
+  cp9.angle = Math.PI / 2;                   // broadside: cop bearing down on the sedan's flank
+  cp9.speed = 180;
+  carCollisions();
+  ckIM('tiresScootSideways', Math.abs(sd9.latV) > 40);
+  sd9.latV = 0; sd9.speed = 0; cp9.x += 300; cp9.speed = 0;
+  // --- 3) PARK: the pawl holds a weak nudge dead
+  tr9.speed = 8; tr9.latV = 0;
+  update(1 / 60);
+  ckIM('pawlHoldsTheWeak', tr9.speed === 0);
+  // --- 3b) a real hit skids the locked wheels to a stop, no roll-away
+  const tx09 = tr9.x;
+  tr9.speed = 150;
+  for (let i9 = 0; i9 < 240 && tr9.speed !== 0; i9++) update(1 / 60);
+  ckIM('parkSkidsAndStops', tr9.speed === 0 && Math.abs(tr9.x - tx09) > 25 && Math.abs(tr9.x - tx09) < 700);
+  // --- 4) rollover: a hard slide into a curb lip trips the chassis
+  let rx9 = 0, ry9 = 0;
+  for (let iy9 = 6; iy9 < GRID_H - 6 && !rx9; iy9++) for (let ix9 = 6; ix9 < GRID_W - 6; ix9++)
+    if (tileAt(ix9, iy9) === T_ROAD && tileAt(ix9, iy9 + 1) === T_SIDE) { rx9 = (ix9 + 0.5) * TILE; ry9 = (iy9 + 0.5) * TILE - 6; break; }
+  const rv9 = mk9('sedan', rx9, ry9, 0, 'ai');
+  const hp09 = rv9.hp;
+  for (let i9 = 0; i9 < 80 && !rv9.rolled9; i9++) { rv9.latV = 280; rv9.speed = 0; moveCar(rv9, 1 / 60); }
+  ckIM('lipHooksTheSlide', !!rv9.rolled9);
+  for (let i9 = 0; i9 < 300 && rv9.rolled9 && !rv9.rolled9.settled && !rv9.dead; i9++) update(1 / 60);
+  ckIM('rollEndsAtRest', rv9.dead || !rv9.rolled9 || rv9.rolled9.settled === true);
+  ckIM('quartersBatterTheShell', rv9.dead || rv9.hp < hp09);
+  ckIM('settledLiesOffWheels', rv9.dead || !rv9.rolled9 || Math.round(rv9.rolled9.ang / (Math.PI / 2)) % 4 !== 0);
+  // --- 5) landing back on the wheels = drivable again
+  const rc9 = mk9('sedan', bx9, by9 + 500, 0, null);
+  rc9.rolled9 = { ang: Math.PI * 2 - 0.2, w: 1.05, dir: 1, q: 3, settled: false };
+  rc9.mesh.rotation.order = 'YZX';
+  for (let i9 = 0; i9 < 60 && rc9.rolled9; i9++) update(1 / 60);
+  ckIM('wheelsDownRecovers', !rc9.rolled9 && rc9.mesh.rotation.x === 0);
+  // --- 6) the teeter: not enough momentum = NO flip — gravity slams it back
+  if (!rv9.dead) { rv9.x = bx9 + 900; rv9.y = by9 + 700; rv9.latV = 0; rv9.speed = 0; }
+  const tt9 = mk9('sedan', rx9, ry9, 0, 'ai');
+  const thp9 = tt9.hp;
+  for (let i9 = 0; i9 < 80 && !tt9.rolled9; i9++) { tt9.latV = 140; tt9.speed = 0; moveCar(tt9, 1 / 60); }
+  ckIM('weakHookStillTrips', !!tt9.rolled9);
+  for (let i9 = 0; i9 < 90 && tt9.rolled9; i9++) update(1 / 60);
+  ckIM('gravityWinsTheTeeter', !tt9.rolled9 && !tt9.dead && tt9.hp > thp9 - 8);
+  tt9.x = bx9 - 400; tt9.y = by9 + 700; tt9.latV = 0;
+  // --- 7) hands on the wheel: countersteer saves the flip hands-off commits
+  const cs9 = mk9('sedan', bx9, by9 + 900, 0, null);
+  cs9.driver = 'player'; player.car = cs9;
+  cs9.rolled9 = { ang: 0.05, w: 3.2, dir: 1, q: 0, settled: false };
+  cs9.mesh.rotation.order = 'YZX';
+  keys.KeyD = true;                            // rolling RIGHT: steer INTO the fall to catch it
+  for (let i9 = 0; i9 < 120 && cs9.rolled9; i9++) { cs9.speed = Math.max(cs9.speed, 120); stepPlayerCar(cs9, 1 / 60); }
+  keys.KeyD = false;
+  ckIM('counterSteerSavesIt', !cs9.rolled9 && !cs9.dead);
+  cs9.rolled9 = { ang: 0.05, w: 3.2, dir: 1, q: 0, settled: false };
+  for (let i9 = 0; i9 < 200 && cs9.rolled9 && !cs9.rolled9.settled && !cs9.dead; i9++) stepPlayerCar(cs9, 1 / 60);
+  ckIM('handsOffFlips', !cs9.dead && !!cs9.rolled9 && cs9.rolled9.settled === true);
+  player.car = null; cs9.driver = null;
+  // --- 8) a DRIVER fights the flip on reflex — cop, cabbie, anyone
+  const af9 = mk9('sedan', bx9, by9 + 1100, 0, 'ai');
+  af9.rolled9 = { ang: 0.05, w: 2.7, dir: 1, q: 0, settled: false };
+  af9.mesh.rotation.order = 'YZX';
+  for (let i9 = 0; i9 < 120 && af9.rolled9; i9++) update(1 / 60);
+  ckIM('aiDriverFightsTheFlip', !af9.rolled9 && !af9.dead);
+  // --- 9) the player PITs anyone: nose on the rear quarter = spin-out
+  const pvt9 = mk9('sedan', bx9 + 300, by9 + 1100, 0, 'ai');
+  pvt9.speed = 70;
+  const pat9 = mk9('sedan', bx9 + 300 - 26, by9 + 1100 + 14, 0, null);
+  pat9.driver = 'player'; player.car = pat9;
+  pat9.speed = 120;
+  carCollisions();
+  ckIM('playerPitSpins', !!pvt9.pitSpin9 && Math.abs(pvt9.latV) > 30);
+  const ang09 = pvt9.angle;
+  for (let i9 = 0; i9 < 30; i9++) moveCar(pvt9, 1 / 60);
+  ckIM('pitYawsTheNose', Math.abs(angDiff(ang09, pvt9.angle)) > 0.08);
+  // --- 10) the law takes a PIT personally
+  const cvp9 = mk9('cop', bx9 + 600, by9 + 1100, 0, null);
+  cvp9.driver = 'cop'; cvp9.speed = 70;
+  pat9.x = cvp9.x - 26; pat9.y = cvp9.y + 14; pat9.angle = 0; pat9.speed = 120;
+  heat = 0; copSeen = false;
+  carCollisions();
+  ckIM('lawTakesPitPersonally', stars() >= 1 && !!cvp9.pitSpin9);
+  player.car = null; pat9.driver = null; heat = 0;
+  console.log('IMPDBG ' + RIM.join(' ') + ' fails=' + imFails);
+}
+if (location.hash === '#drift') {
+  // DRIFT receipt (Tank order): gas + brake on a REAR-DRIVE car spins the
+  // rear loose — earned from friction, power, speed, and mass, never
+  // scripted. Every kind drifts like itself; four-wheel drive holds.
+  window._noRender = true;
+  startGame();
+  godMode = true;
+  let drFails = 0;
+  const RDR = [], ckDR = (n9, v9) => { RDR.push(n9 + '=' + v9); if (!v9) drFails++; };
+  const dcs9 = mkCar(player.x + 200, player.y, 0, 'sedan', 'player');
+  dcs9.keep = true; attachCarMesh(dcs9); cars.push(dcs9); player.car = dcs9;
+  keys.KeyW = true; keys.KeyS = true;
+  dcs9.speed = 120;
+  let tIn9 = -1;
+  for (let i9 = 0; i9 < 240; i9++) { dcs9.speed = Math.max(dcs9.speed, 90); stepPlayerCar(dcs9, 1 / 60); if (tIn9 < 0 && (dcs9.drift9 || 0) > 0.5) tIn9 = i9; }
+  ckDR('rearBreaksLoose', tIn9 > 0);
+  ckDR('notEasilyDone', tIn9 >= 15);           // held pedals, not a tap
+  keys.KeyD = true;                            // steer while loose: the slide carries
+  for (let i9 = 0; i9 < 45; i9++) { dcs9.speed = Math.max(dcs9.speed, 90); stepPlayerCar(dcs9, 1 / 60); }
+  keys.KeyD = false;
+  ckDR('slideCarries', Math.abs(dcs9.latV) > 35);
+  keys.KeyW = false; keys.KeyS = false;
+  for (let i9 = 0; i9 < 90; i9++) stepPlayerCar(dcs9, 1 / 60);
+  ckDR('gripComesBack', (dcs9.drift9 || 0) === 0);
+  // the truck: less muscle, less grip — its own slower character
+  const dct9 = mkCar(player.x + 400, player.y, 0, 'truck', 'player');
+  dct9.keep = true; attachCarMesh(dct9); cars.push(dct9); player.car = dct9;
+  keys.KeyW = true; keys.KeyS = true;
+  dct9.speed = 120;
+  let tTr9 = -1;
+  for (let i9 = 0; i9 < 240; i9++) { dct9.speed = Math.max(dct9.speed, 90); stepPlayerCar(dct9, 1 / 60); if (tTr9 < 0 && (dct9.drift9 || 0) > 0.5) tTr9 = i9; }
+  ckDR('everyKindDriftsItself', tTr9 < 0 || tTr9 !== tIn9);
+  // the humvee is FOUR wheel drive — no rear end to break loose
+  const dch9 = mkCar(player.x + 600, player.y, 0, 'humvee', 'player');
+  dch9.keep = true; attachCarMesh(dch9); cars.push(dch9); player.car = dch9;
+  dch9.speed = 120;
+  for (let i9 = 0; i9 < 240; i9++) { dch9.speed = Math.max(dch9.speed, 90); stepPlayerCar(dch9, 1 / 60); }
+  ckDR('fourWheelDriveHolds', (dch9.drift9 || 0) === 0);
+  keys.KeyW = false; keys.KeyS = false; player.car = null;
+  console.log('DRIFTDBG in=' + tIn9 + 'f truck=' + tTr9 + 'f ' + RDR.join(' ') + ' fails=' + drFails);
+}
+if (location.hash === '#combinelaw') {
+  // COMBINE BLOOD IS FREE receipt (Tank order: "as long as my targets are
+  // the Combine, I should be scott free" — cops and civilians still bill):
+  // gunfire heat is waived on EVERY job that fields armed Combine, killing
+  // any combine-branded ped adds no heat, and a civilian or cop dying in
+  // the same fight still writes the full penalty.
+  window._noRender = true;
+  startGame();
+  godMode = true;
+  let cbFails = 0;
+  const RCB = [], ckCB = (n9, v9) => { RCB.push(n9 + '=' + v9); if (!v9) cbFails++; };
+  for (const ty9 of ['goons', 'hit', 'escort', 'sting', 'search', 'escape']) {
+    mission = { type: ty9, goons: [] };
+    ckCB('waives_' + ty9, combatMission());
+  }
+  mission = { type: 'rush' };
+  ckCB('rushStillPolices', !combatMission());
+  mission = null;
+  // a cop close enough to HEAR the shot; firing on a Combine job = free
+  const cw9 = mkPed(player.x + 100, player.y, { cop: true, hp: 50, spd: 0, shirt: 0x20306a });
+  attachPedMesh(cw9); peds.push(cw9);
+  heat = 0; copSeen = false; wantedClearT = 0;
+  mission = { type: 'sting', goons: [] };
+  gunfireWitnessed();
+  ckCB('stingGunfireFree', stars() === 0);
+  mission = null;
+  gunfireWitnessed();
+  ckCB('noJobGunfireBills', stars() === 1);
+  // the faction brand alone is free game — no goon/guard/target flag on him
+  heat = 0;
+  const cb9 = mkPed(player.x + 60, player.y, { combine: true, hp: 10, shirt: 0x6a1a1a });
+  attachPedMesh(cb9); peds.push(cb9);
+  killPed(cb9, true);
+  ckCB('combineBrandKillFree', heat === 0);
+  const gn9 = mkPed(player.x + 60, player.y, { goon: true, combine: true, hp: 10 });
+  attachPedMesh(gn9); peds.push(gn9);
+  killPed(gn9, true);
+  ckCB('goonKillFree', heat === 0);
+  // a civilian dying in the same fight still bills — and a cop is worse
+  const cv9 = mkPed(player.x + 70, player.y, { hp: 10 });
+  attachPedMesh(cv9); peds.push(cv9);
+  killPed(cv9, true);
+  ckCB('civilianStillBills', heat >= 0.6 - 0.001);
+  heat = 0;
+  killPed(cw9, true);
+  ckCB('copStillBills', heat >= 1.2 - 0.001);
+  console.log('CMBDBG ' + RCB.join(' ') + ' fails=' + cbFails);
+}
 if (location.hash === '#rambar') {
   // push-bar receipt: absorbs frontal hits, bends, tears off at 0 HP,
   // and only THEN does the cruiser's nose crumple
@@ -21500,15 +22308,19 @@ if (location.hash === '#respray') {
   console.log('RSPRDBG seenKeepsHeat=' + (heatSeen === 2) + ' hiddenClears=' + (heatHidden === 0) + ' paidTwice=' + (player.cash === 600));
 }
 if (location.hash === '#heat6') {
-  // star 6 soft gate: above 5 the meter fills at half rate
+  // STAGED ESCALATION (Tank order): stars 1-2 fill at full rate, star
+  // three and up at 60% — the heat has to be earned once it's really on —
+  // and past 5 at half rate. Star 6 stays reachable.
   startGame();
+  heat = 1; addHeat(1);
+  const below = Math.abs(heat - 2) < 0.01;
   heat = 3; addHeat(1);
-  const below = heat === 4;
+  const staged = Math.abs(heat - 3.6) < 0.01;
   heat = 5; addHeat(1);
   const gated = stars() === 5 && Math.abs(heat - 5.55) < 0.01;
-  addHeat(1);
+  addHeat(1); addHeat(1);
   const reached = stars() === 6;
-  console.log('HEAT6DBG belowUnchanged=' + below + ' gatedAt5=' + gated + ' stillReachable=' + reached);
+  console.log('HEAT6DBG fullBelowTwo=' + below + ' stagedMidBand=' + staged + ' gatedAt5=' + gated + ' stillReachable=' + reached);
 }
 if (location.hash === '#jump') {
   startGame();
@@ -22264,7 +23076,16 @@ if (location.hash === '#ally') {
   const c9 = mkPed(mp.x, mp.y + 50, { cop: true, patrol: true, hp: 200, shirt: 0x20306a });   // beside her, OUT of the firing lane
   attachPedMesh(c9); peds.push(c9);
   const gx = g9.x, gy = g9.y, cx = c9.x, cy = c9.y;
-  for (let i = 0; i < 300 && !g9.dead; i++) { update(1 / 60); if (!g9.dead) { g9.x = gx; g9.y = gy; } c9.x = cx; c9.y = cy; }
+  // MESH-TRUE ballistics need synced matrices — a synchronous update loop
+  // without syncScene raycasts a stale mesh and every shot whiffs (the
+  // same harness trap TLAWDBG's directHitDriverBolts fell into)
+  for (let i = 0; i < 300 && !g9.dead; i++) {
+    update(1 / 60);
+    if (!g9.dead) { g9.x = gx; g9.y = gy; }
+    c9.x = cx; c9.y = cy;
+    syncScene(1 / 60, i * 0.016);
+    if (g9.mesh) g9.mesh.updateMatrixWorld(true);
+  }
   const fights = g9.dead || g9.hp < 35;
   const noBait = !mp.pedOutlaw;
   const rc = mkCar(player.x + 20, player.y, 0, 'sedan', 'player');

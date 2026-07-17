@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>GTA 3: Nuvola City Stories</title>
 <style>
   html,body{margin:0;padding:0;overflow:hidden;background:#05050a;height:100%;
@@ -295,7 +297,16 @@ const TOUCH = {
   held: {},                     // button name -> touch id (ids can be 0!)
   useEdge: false
 };
-function touchMapW() { return TOUCH.on ? 112 : 208; }   // phone screens get the small map
+// Tank orders 2026-07-17: Android trims the map + runs fullscreen + pause/
+// radio buttons — and iPhone mimics Android 100%, so every phone rule
+// rides TOUCH.on, no platform split.
+function touchMapW() { return TOUCH.on ? 84 : 208; }   // phones get the small map
+function touchPauseBtn9() {
+  // upper right, tucked under the wanted-star stack (stars y36, countdown
+  // y58, FPS y76) — Tank order 2026-07-17
+  const r9 = clamp(Math.min(VW, VH) * 0.055, 24, 34);
+  return { x: VW - r9 - 16, y: 96 + r9, r: r9 };
+}
 function touchButtons() {
   // context layout: driving shows the pedals, on foot FIRE takes the big
   // bottom-right spot — all sized for thumbs, off the screen edges
@@ -306,6 +317,9 @@ function touchButtons() {
     b9.push({ n: 'brake', label: 'BRK', x: VW - r9 * 3.5 - 30, y: VH - r9 - 24, r: r9 });
     b9.push({ n: 'fire', label: 'FIRE', x: VW - r9 - 30, y: VH - r9 * 3.7 - 50, r: r9 });
     b9.push({ n: 'use', label: 'USE', x: VW - r9 * 3.6 - 36, y: VH - r9 * 3.3 - 32, r: r9 * 0.85 });
+    // radio toggle rides above USE — driving only (the radio itself only
+    // plays in a car). Tank order 2026-07-17.
+    b9.push({ n: 'radio', label: '♪', x: VW - r9 * 3.6 - 36, y: VH - r9 * 5.4 - 40, r: r9 * 0.7 });
   } else {
     b9.push({ n: 'fire', label: 'FIRE', x: VW - r9 - 24, y: VH - r9 - 46, r: r9 * 1.15 });
     b9.push({ n: 'use', label: 'USE', x: VW - r9 * 3.5 - 30, y: VH - r9 - 24, r: r9 });
@@ -315,10 +329,22 @@ function touchButtons() {
   return b9;
 }
 TOUCH._start = (id9, x9, y9) => {
+  // PAUSE binds ONLY where a touch STARTS — a finger sliding across it
+  // never activates it (Tank order 2026-07-17). Works while paused too:
+  // the paused input block eats Enter, so this tap is the only way back.
+  if (state === 'play') {
+    const pb9 = touchPauseBtn9();
+    if (Math.hypot(x9 - pb9.x, y9 - pb9.y) <= pb9.r * 1.15) {
+      TOUCH.pauseEdge9 = true;
+      TOUCH.held.pause = id9;     // claim the finger; its slide drives nothing
+      return;
+    }
+  }
   for (const b9 of touchButtons()) {
     if (Math.hypot(x9 - b9.x, y9 - b9.y) <= b9.r * 1.25) {
       TOUCH.held[b9.n] = id9;
       if (b9.n === 'use') TOUCH.useEdge = true;
+      if (b9.n === 'radio') TOUCH.radioEdge9 = true;   // tap = one KeyR, the keyboard toggle
       if (b9.n === 'weap') { TOUCH.weapT = 0; TOUCH.weapCx = b9.x; TOUCH.weapCy = b9.y; }
       return;
     }
@@ -358,12 +384,42 @@ TOUCH._end = (id9) => {
   if (TOUCH.look && TOUCH.look.id === id9) TOUCH.look = null;
   for (const n9 in TOUCH.held) if (TOUCH.held[n9] === id9) delete TOUCH.held[n9];
 };
+// PHONE FULLSCREEN (Tank orders 2026-07-17: "have the game go to full
+// screen on android when it is being used to give the player more room" +
+// "iPhone mimics Android 100%"): the browser only grants fullscreen inside
+// a real user gesture, so the request rides every touch that finds the
+// game windowed — that covers the first tap AND coming back after the
+// system back-gesture drops us out. iPhone WebKit refuses the fullscreen
+// API for pages (iPad grants it) — the same ask silently no-ops there;
+// the apple-mobile-web-app meta in <head> gives iPhone fullscreen when
+// the page is saved to the home screen.
+TOUCH.fsT9 = -1e9;
+TOUCH.fsOn9 = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+TOUCH.fsGo9 = () => {
+  const el9 = document.documentElement;
+  const req9 = el9.requestFullscreen || el9.webkitRequestFullscreen;
+  if (!req9) return;
+  try {
+    const p9 = req9.call(el9, { navigationUI: 'hide' });
+    if (p9 && p9.catch) p9.catch(() => {});
+  } catch (e9) {}
+};
+TOUCH.fsAsk9 = () => {
+  if (!TOUCH.on || TOUCH.fsOn9()) return false;
+  const now9 = performance.now();
+  if (now9 - TOUCH.fsT9 < 1500) return false;   // one polite ask per gesture burst
+  TOUCH.fsT9 = now9;
+  TOUCH.fsGo9();
+  return true;
+};
+TOUCH._onTouchStart9 = (e9) => {
+  TOUCH.fsAsk9();
+  e9.preventDefault();
+  for (const t9 of e9.changedTouches) TOUCH._start(t9.identifier, t9.clientX, t9.clientY);
+  if (state === 'menu' || paused) pressed.add('Enter');   // a tap works the menus
+};
 if (TOUCH.on) {
-  window.addEventListener('touchstart', (e9) => {
-    e9.preventDefault();
-    for (const t9 of e9.changedTouches) TOUCH._start(t9.identifier, t9.clientX, t9.clientY);
-    if (state === 'menu' || paused) pressed.add('Enter');   // a tap works the menus
-  }, { passive: false });
+  window.addEventListener('touchstart', TOUCH._onTouchStart9, { passive: false });
   window.addEventListener('touchmove', (e9) => {
     e9.preventDefault();
     for (const t9 of e9.changedTouches) TOUCH._move(t9.identifier, t9.clientX, t9.clientY);
@@ -388,6 +444,8 @@ function applyTouch(dt9) {
   if (TOUCH.held.brake !== undefined) padBrakeV = Math.max(padBrakeV, 1);
   if (TOUCH.held.fire !== undefined) padFire = true;
   if (TOUCH.useEdge) { pressed.add('KeyE'); TOUCH.useEdge = false; }
+  if (TOUCH.pauseEdge9) { pressed.add('KeyP'); TOUCH.pauseEdge9 = false; }   // rides the keyboard pause path, guards and all
+  if (TOUCH.radioEdge9) { pressed.add('KeyR'); TOUCH.radioEdge9 = false; }   // rides the keyboard radio toggle
 }
 function pollPad(dt) {
   padLX = padLY = padThrottle = padBrakeV = 0;
@@ -20973,6 +21031,29 @@ function drawHUD(t) {
   hctx.font = 'bold 13px monospace';
   hctx.fillStyle = fpsSmooth >= 50 ? '#8fa8c8' : fpsSmooth >= 30 ? '#ffd23f' : '#ff5050';
   hctx.fillText(Math.round(fpsSmooth) + ' FPS', VW - 14, s > 0 || disarmT > 0 ? 76 : 58);
+  // touch pause button under the star stack (Tank order 2026-07-17): a
+  // finger TAP works it — sliding across it never does (touch buttons
+  // only bind where the touch starts)
+  if (TOUCH.on && state === 'play') {
+    const pb9 = touchPauseBtn9();
+    hctx.fillStyle = 'rgba(0,0,0,0.55)';
+    hctx.beginPath(); hctx.arc(pb9.x, pb9.y, pb9.r, 0, TAU); hctx.fill();
+    hctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    hctx.lineWidth = 1.5;
+    hctx.beginPath(); hctx.arc(pb9.x, pb9.y, pb9.r, 0, TAU); hctx.stroke();
+    const bw9 = pb9.r * 0.22, bh9 = pb9.r * 0.62;
+    hctx.fillStyle = '#eef5ff';
+    if (paused) {                                     // play triangle: tap resumes
+      hctx.beginPath();
+      hctx.moveTo(pb9.x - bw9, pb9.y - bh9 / 2);
+      hctx.lineTo(pb9.x - bw9, pb9.y + bh9 / 2);
+      hctx.lineTo(pb9.x + bw9 * 1.6, pb9.y);
+      hctx.closePath(); hctx.fill();
+    } else {                                          // pause bars
+      hctx.fillRect(pb9.x - bw9 * 1.7, pb9.y - bh9 / 2, bw9, bh9);
+      hctx.fillRect(pb9.x + bw9 * 0.7, pb9.y - bh9 / 2, bw9, bh9);
+    }
+  }
   // Messages are a deliberately short stack of translucent cards. It keeps
   // the scene readable during the exact moments the game has most to say.
   hctx.textAlign = 'center';
@@ -21663,7 +21744,8 @@ function drawHUD(t) {
     hctx.font = 'bold 15px monospace';
     hctx.textAlign = 'center';
     for (const b9 of touchButtons()) {
-      const on9 = TOUCH.held[b9.n] !== undefined;
+      // the ♪ button doubles as the state light: green ring = radio ON
+      const on9 = TOUCH.held[b9.n] !== undefined || (b9.n === 'radio' && radioOn);
       hctx.fillStyle = on9 ? 'rgba(63,220,95,0.45)' : 'rgba(10,14,22,0.5)';
       hctx.beginPath(); hctx.arc(b9.x, b9.y, b9.r, 0, TAU); hctx.fill();
       hctx.strokeStyle = on9 ? '#3fdc5f' : 'rgba(255,255,255,0.55)';
@@ -23895,6 +23977,92 @@ if (location.hash === '#cores') {
     console.log('CORDBG ' + RC.join(' ') + ' fails=' + cFails);
   }, 800);
 }
+if (location.hash === '#android') {
+  // PHONE FIT receipt (Tank orders 2026-07-17, iPhone mimics Android
+  // 100%): on any phone the minimap shrinks and the game asks for
+  // fullscreen on the player's touch — once per gesture burst, never when
+  // already fullscreen, never on desktop. Plus the pause + radio buttons.
+  window._noRender = true;
+  startGame();
+  let aFails = 0;
+  const RA = [], ckA = (n9, v9) => { RA.push(n9 + '=' + v9); if (!v9) aFails++; };
+  const wasOn9 = TOUCH.on, wasGo9 = TOUCH.fsGo9, wasIs9 = TOUCH.fsOn9;
+  // --- the map sizes: one phone rule, iPhone = Android
+  TOUCH.on = true;
+  ckA('phoneMapIsSmaller', touchMapW() === 84);
+  ckA('iphoneMimicsAndroid', touchMapW() === 84 && TOUCH.fsAsk9.toString().includes('TOUCH.on'));
+  TOUCH.on = false;
+  ckA('desktopKeepsBigMap', touchMapW() === 208);
+  TOUCH.on = true;
+  // --- fullscreen rides the touch gesture
+  let asked9 = 0;
+  TOUCH.fsGo9 = () => { asked9++; };
+  TOUCH.fsOn9 = () => false;
+  TOUCH.fsT9 = -1e9;
+  const fakeTouch9 = { preventDefault: () => {}, changedTouches: [] };
+  TOUCH._onTouchStart9(fakeTouch9);
+  ckA('touchAsksForFullscreen', asked9 === 1);
+  TOUCH._onTouchStart9(fakeTouch9);
+  ckA('onePoliteAskPerBurst', asked9 === 1);
+  TOUCH.fsT9 = -1e9;
+  TOUCH.fsOn9 = () => true;
+  ckA('alreadyFullscreenStaysQuiet', TOUCH.fsAsk9() === false && asked9 === 1);
+  TOUCH.fsOn9 = () => false;
+  TOUCH.on = false;
+  TOUCH.fsT9 = -1e9;
+  ckA('neverAsksOnDesktop', TOUCH.fsAsk9() === false && asked9 === 1);
+  ckA('realAskUsesRequestFullscreen', wasGo9.toString().includes('requestFullscreen'));
+  // --- the pause button: upper right under the stars, TAP only
+  TOUCH.on = true;
+  const pb9 = touchPauseBtn9();
+  ckA('pauseBtnUnderTheStars', pb9.x > VW - 80 && pb9.y > 80 && pb9.y < 150);
+  pressed.delete('KeyP');
+  TOUCH._start(41, pb9.x, pb9.y);
+  const claimed9 = TOUCH.held.pause === 41 && !TOUCH.stick && !TOUCH.look;
+  applyTouch();
+  ckA('tapFiresThePausePath', pressed.has('KeyP'));
+  ckA('tapClaimsTheFinger', claimed9);
+  pressed.delete('KeyP');
+  TOUCH._end(41);
+  ckA('fingerReleasesClean', TOUCH.held.pause === undefined);
+  // a finger that starts elsewhere and SLIDES across the button does nothing
+  TOUCH._start(42, pb9.x - 220, pb9.y);
+  TOUCH._move(42, pb9.x, pb9.y);
+  applyTouch();
+  ckA('slideAcrossNeverPauses', !pressed.has('KeyP'));
+  TOUCH._end(42);
+  // works while paused too — the paused input block eats Enter, so this
+  // tap is the only touch road back to the game
+  const wasPaused9 = paused;
+  paused = true;
+  TOUCH._start(43, pb9.x, pb9.y);
+  applyTouch();
+  ckA('tapWorksWhilePaused', pressed.has('KeyP'));
+  pressed.delete('KeyP');
+  TOUCH._end(43);
+  paused = wasPaused9;
+  // --- the radio button: driving only, tap toggles, slide never does
+  ckA('noRadioBtnOnFoot', !touchButtons().find(b2 => b2.n === 'radio'));
+  const rc9 = mkCar(player.x, player.y, 0, 'sedan', 'player');
+  rc9.keep = true; attachCarMesh(rc9); cars.push(rc9);
+  player.car = rc9;
+  const rb9 = touchButtons().find(b2 => b2.n === 'radio');
+  ckA('radioBtnWhileDriving', !!rb9);
+  pressed.delete('KeyR');
+  TOUCH._start(51, rb9.x, rb9.y);
+  applyTouch();
+  ckA('tapFiresTheRadioToggle', pressed.has('KeyR'));
+  pressed.delete('KeyR');
+  TOUCH._end(51);
+  TOUCH._start(52, rb9.x, rb9.y - 200);
+  TOUCH._move(52, rb9.x, rb9.y);
+  applyTouch();
+  ckA('slideAcrossNeverToggles', !pressed.has('KeyR'));
+  TOUCH._end(52);
+  player.car = null;
+  TOUCH.on = wasOn9; TOUCH.fsGo9 = wasGo9; TOUCH.fsOn9 = wasIs9; TOUCH.fsT9 = -1e9;
+  console.log('ANDRDBG ' + RA.join(' ') + ' fails=' + aFails);
+}
 if (location.hash === '#touch') {
   // MOBILE RIG receipt (Tank order: Android AND iPhone get the same
   // controls): detection reads the right platforms, the thumb stick and
@@ -23911,7 +24079,7 @@ if (location.hash === '#touch') {
     ckU('desktopClean', mobileFrom('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36', 0) === null);
     const wasOn9 = TOUCH.on;
     TOUCH.on = true;
-    ckU('mapShrinksOnPhone', touchMapW() === 112);
+    ckU('mapShrinksOnPhone', touchMapW() === 84);   // iPhone mimics Android: one phone size
     // the stick: anchor on the left, thumb pushed right+down
     TOUCH._start(7, VW * 0.2, VH * 0.6);
     TOUCH._move(7, VW * 0.2 + 40, VH * 0.6 + 22);
